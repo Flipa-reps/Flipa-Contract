@@ -204,3 +204,7 @@ This is a gambling application. Please gamble responsibly. The house edge is bui
 - Design tokens (JSON): `frontend/tokens/tossd.tokens.json`
 - Design tokens (CSS): `frontend/tokens/tossd.tokens.css`
 - Usage examples: `frontend/examples/brand-system-examples.md`
+
+## 📐 Landing Page Screen Specs
+
+- High-fidelity desktop + mobile spec: `frontend/LANDING_SCREENS.md`
