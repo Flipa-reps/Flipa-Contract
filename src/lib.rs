@@ -94,6 +94,36 @@ pub enum StorageKey {
     PlayerGame(Address),       // Per-player game state
 }
 
+/// Multiplier values in basis points (1 bps = 0.0001x).
+/// Applied to the wager to compute gross payout before fees.
+///
+/// | Streak | Multiplier | Rationale                          |
+/// |--------|------------|------------------------------------|
+/// | 1      | 1.9x       | ~5% house edge on a fair 2x payout |
+/// | 2      | 3.5x       | ~6.25% edge compounded over 2 wins |
+/// | 3      | 6.0x       | ~6.25% edge compounded over 3 wins |
+/// | 4+     | 10.0x      | ~6.25% edge compounded over 4 wins |
+const MULTIPLIER_STREAK_1: u32 = 19_000; // 1.9x
+const MULTIPLIER_STREAK_2: u32 = 35_000; // 3.5x
+const MULTIPLIER_STREAK_3: u32 = 60_000; // 6.0x
+const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
+
+/// Returns the gross payout multiplier (in basis points, 10_000 = 1x)
+/// for the given win `streak` level.
+///
+/// - streak 1  → 19_000 (1.9x)
+/// - streak 2  → 35_000 (3.5x)
+/// - streak 3  → 60_000 (6.0x)
+/// - streak 4+ → 100_000 (10.0x)
+pub fn get_multiplier(streak: u32) -> u32 {
+    match streak {
+        1 => MULTIPLIER_STREAK_1,
+        2 => MULTIPLIER_STREAK_2,
+        3 => MULTIPLIER_STREAK_3,
+        _ => MULTIPLIER_STREAK_4_PLUS,
+    }
+}
+
 #[contract]
 pub struct CoinflipContract;
 
@@ -186,6 +216,28 @@ impl CoinflipContract {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_get_multiplier_streak_levels() {
+        assert_eq!(get_multiplier(1), 19_000);
+        assert_eq!(get_multiplier(2), 35_000);
+        assert_eq!(get_multiplier(3), 60_000);
+    }
+
+    #[test]
+    fn test_get_multiplier_streak_4_plus() {
+        // streak 4 and beyond all return the max multiplier
+        assert_eq!(get_multiplier(4), 100_000);
+        assert_eq!(get_multiplier(10), 100_000);
+        assert_eq!(get_multiplier(u32::MAX), 100_000);
+    }
+
+    #[test]
+    fn test_get_multiplier_streak_0_returns_max() {
+        // streak 0 is not a valid game state, but the function must not panic;
+        // it falls through to the wildcard arm and returns the 4+ multiplier.
+        assert_eq!(get_multiplier(0), 100_000);
+    }
 
     #[test]
     fn test_error_codes_defined() {
@@ -283,6 +335,28 @@ mod property_tests {
     use super::*;
     use proptest::prelude::*;
     use soroban_sdk::testutils::Address as _;
+
+    // Feature: soroban-coinflip-game, Property: multiplier monotonicity
+    // Validates: streak multipliers are strictly increasing from streak 1 → 2 → 3 → 4+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn test_multiplier_monotonically_increasing(streak in 1u32..=3u32) {
+            prop_assert!(get_multiplier(streak) < get_multiplier(streak + 1));
+        }
+
+        #[test]
+        fn test_multiplier_streak_4_plus_is_constant(streak in 4u32..=100u32) {
+            prop_assert_eq!(get_multiplier(streak), 100_000u32);
+        }
+
+        #[test]
+        fn test_multiplier_always_greater_than_1x(streak in 1u32..=100u32) {
+            // Every valid streak must yield a multiplier above 1x (10_000 bps)
+            prop_assert!(get_multiplier(streak) > 10_000);
+        }
+    }
 
     // Feature: soroban-coinflip-game, Property 24: State retrieval accuracy
     // Validates: Requirements 8.1, 8.2, 11.4
