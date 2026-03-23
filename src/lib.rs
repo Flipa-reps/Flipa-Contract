@@ -410,6 +410,33 @@ mod property_tests {
             // Every valid streak must yield a multiplier above 1x (10_000 bps)
             prop_assert!(get_multiplier(streak) > 10_000);
         }
+
+        /// Invariant: multiplier never exceeds the 10x cap (100_000 bps) for any input.
+        #[test]
+        fn test_multiplier_never_exceeds_cap(streak in 0u32..=u32::MAX) {
+            prop_assert!(get_multiplier(streak) <= 100_000);
+        }
+
+        /// Invariant: streaks 1–3 each map to their exact documented constant.
+        /// Catches any accidental reordering or off-by-one in the match arms.
+        #[test]
+        fn test_multiplier_exact_values_streaks_1_to_3(streak in 1u32..=3u32) {
+            let expected = match streak {
+                1 => 19_000,
+                2 => 35_000,
+                3 => 60_000,
+                _ => unreachable!(),
+            };
+            prop_assert_eq!(get_multiplier(streak), expected);
+        }
+
+        /// Invariant: the cap boundary is exactly at streak 4 — streak 3 must be
+        /// strictly below the cap and streak 4 must equal it.
+        #[test]
+        fn test_multiplier_cap_boundary(streak in 4u32..=1_000u32) {
+            prop_assert!(get_multiplier(3) < get_multiplier(streak));
+            prop_assert_eq!(get_multiplier(streak), get_multiplier(4));
+        }
     }
 
     // Feature: soroban-coinflip-game, Property: distinct addresses always accepted
