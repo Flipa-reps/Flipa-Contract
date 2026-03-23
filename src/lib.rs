@@ -31,6 +31,12 @@ pub enum Error {
     
     // Transfer errors
     TransferFailed = 40,
+
+    // Initialization errors
+    /// admin and treasury must be distinct addresses
+    AdminTreasuryConflict = 50,
+    /// contract has already been initialized
+    AlreadyInitialized = 51,
 }
 
 /// Side choice for the coinflip
@@ -129,7 +135,16 @@ pub struct CoinflipContract;
 
 #[contractimpl]
 impl CoinflipContract {
-    /// Initialize the contract with configuration
+    /// Initialize the contract with configuration.
+    ///
+    /// Accepted inputs:
+    /// - `admin`    – any valid Stellar address; must differ from `treasury`
+    /// - `treasury` – any valid Stellar address; must differ from `admin`
+    /// - `fee_bps`  – 200–500 (2–5%)
+    /// - `min_wager` / `max_wager` – stroops, min < max
+    ///
+    /// Errors if the contract is already initialized, if admin == treasury,
+    /// or if numeric parameters are out of range.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -138,11 +153,21 @@ impl CoinflipContract {
         min_wager: i128,
         max_wager: i128,
     ) -> Result<(), Error> {
+        // Guard: prevent re-initialization
+        if env.storage().persistent().has(&StorageKey::Config) {
+            return Err(Error::AlreadyInitialized);
+        }
+
+        // Guard: admin and treasury must be distinct roles
+        if admin == treasury {
+            return Err(Error::AdminTreasuryConflict);
+        }
+
         // Validate fee percentage (2-5%)
         if fee_bps < 200 || fee_bps > 500 {
             return Err(Error::InvalidFeePercentage);
         }
-        
+
         // Validate wager limits
         if min_wager >= max_wager {
             return Err(Error::InvalidWagerLimits);
@@ -240,6 +265,33 @@ mod tests {
     }
 
     #[test]
+    fn test_initialize_rejects_same_admin_and_treasury() {
+        let env = Env::default();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let result = client.try_initialize(&addr, &addr, &300, &1_000_000, &100_000_000);
+        assert_eq!(result, Err(Ok(Error::AdminTreasuryConflict)));
+    }
+
+    #[test]
+    fn test_initialize_rejects_reinitialization() {
+        let env = Env::default();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+
+        // Second call must fail
+        let result = client.try_initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    #[test]
     fn test_error_codes_defined() {
         // Verify all error codes are unique and properly defined
         assert_eq!(Error::WagerBelowMinimum as u32, 1);
@@ -257,6 +309,8 @@ mod tests {
         assert_eq!(Error::InvalidFeePercentage as u32, 31);
         assert_eq!(Error::InvalidWagerLimits as u32, 32);
         assert_eq!(Error::TransferFailed as u32, 40);
+        assert_eq!(Error::AdminTreasuryConflict as u32, 50);
+        assert_eq!(Error::AlreadyInitialized as u32, 51);
     }
 
     #[test]
@@ -355,6 +409,30 @@ mod property_tests {
         fn test_multiplier_always_greater_than_1x(streak in 1u32..=100u32) {
             // Every valid streak must yield a multiplier above 1x (10_000 bps)
             prop_assert!(get_multiplier(streak) > 10_000);
+        }
+    }
+
+    // Feature: soroban-coinflip-game, Property: distinct addresses always accepted
+    // Validates: admin != treasury is the only address constraint
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        #[test]
+        fn test_distinct_addresses_always_accepted(
+            fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            max_wager in 10_000_001i128..1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            // Two independently generated addresses are always distinct
+            let admin = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            let result = client.try_initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+            prop_assert!(result.is_ok());
         }
     }
 
