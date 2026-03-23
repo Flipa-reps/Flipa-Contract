@@ -130,6 +130,26 @@ pub fn get_multiplier(streak: u32) -> u32 {
     }
 }
 
+/// Calculates the net payout for a winning streak.
+///
+/// Formulas (all in stroops):
+/// - gross = wager × multiplier_bps / 10_000
+/// - fee   = gross × fee_bps / 10_000
+/// - net   = gross − fee
+///
+/// Returns `None` if any intermediate multiplication overflows `i128`.
+///
+/// # Arguments
+/// - `wager`   – original wager in stroops (must be > 0)
+/// - `streak`  – current win streak (passed to `get_multiplier`)
+/// - `fee_bps` – protocol fee in basis points (200–500)
+pub fn calculate_payout(wager: i128, streak: u32, fee_bps: u32) -> Option<i128> {
+    let multiplier = get_multiplier(streak) as i128;
+    let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
+    let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
+    gross.checked_sub(fee)
+}
+
 #[contract]
 pub struct CoinflipContract;
 
@@ -292,6 +312,32 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_payout_basic() {
+        // wager=10_000_000, streak=1 (1.9x), fee=300bps (3%)
+        // gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
+        // fee   = 19_000_000 * 300  / 10_000 =    570_000
+        // net   = 18_430_000
+        assert_eq!(calculate_payout(10_000_000, 1, 300), Some(18_430_000));
+    }
+
+    #[test]
+    fn test_calculate_payout_streak_4_plus() {
+        // wager=1_000_000, streak=4 (10x), fee=500bps (5%)
+        // gross = 10_000_000, fee = 500_000, net = 9_500_000
+        assert_eq!(calculate_payout(1_000_000, 4, 500), Some(9_500_000));
+    }
+
+    #[test]
+    fn test_calculate_payout_overflow_returns_none() {
+        assert_eq!(calculate_payout(i128::MAX, 1, 300), None);
+    }
+
+    #[test]
+    fn test_calculate_payout_zero_wager() {
+        assert_eq!(calculate_payout(0, 1, 300), Some(0));
+    }
+
+    #[test]
     fn test_error_codes_defined() {
         // Verify all error codes are unique and properly defined
         assert_eq!(Error::WagerBelowMinimum as u32, 1);
@@ -389,6 +435,58 @@ mod property_tests {
     use super::*;
     use proptest::prelude::*;
     use soroban_sdk::testutils::Address as _;
+
+    // Feature: soroban-coinflip-game, Property: payout correctness
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Net payout is always strictly less than gross (fee is always deducted).
+        #[test]
+        fn test_payout_net_less_than_gross(
+            wager   in 1i128..100_000_000i128,
+            streak  in 1u32..=10u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let net   = calculate_payout(wager, streak, fee_bps).unwrap();
+            let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
+            prop_assert!(net < gross);
+        }
+
+        /// Net payout is always positive for any valid wager.
+        #[test]
+        fn test_payout_always_positive(
+            wager   in 1i128..100_000_000i128,
+            streak  in 1u32..=10u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            prop_assert!(calculate_payout(wager, streak, fee_bps).unwrap() > 0);
+        }
+
+        /// Higher streak → higher net payout for the same wager and fee.
+        #[test]
+        fn test_payout_increases_with_streak(
+            wager   in 1i128..100_000_000i128,
+            streak  in 1u32..=3u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let lower  = calculate_payout(wager, streak,     fee_bps).unwrap();
+            let higher = calculate_payout(wager, streak + 1, fee_bps).unwrap();
+            prop_assert!(higher > lower);
+        }
+
+        /// Payout scales linearly with wager within integer-division rounding (≤ 1 stroop diff).
+        #[test]
+        fn test_payout_linear_in_wager(
+            wager   in 1i128..50_000_000i128,
+            streak  in 1u32..=10u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let single = calculate_payout(wager,     streak, fee_bps).unwrap();
+            let double = calculate_payout(wager * 2, streak, fee_bps).unwrap();
+            // Integer division can cause a ±1 stroop rounding difference
+            prop_assert!((double - single * 2).abs() <= 1);
+        }
+    }
 
     // Feature: soroban-coinflip-game, Property: multiplier monotonicity
     // Validates: streak multipliers are strictly increasing from streak 1 → 2 → 3 → 4+
