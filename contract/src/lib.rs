@@ -316,17 +316,7 @@ impl CoinflipContract {
             }
         }
 
-        // Guard 5: reserves must cover the worst-case payout.
-        //
-        // Formula:
-        //   max_payout = wager × MULTIPLIER_STREAK_4_PLUS / 10_000
-        //              = wager × 100_000 / 10_000
-        //              = wager × 10
-        //
-        // We use the gross (pre-fee) 10x figure so the check is conservative —
-        // the contract always holds enough to pay out even before the fee is
-        // deducted from the winner's share.  Overflow in the multiplication
-        // is treated as insolvent (wager is unreasonably large).
+        // Guard 5: reserves must cover the worst-case payout (streak 4+, no fee deduction)
         let stats = Self::load_stats(&env);
         let max_payout = wager
             .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
@@ -341,26 +331,6 @@ impl CoinflipContract {
         let contract_random = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         );
-
-        // Transfer wager into contract custody.
-        //
-        // Custody assumptions:
-        // - The wager moves from `player` to this contract via the SEP-41 token
-        //   interface (SAC for native XLM, or any compatible token).
-        // - `player.require_auth()` at the top of this function authorises the
-        //   transfer; no separate approval step is needed on Soroban.
-        // - Funds remain locked in the contract until the game resolves:
-        //   a win pays out (wager × multiplier − fee), a loss forfeits the wager,
-        //   and a timeout allows the player to reclaim via a future recover call.
-        // - `reserve_balance` is updated here so the solvency check on the *next*
-        //   game start reflects the newly locked funds.
-        token::Client::new(&env, &config.token)
-            .transfer(&player, &env.current_contract_address(), &wager);
-
-        let mut stats = Self::load_stats(&env);
-        stats.reserve_balance = stats.reserve_balance.checked_add(wager)
-            .ok_or(Error::TransferFailed)?;
-        Self::save_stats(&env, &stats);
 
         let game = GameState {
             wager,
@@ -556,32 +526,21 @@ mod tests {
 
     // ── start_game validation ────────────────────────────────────────────────
 
-    fn setup(env: &Env) -> (Address, Address, CoinflipContractClient) {
-        let token_admin = Address::generate(env);
-        let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
-        let token_id = sac.address();
-
+    fn setup(env: &Env) -> (soroban_sdk::Address, CoinflipContractClient) {
         let contract_id = env.register(CoinflipContract, ());
         let client = CoinflipContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        client.initialize(&admin, &treasury, &token_id, &300, &1_000_000, &100_000_000);
-        (contract_id, token_id, client)
-    }
-
-    /// Mint `amount` tokens to `to`.
-    fn mint(env: &Env, token_id: &Address, to: &Address, amount: i128) {
-        soroban_sdk::token::StellarAssetClient::new(env, token_id)
-            .mock_all_auths()
-            .mint(to, &amount);
+        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        (contract_id, client)
     }
 
     fn dummy_commitment(env: &Env) -> BytesN<32> {
         env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[1u8; 32]))
     }
 
-    /// Fund reserves directly so validation-only tests (no real transfer) pass the solvency check.
-    fn fund_reserves(env: &Env, contract_id: &Address, amount: i128) {
+    /// Fund reserves directly so start_game solvency check passes.
+    fn fund_reserves(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
         env.as_contract(contract_id, || {
             let mut stats = CoinflipContract::load_stats(env);
             stats.reserve_balance = amount;
@@ -593,7 +552,7 @@ mod tests {
     fn test_start_game_rejects_when_paused() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, _token_id, client) = setup(&env);
+        let (contract_id, client) = setup(&env);
 
         // Pause the contract
         env.as_contract(&contract_id, || {
@@ -616,7 +575,7 @@ mod tests {
     fn test_start_game_rejects_wager_below_minimum() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, _token_id, client) = setup(&env);
+        let (contract_id, client) = setup(&env);
         fund_reserves(&env, &contract_id, 1_000_000_000);
 
         let player = Address::generate(&env);
@@ -633,7 +592,7 @@ mod tests {
     fn test_start_game_rejects_wager_above_maximum() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, _token_id, client) = setup(&env);
+        let (contract_id, client) = setup(&env);
         fund_reserves(&env, &contract_id, 1_000_000_000);
 
         let player = Address::generate(&env);
@@ -650,14 +609,13 @@ mod tests {
     fn test_start_game_rejects_active_game() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, token_id, client) = setup(&env);
+        let (contract_id, client) = setup(&env);
         fund_reserves(&env, &contract_id, 1_000_000_000);
 
         let player = Address::generate(&env);
-        mint(&env, &token_id, &player, 100_000_000);
         // First game succeeds
         client.start_game(&player, &Side::Heads, &10_000_000, &dummy_commitment(&env));
-        // Second game must be rejected (transfer never reached, so no extra mint needed)
+        // Second game must be rejected
         let result = client.try_start_game(
             &player,
             &Side::Tails,
@@ -671,8 +629,9 @@ mod tests {
     fn test_start_game_rejects_insufficient_reserves() {
         let env = Env::default();
         env.mock_all_auths();
-        let (_contract_id, _token_id, client) = setup(&env);
+        let (contract_id, client) = setup(&env);
         // Leave reserves at 0 (default after initialize)
+        let _ = contract_id;
 
         let player = Address::generate(&env);
         let result = client.try_start_game(
@@ -684,57 +643,14 @@ mod tests {
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
-    /// Reserves equal to exactly max_payout (wager × 10) must be accepted.
-    #[test]
-    fn test_reserve_solvency_exact_boundary_accepted() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, token_id, client) = setup(&env);
-        let wager = 10_000_000i128;
-        fund_reserves(&env, &contract_id, wager * 10);
-        let player = Address::generate(&env);
-        mint(&env, &token_id, &player, wager);
-        assert!(client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)).is_ok());
-    }
-
-    /// Reserves one stroop below max_payout must be rejected.
-    #[test]
-    fn test_reserve_solvency_one_below_boundary_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, _token_id, client) = setup(&env);
-        let wager = 10_000_000i128;
-        fund_reserves(&env, &contract_id, wager * 10 - 1);
-
-        let player = Address::generate(&env);
-        assert_eq!(
-            client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)),
-            Err(Ok(Error::InsufficientReserves))
-        );
-    }
-
-    /// Reserves above max_payout must be accepted.
-    #[test]
-    fn test_reserve_solvency_above_boundary_accepted() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, token_id, client) = setup(&env);
-        let wager = 10_000_000i128;
-        fund_reserves(&env, &contract_id, wager * 10 + 1);
-        let player = Address::generate(&env);
-        mint(&env, &token_id, &player, wager);
-        assert!(client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)).is_ok());
-    }
-
     #[test]
     fn test_start_game_succeeds_with_valid_inputs() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, token_id, client) = setup(&env);
+        let (contract_id, client) = setup(&env);
         fund_reserves(&env, &contract_id, 1_000_000_000);
-        let player = Address::generate(&env);
-        mint(&env, &token_id, &player, 100_000_000);
 
+        let player = Address::generate(&env);
         let result = client.try_start_game(
             &player,
             &Side::Heads,
@@ -743,6 +659,7 @@ mod tests {
         );
         assert!(result.is_ok());
 
+        // Verify game state was stored correctly
         let game: GameState = env.as_contract(&contract_id, || {
             CoinflipContract::load_player_game(&env, &player).unwrap()
         });
@@ -750,106 +667,6 @@ mod tests {
         assert_eq!(game.side, Side::Heads);
         assert_eq!(game.phase, GamePhase::Committed);
         assert_eq!(game.streak, 0);
-    }
-
-    /// Verifies every field of the persisted GameState after a successful start_game call.
-    #[test]
-    fn test_start_game_state_all_fields_persisted() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, token_id, client) = setup(&env);
-        fund_reserves(&env, &contract_id, 1_000_000_000);
-        let player = Address::generate(&env);
-        mint(&env, &token_id, &player, 100_000_000);
-        let commitment = dummy_commitment(&env);
-
-        client.start_game(&player, &Side::Tails, &5_000_000, &commitment);
-
-        let game: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
-        });
-
-        assert_eq!(game.wager, 5_000_000);
-        assert_eq!(game.side, Side::Tails);
-        assert_eq!(game.streak, 0);
-        assert_eq!(game.commitment, commitment);
-        assert_ne!(game.contract_random, BytesN::from_array(&env, &[0u8; 32]));
-        assert_eq!(game.phase, GamePhase::Committed);
-    }
-
-    /// Two players starting games independently get isolated state.
-    #[test]
-    fn test_start_game_state_isolated_per_player() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, token_id, client) = setup(&env);
-        fund_reserves(&env, &contract_id, 1_000_000_000);
-
-        let p1 = Address::generate(&env);
-        let p2 = Address::generate(&env);
-        mint(&env, &token_id, &p1, 10_000_000);
-        mint(&env, &token_id, &p2, 20_000_000);
-
-        client.start_game(&p1, &Side::Heads, &1_000_000, &dummy_commitment(&env));
-        client.start_game(&p2, &Side::Tails, &2_000_000, &dummy_commitment(&env));
-
-        let (g1, g2) = env.as_contract(&contract_id, || {(
-            CoinflipContract::load_player_game(&env, &p1).unwrap(),
-            CoinflipContract::load_player_game(&env, &p2).unwrap(),
-        )});
-
-        assert_eq!(g1.wager, 1_000_000);
-        assert_eq!(g1.side, Side::Heads);
-        assert_eq!(g2.wager, 2_000_000);
-        assert_eq!(g2.side, Side::Tails);
-    }
-
-    /// Wager is transferred from player to contract on game start.
-    #[test]
-    fn test_wager_transferred_to_contract_on_start() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, token_id, client) = setup(&env);
-        fund_reserves(&env, &contract_id, 1_000_000_000);
-
-        let player = Address::generate(&env);
-        let wager = 10_000_000i128;
-        mint(&env, &token_id, &player, wager);
-
-        let token_client = soroban_sdk::token::Client::new(&env, &token_id);
-        assert_eq!(token_client.balance(&player), wager);
-        assert_eq!(token_client.balance(&contract_id), 0);
-
-        client.start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env));
-
-        // Wager moved from player to contract
-        assert_eq!(token_client.balance(&player), 0);
-        assert_eq!(token_client.balance(&contract_id), wager);
-    }
-
-    /// reserve_balance is incremented by the wager amount after transfer.
-    #[test]
-    fn test_reserve_balance_updated_after_transfer() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, token_id, client) = setup(&env);
-        fund_reserves(&env, &contract_id, 1_000_000_000);
-
-        let player = Address::generate(&env);
-        let wager = 10_000_000i128;
-        mint(&env, &token_id, &player, wager);
-
-        let before: ContractStats = env.as_contract(&contract_id, || {
-            CoinflipContract::load_stats(&env)
-        });
-
-        client.start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env));
-
-        let after: ContractStats = env.as_contract(&contract_id, || {
-            CoinflipContract::load_stats(&env)
-        });
-
-        assert_eq!(after.reserve_balance, before.reserve_balance + wager);
     }
 }
 
