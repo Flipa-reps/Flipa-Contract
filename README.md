@@ -130,6 +130,34 @@ The project employs a dual testing approach:
 - Universal correctness validation
 - 30 correctness properties covering all requirements
 
+## ✅ Task 5 Checkpoint — Test Matrix
+
+All 43 tests must pass before proceeding to game-flow implementation.
+
+```bash
+cargo test                                      # run full suite (43 tests)
+cargo test --lib tests::                        # unit tests (15)
+cargo test --lib property_tests::               # core property tests (13)
+cargo test --lib outcome_determinism_tests::    # determinism tests (6)
+cargo test --lib randomness_regression_tests::  # randomness regression tests (5)
+```
+
+| Module | Count | What it covers |
+|---|---|---|
+| `tests` | 15 | Multipliers, payout arithmetic, initialization, error codes, enums |
+| `property_tests` | 13 | Payout correctness, multiplier monotonicity, commitment verification, config storage |
+| `outcome_determinism_tests` | 6 | Identical inputs → identical outputs for all helpers |
+| `randomness_regression_tests` | 5 | Commit-reveal unilateral control paths |
+| **Total** | **43** | |
+
+### Expected output
+
+```
+test result: ok. 43 passed; 0 failed; 0 ignored
+```
+
+Any failure at this checkpoint indicates a regression in core logic and must be resolved before game-flow work continues.
+
 ## 🔒 Security Features
 
 1. **Commit-Reveal Pattern**: Prevents outcome manipulation by either party
