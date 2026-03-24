@@ -947,3 +947,220 @@ mod player_game_storage_tests {
         }
     }
 }
+
+/// # User Data Isolation & Profile Round-Trip Tests
+///
+/// Design properties verified (issue #29):
+///
+/// Property 29-A (user data isolation):
+///   Writing or deleting one player's GameState must never affect any other
+///   player's slot. Each `StorageKey::PlayerGame(addr)` is keyed by address,
+///   so two distinct addresses are always independent storage entries.
+///
+/// Property 29-B (profile round-trip):
+///   Every field of `ContractConfig` written via `initialize()` or a direct
+///   storage write must be read back unchanged. No field is silently dropped,
+///   truncated, or defaulted on reload.
+///
+/// Assumptions:
+///   - Soroban persistent storage is deterministic: set then get returns the
+///     exact same value with no serialisation loss.
+///   - `Address::generate` always produces a unique address within one `Env`,
+///     so two generated addresses are guaranteed to be distinct.
+///   - There is no access-control enforcement at the storage layer itself;
+///     isolation is structural (different storage keys per player).
+#[cfg(test)]
+mod user_data_isolation_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn bytes32(env: &Env, seed: u8) -> BytesN<32> {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        BytesN::from_array(env, &b)
+    }
+
+    fn make_game(env: &Env, wager: i128, streak: u32) -> GameState {
+        GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment:      bytes32(env, 0xAA),
+            contract_random: bytes32(env, 0xBB),
+            phase: GamePhase::Committed,
+        }
+    }
+
+    // ── Property 29-A: user data isolation ───────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Writing player B's game must not alter player A's stored game.
+        #[test]
+        fn prop_29a_write_does_not_affect_other_player(
+            wager_a in 1_000_000i128..50_000_000i128,
+            wager_b in 50_000_001i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let player_a = Address::generate(&env);
+            let player_b = Address::generate(&env);
+
+            let game_a = make_game(&env, wager_a, 1);
+            let game_b = make_game(&env, wager_b, 2);
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::PlayerGame(player_a.clone()), &game_a);
+                // Writing B must not touch A
+                env.storage().persistent().set(&StorageKey::PlayerGame(player_b.clone()), &game_b);
+            });
+
+            let loaded_a: GameState = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(player_a.clone())).unwrap()
+            });
+            prop_assert_eq!(loaded_a.wager, wager_a);
+        }
+
+        /// Deleting player B's game must not remove player A's stored game.
+        #[test]
+        fn prop_29a_delete_does_not_affect_other_player(
+            wager_a in 1_000_000i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let player_a = Address::generate(&env);
+            let player_b = Address::generate(&env);
+
+            let game_a = make_game(&env, wager_a, 1);
+            let game_b = make_game(&env, 5_000_000, 1);
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::PlayerGame(player_a.clone()), &game_a);
+                env.storage().persistent().set(&StorageKey::PlayerGame(player_b.clone()), &game_b);
+                // Deleting B must not touch A
+                env.storage().persistent().remove(&StorageKey::PlayerGame(player_b.clone()));
+            });
+
+            let loaded_a: Option<GameState> = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(player_a.clone()))
+            });
+            prop_assert!(loaded_a.is_some());
+            prop_assert_eq!(loaded_a.unwrap().wager, wager_a);
+        }
+
+        /// N players each storing distinct wagers all read back their own value.
+        /// Uses three players to stress-test multi-slot independence.
+        #[test]
+        fn prop_29a_three_player_isolation(
+            wager_a in 1_000_000i128..30_000_000i128,
+            wager_b in 30_000_001i128..60_000_000i128,
+            wager_c in 60_000_001i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let pa = Address::generate(&env);
+            let pb = Address::generate(&env);
+            let pc = Address::generate(&env);
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::PlayerGame(pa.clone()), &make_game(&env, wager_a, 1));
+                env.storage().persistent().set(&StorageKey::PlayerGame(pb.clone()), &make_game(&env, wager_b, 2));
+                env.storage().persistent().set(&StorageKey::PlayerGame(pc.clone()), &make_game(&env, wager_c, 3));
+            });
+
+            let la: GameState = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(pa.clone())).unwrap()
+            });
+            let lb: GameState = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(pb.clone())).unwrap()
+            });
+            let lc: GameState = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(pc.clone())).unwrap()
+            });
+
+            prop_assert_eq!(la.wager, wager_a);
+            prop_assert_eq!(lb.wager, wager_b);
+            prop_assert_eq!(lc.wager, wager_c);
+        }
+    }
+
+    // ── Property 29-B: profile round-trip ────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// All ContractConfig fields written by initialize() are read back
+        /// without loss, including addresses, numeric params, and paused flag.
+        #[test]
+        fn prop_29b_profile_initialize_round_trip(
+            fee_bps   in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            max_wager in 10_000_001i128..1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+
+            let cfg: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+
+            prop_assert_eq!(cfg.admin,     admin);
+            prop_assert_eq!(cfg.treasury,  treasury);
+            prop_assert_eq!(cfg.fee_bps,   fee_bps);
+            prop_assert_eq!(cfg.min_wager, min_wager);
+            prop_assert_eq!(cfg.max_wager, max_wager);
+            prop_assert_eq!(cfg.paused,    false);
+        }
+
+        /// A profile update (direct config overwrite) persists all fields,
+        /// including a toggled paused flag, without corrupting other fields.
+        #[test]
+        fn prop_29b_profile_update_round_trip(
+            fee_bps   in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            max_wager in 10_000_001i128..1_000_000_000i128,
+            paused    in proptest::bool::ANY,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+
+            // Simulate a profile update (e.g. admin toggling pause)
+            let updated = ContractConfig {
+                admin:    admin.clone(),
+                treasury: treasury.clone(),
+                fee_bps,
+                min_wager,
+                max_wager,
+                paused,
+            };
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::Config, &updated);
+            });
+
+            let reloaded: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+
+            prop_assert_eq!(reloaded.admin,     admin);
+            prop_assert_eq!(reloaded.treasury,  treasury);
+            prop_assert_eq!(reloaded.fee_bps,   fee_bps);
+            prop_assert_eq!(reloaded.min_wager, min_wager);
+            prop_assert_eq!(reloaded.max_wager, max_wager);
+            prop_assert_eq!(reloaded.paused,    paused);
+        }
+    }
+}
