@@ -157,6 +157,18 @@ pub struct CoinflipContract;
 impl CoinflipContract {
     /// Initialize the contract with configuration.
     ///
+    /// # Initialization invariant
+    ///
+    /// This function may only be called **once**. On the first call it writes
+    /// `StorageKey::Config` to persistent storage; every subsequent call checks
+    /// for that key and returns `Error::AlreadyInitialized` immediately,
+    /// leaving all existing state untouched.
+    ///
+    /// This is the sole re-initialization guard. There is no admin override or
+    /// migration path — a deployed contract's configuration is immutable after
+    /// the first successful `initialize` call (fields may be updated through
+    /// separate admin functions, but `initialize` itself cannot be re-run).
+    ///
     /// Accepted inputs:
     /// - `admin`    – any valid Stellar address; must differ from `treasury`
     /// - `treasury` – any valid Stellar address; must differ from `admin`
@@ -1153,6 +1165,170 @@ mod player_game_delete_tests {
                 env.storage().persistent().get(&StorageKey::PlayerGame(player.clone())).unwrap()
             });
             prop_assert_eq!(loaded.wager, wager_second);
+        }
+    }
+}
+
+/// # Initialization Guard Tests
+///
+/// Security invariant: `initialize()` must succeed exactly once per contract
+/// instance. Every subsequent call must return `Error::AlreadyInitialized`
+/// and must not mutate any stored state.
+///
+/// Assumptions:
+///   - The guard key is `StorageKey::Config`; its presence signals init is done.
+///   - No caller — including the original admin — can bypass the guard.
+///   - Invalid params on a retry still return `AlreadyInitialized`, not a
+///     param-validation error, because the guard fires first.
+#[cfg(test)]
+mod init_guard_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> (soroban_sdk::Address, CoinflipContractClient) {
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        (contract_id, client)
+    }
+
+    // ── Unit tests ────────────────────────────────────────────────────────────
+
+    /// Second call with identical valid params returns AlreadyInitialized.
+    #[test]
+    fn test_second_call_same_params_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let admin    = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    /// Second call with different valid params still returns AlreadyInitialized.
+    #[test]
+    fn test_second_call_different_params_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let admin    = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+
+        let admin2    = Address::generate(&env);
+        let treasury2 = Address::generate(&env);
+        let result = client.try_initialize(&admin2, &treasury2, &400, &2_000_000, &50_000_000);
+        assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    /// Second call with invalid fee still returns AlreadyInitialized (guard fires first).
+    #[test]
+    fn test_second_call_invalid_fee_still_already_initialized() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let admin    = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &treasury, &999, &1_000_000, &100_000_000);
+        assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    /// Second call with admin == treasury still returns AlreadyInitialized.
+    #[test]
+    fn test_second_call_same_admin_treasury_still_already_initialized() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let admin    = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &admin, &300, &1_000_000, &100_000_000);
+        assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    /// Config stored after first init is unchanged after a rejected second call.
+    #[test]
+    fn test_config_unchanged_after_rejected_reinit() {
+        let env = Env::default();
+        let (contract_id, client) = setup(&env);
+        let admin    = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        let _ = client.try_initialize(&Address::generate(&env), &Address::generate(&env), &400, &2_000_000, &50_000_000);
+
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.fee_bps,   300);
+        assert_eq!(cfg.min_wager, 1_000_000);
+        assert_eq!(cfg.max_wager, 100_000_000);
+        assert_eq!(cfg.admin,     admin);
+        assert_eq!(cfg.treasury,  treasury);
+    }
+
+    // ── Property tests ────────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Any number of retries after a successful init always return AlreadyInitialized.
+        #[test]
+        fn prop_reinit_always_rejected(
+            fee_bps   in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            max_wager in 10_000_001i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let (_, client) = setup(&env);
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+
+            // Retry with fresh addresses and different params
+            let result = client.try_initialize(
+                &Address::generate(&env),
+                &Address::generate(&env),
+                &fee_bps,
+                &min_wager,
+                &max_wager,
+            );
+            prop_assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+        }
+
+        /// Config written on first init is never overwritten by a rejected retry.
+        #[test]
+        fn prop_config_immutable_after_init(
+            fee_bps   in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            max_wager in 10_000_001i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup(&env);
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+            let _ = client.try_initialize(
+                &Address::generate(&env),
+                &Address::generate(&env),
+                &(if fee_bps == 500 { 200 } else { fee_bps + 1 }),
+                &min_wager,
+                &max_wager,
+            );
+
+            let cfg: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+            prop_assert_eq!(cfg.fee_bps,   fee_bps);
+            prop_assert_eq!(cfg.min_wager, min_wager);
+            prop_assert_eq!(cfg.max_wager, max_wager);
+            prop_assert_eq!(cfg.admin,     admin);
+            prop_assert_eq!(cfg.treasury,  treasury);
         }
     }
 }
