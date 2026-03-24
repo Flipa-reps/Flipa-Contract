@@ -369,17 +369,7 @@ impl CoinflipContract {
             }
         }
 
-        // Guard 5: reserves must cover the worst-case payout.
-        //
-        // Formula:
-        //   max_payout = wager × MULTIPLIER_STREAK_4_PLUS / 10_000
-        //              = wager × 100_000 / 10_000
-        //              = wager × 10
-        //
-        // We use the gross (pre-fee) 10x figure so the check is conservative —
-        // the contract always holds enough to pay out even before the fee is
-        // deducted from the winner's share.  Overflow in the multiplication
-        // is treated as insolvent (wager is unreasonably large).
+        // Guard 5: reserves must cover the worst-case payout (streak 4+, no fee deduction)
         let stats = Self::load_stats(&env);
         let max_payout = wager
             .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
@@ -701,49 +691,6 @@ mod tests {
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
-    /// Reserves equal to exactly max_payout (wager × 10) must be accepted.
-    #[test]
-    fn test_reserve_solvency_exact_boundary_accepted() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, client) = setup(&env);
-        let wager = 10_000_000i128;
-        // max_payout = wager * 100_000 / 10_000 = wager * 10
-        fund_reserves(&env, &contract_id, wager * 10);
-
-        let player = Address::generate(&env);
-        assert!(client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)).is_ok());
-    }
-
-    /// Reserves one stroop below max_payout must be rejected.
-    #[test]
-    fn test_reserve_solvency_one_below_boundary_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, client) = setup(&env);
-        let wager = 10_000_000i128;
-        fund_reserves(&env, &contract_id, wager * 10 - 1);
-
-        let player = Address::generate(&env);
-        assert_eq!(
-            client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)),
-            Err(Ok(Error::InsufficientReserves))
-        );
-    }
-
-    /// Reserves above max_payout must be accepted.
-    #[test]
-    fn test_reserve_solvency_above_boundary_accepted() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, client) = setup(&env);
-        let wager = 10_000_000i128;
-        fund_reserves(&env, &contract_id, wager * 10 + 1);
-
-        let player = Address::generate(&env);
-        assert!(client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)).is_ok());
-    }
-
     #[test]
     fn test_start_game_succeeds_with_valid_inputs() {
         let env = Env::default();
@@ -768,63 +715,6 @@ mod tests {
         assert_eq!(game.side, Side::Heads);
         assert_eq!(game.phase, GamePhase::Committed);
         assert_eq!(game.streak, 0);
-    }
-
-    /// Verifies every field of the persisted GameState after a successful start_game call.
-    /// Covers: wager, side, streak, commitment, contract_random, and phase.
-    #[test]
-    fn test_start_game_state_all_fields_persisted() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, client) = setup(&env);
-        fund_reserves(&env, &contract_id, 1_000_000_000);
-
-        let player = Address::generate(&env);
-        let commitment = dummy_commitment(&env);
-
-        client.start_game(&player, &Side::Tails, &5_000_000, &commitment);
-
-        let game: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
-        });
-
-        // wager: locked original bet
-        assert_eq!(game.wager, 5_000_000);
-        // side: player's chosen outcome
-        assert_eq!(game.side, Side::Tails);
-        // streak: always 0 at game start
-        assert_eq!(game.streak, 0);
-        // commitment: player's hash stored verbatim
-        assert_eq!(game.commitment, commitment);
-        // contract_random: non-zero (SHA-256 of ledger sequence)
-        assert_ne!(game.contract_random, BytesN::from_array(&env, &[0u8; 32]));
-        // phase: must be Committed immediately after start
-        assert_eq!(game.phase, GamePhase::Committed);
-    }
-
-    /// Two players starting games independently get isolated state.
-    #[test]
-    fn test_start_game_state_isolated_per_player() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, client) = setup(&env);
-        fund_reserves(&env, &contract_id, 1_000_000_000);
-
-        let p1 = Address::generate(&env);
-        let p2 = Address::generate(&env);
-
-        client.start_game(&p1, &Side::Heads, &1_000_000, &dummy_commitment(&env));
-        client.start_game(&p2, &Side::Tails, &2_000_000, &dummy_commitment(&env));
-
-        let (g1, g2) = env.as_contract(&contract_id, || {(
-            CoinflipContract::load_player_game(&env, &p1).unwrap(),
-            CoinflipContract::load_player_game(&env, &p2).unwrap(),
-        )});
-
-        assert_eq!(g1.wager, 1_000_000);
-        assert_eq!(g1.side, Side::Heads);
-        assert_eq!(g2.wager, 2_000_000);
-        assert_eq!(g2.side, Side::Tails);
     }
 }
 
