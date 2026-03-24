@@ -77,16 +77,29 @@ pub enum GamePhase {
     Completed,    // Game ended
 }
 
-/// Per-player game state
+/// Per-player game state persisted in `Committed` phase at game start.
+///
+/// Field meanings:
+/// - `wager`          – original bet in stroops; locked for the duration of the game
+/// - `side`           – player's chosen outcome (`Heads` or `Tails`)
+/// - `streak`         – consecutive wins so far; starts at 0, incremented on each win
+///                      (determines the multiplier tier on reveal)
+/// - `commitment`     – SHA-256 hash of the player's secret random value;
+///                      submitted up-front so the player cannot change their
+///                      random input after seeing the contract's contribution
+/// - `contract_random`– SHA-256 of the ledger sequence at game-start time;
+///                      combined with the player's revealed secret to produce
+///                      the final, unpredictable outcome
+/// - `phase`          – lifecycle position: `Committed` → `Revealed` → `Completed`
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GameState {
-    pub wager: i128,              // Original wager amount in stroops
-    pub side: Side,               // Heads (0) or Tails (1)
-    pub streak: u32,              // Current win streak (0-4+)
-    pub commitment: BytesN<32>,   // Hash commitment for randomness
-    pub contract_random: BytesN<32>, // Contract's random contribution
-    pub phase: GamePhase,         // Current phase
+    pub wager: i128,
+    pub side: Side,
+    pub streak: u32,
+    pub commitment: BytesN<32>,
+    pub contract_random: BytesN<32>,
+    pub phase: GamePhase,
 }
 
 /// Contract configuration
