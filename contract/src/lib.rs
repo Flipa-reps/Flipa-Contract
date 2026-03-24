@@ -182,7 +182,7 @@ pub fn calculate_payout(wager: i128, streak: u32, fee_bps: u32) -> Option<i128> 
 /// - Both the revealed secret hash and the `commitment` must match exactly 
 ///   for the verification to pass.
 pub fn verify_commitment(env: &Env, secret: &Bytes, commitment: &BytesN<32>) -> bool {
-    let hash = env.crypto().sha256(secret);
+    let hash: BytesN<32> = env.crypto().sha256(secret).into();
     &hash == commitment
 }
 
@@ -383,9 +383,9 @@ impl CoinflipContract {
 
         // Generate contract-side randomness contribution from ledger sequence
         let seq_bytes = env.ledger().sequence().to_be_bytes();
-        let contract_random = env.crypto().sha256(
+        let contract_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
-        );
+        ).into();
 
         let game = GameState {
             wager,
@@ -405,6 +405,110 @@ impl CoinflipContract {
         Self::save_stats(&env, &stats);
 
         Ok(())
+    }
+
+    /// Cash out winnings after a winning reveal.
+    ///
+    /// # Eligibility rules (cash-out preconditions)
+    ///
+    /// A cash-out is only valid when ALL of the following hold:
+    ///
+    /// 1. `player` has an active game record (`NoActiveGame` otherwise).
+    /// 2. The game is in the `Revealed` phase (`InvalidPhase` otherwise).
+    ///    - `Committed` → reveal has not happened yet; cash-out is premature.
+    ///    - `Completed` → game already ended; nothing left to claim.
+    /// 3. The game streak is ≥ 1, meaning the last reveal was a **win**
+    ///    (`NoWinningsToClaimOrContinue` otherwise).
+    ///    - streak == 0 after reveal means the player lost; no payout is owed.
+    ///
+    /// # Payout calculation
+    ///
+    /// ```text
+    /// gross = wager × get_multiplier(streak) / 10_000
+    /// fee   = gross × fee_bps / 10_000
+    /// net   = gross − fee
+    /// ```
+    ///
+    /// The net amount is transferred from the contract's token account to the
+    /// player. The fee portion stays in the contract (credited to treasury
+    /// accounting via `total_fees`). Reserves are debited by the net payout.
+    ///
+    /// # State transitions
+    ///
+    /// On success:
+    /// - `game.phase` → `Completed`
+    /// - `stats.total_fees` += fee
+    /// - `stats.reserve_balance` -= net_payout
+    ///
+    /// All state mutations happen **after** all precondition checks pass,
+    /// ensuring no partial state is written on error.
+    ///
+    /// # Errors
+    ///
+    /// | Error                        | Condition                                      |
+    /// |------------------------------|------------------------------------------------|
+    /// | `NoActiveGame`               | No game record exists for `player`             |
+    /// | `InvalidPhase`               | Game is not in `Revealed` phase                |
+    /// | `NoWinningsToClaimOrContinue`| streak == 0 (last reveal was a loss)           |
+    /// | `InsufficientReserves`       | Arithmetic overflow computing payout           |
+    pub fn cash_out(env: Env, player: Address) -> Result<i128, Error> {
+        player.require_auth();
+
+        // ── Guard 1: player must have a game record ──────────────────────────
+        let game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // ── Guard 2: game must be in Revealed phase ──────────────────────────
+        // Committed → reveal hasn't happened yet (premature cash-out).
+        // Completed → game already ended (nothing left to claim).
+        if game.phase != GamePhase::Revealed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // ── Guard 3: streak ≥ 1 means the last reveal was a win ─────────────
+        // streak == 0 after reveal means the player lost; no payout is owed.
+        if game.streak == 0 {
+            return Err(Error::NoWinningsToClaimOrContinue);
+        }
+
+        // ── Compute payout ───────────────────────────────────────────────────
+        let config = Self::load_config(&env);
+        let net_payout = calculate_payout(game.wager, game.streak, config.fee_bps)
+            .ok_or(Error::InsufficientReserves)?;
+
+        // Derive fee from gross for stats accounting.
+        // gross = wager * multiplier / 10_000
+        let multiplier = get_multiplier(game.streak) as i128;
+        let gross = game.wager
+            .checked_mul(multiplier)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        let fee = gross.checked_sub(net_payout).ok_or(Error::InsufficientReserves)?;
+
+        // ── Transfer net payout to player ────────────────────────────────────
+        // Uses the SAC token client; the contract must hold sufficient balance.
+        let token_client = token::Client::new(&env, &config.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &player,
+            &net_payout,
+        );
+
+        // ── Persist state changes ────────────────────────────────────────────
+        // Mark game completed — player can start a fresh game after this.
+        let mut completed_game = game;
+        completed_game.phase = GamePhase::Completed;
+        Self::save_player_game(&env, &player, &completed_game);
+
+        // Update aggregate stats: credit fee, debit reserves.
+        let mut stats = Self::load_stats(&env);
+        stats.total_fees = stats.total_fees.checked_add(fee).unwrap_or(stats.total_fees);
+        stats.reserve_balance = stats.reserve_balance
+            .checked_sub(net_payout)
+            .unwrap_or(stats.reserve_balance);
+        Self::save_stats(&env, &stats);
+
+        Ok(net_payout)
     }
 }
 
@@ -593,7 +697,7 @@ mod tests {
         secret.push_back(2u8);
         secret.push_back(3u8);
 
-        let commitment = env.crypto().sha256(&secret);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
         // Correct secret
         assert!(verify_commitment(&env, &secret, &commitment));
@@ -620,7 +724,7 @@ mod tests {
     }
 
     fn dummy_commitment(env: &Env) -> BytesN<32> {
-        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[1u8; 32]))
+        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[1u8; 32])).into()
     }
 
     /// Fund reserves directly so start_game solvency check passes.
@@ -751,6 +855,253 @@ mod tests {
         assert_eq!(game.side, Side::Heads);
         assert_eq!(game.phase, GamePhase::Committed);
         assert_eq!(game.streak, 0);
+    }
+
+    // ── cash_out validation ──────────────────────────────────────────────────
+
+    /// Inject a game directly into storage at a specific phase/streak,
+    /// bypassing start_game so tests can exercise any state combination.
+    fn inject_game(
+        env: &Env,
+        contract_id: &soroban_sdk::Address,
+        player: &Address,
+        phase: GamePhase,
+        streak: u32,
+        wager: i128,
+    ) {
+        let dummy = dummy_commitment(env);
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment: dummy.clone(),
+            contract_random: dummy,
+            phase,
+        };
+        env.as_contract(contract_id, || {
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+    }
+
+    /// Set reserve_balance so the contract can cover the payout.
+    fn set_reserves(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &stats);
+        });
+    }
+
+    // ── Guard 1: NoActiveGame ────────────────────────────────────────────────
+
+    #[test]
+    fn test_cash_out_rejects_no_active_game() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // No game record exists for this player.
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    // ── Guard 2: InvalidPhase ────────────────────────────────────────────────
+
+    #[test]
+    fn test_cash_out_rejects_committed_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Game exists but reveal hasn't happened yet.
+        inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    #[test]
+    fn test_cash_out_rejects_completed_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Game already ended — nothing left to claim.
+        inject_game(&env, &contract_id, &player, GamePhase::Completed, 1, 10_000_000);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    // ── Guard 3: NoWinningsToClaimOrContinue ─────────────────────────────────
+
+    #[test]
+    fn test_cash_out_rejects_losing_state_streak_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Revealed but streak == 0 means the player lost.
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
+    }
+
+    // ── Happy path ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cash_out_succeeds_streak_1() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let wager = 10_000_000i128;
+        // gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
+        // fee   = 19_000_000 * 300  / 10_000 =    570_000
+        // net   = 18_430_000
+        let expected_net = 18_430_000i128;
+        let expected_fee = 570_000i128;
+
+        set_reserves(&env, &contract_id, 100_000_000);
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Ok(Ok(expected_net)));
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+        assert_eq!(game.phase, GamePhase::Completed);
+
+        // Stats: fee credited, reserves debited.
+        let stats: ContractStats = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        });
+        assert_eq!(stats.total_fees, expected_fee);
+        assert_eq!(stats.reserve_balance, 100_000_000 - expected_net);
+    }
+
+    #[test]
+    fn test_cash_out_succeeds_streak_2() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let wager = 5_000_000i128;
+        // gross = 5_000_000 * 35_000 / 10_000 = 17_500_000
+        // fee   = 17_500_000 * 300  / 10_000 =    525_000
+        // net   = 16_975_000
+        let expected_net = 16_975_000i128;
+
+        set_reserves(&env, &contract_id, 100_000_000);
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, wager);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Ok(Ok(expected_net)));
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+        assert_eq!(game.phase, GamePhase::Completed);
+    }
+
+    #[test]
+    fn test_cash_out_succeeds_streak_4_plus() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let wager = 1_000_000i128;
+        // gross = 1_000_000 * 100_000 / 10_000 = 10_000_000
+        // fee   = 10_000_000 * 300   / 10_000 =    300_000
+        // net   = 9_700_000
+        let expected_net = 9_700_000i128;
+
+        set_reserves(&env, &contract_id, 100_000_000);
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 4, wager);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Ok(Ok(expected_net)));
+    }
+
+    // ── Post-cash-out: player can start a new game ───────────────────────────
+
+    #[test]
+    fn test_cash_out_allows_new_game_after_completion() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        set_reserves(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 10_000_000);
+
+        // Cash out succeeds.
+        assert!(client.try_cash_out(&player).is_ok());
+
+        // Reserves still cover a new game — player can start again.
+        let result = client.try_start_game(
+            &player,
+            &Side::Tails,
+            &10_000_000,
+            &dummy_commitment(&env),
+        );
+        assert!(result.is_ok(), "player must be able to start a new game after cash-out");
+    }
+
+    // ── Guard ordering: all checks fire before any state mutation ────────────
+
+    #[test]
+    fn test_cash_out_no_state_mutation_on_invalid_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
+
+        let before: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        let _ = client.try_cash_out(&player);
+
+        let after: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        // State must be identical — no partial mutation on error.
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_cash_out_no_state_mutation_on_losing_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
+
+        let before_stats: ContractStats = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        });
+
+        let _ = client.try_cash_out(&player);
+
+        let after_stats: ContractStats = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        });
+
+        // Stats must be unchanged — no fee or reserve mutation on error.
+        assert_eq!(before_stats.total_fees, after_stats.total_fees);
+        assert_eq!(before_stats.reserve_balance, after_stats.reserve_balance);
     }
 }
 
@@ -928,7 +1279,7 @@ mod property_tests {
     }
 
     fn dummy_commitment_prop(env: &Env) -> BytesN<32> {
-        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[42u8; 32]))
+        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[42u8; 32])).into()
     }
 
     proptest! {
