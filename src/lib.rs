@@ -313,7 +313,17 @@ impl CoinflipContract {
             }
         }
 
-        // Guard 5: reserves must cover the worst-case payout (streak 4+, no fee deduction)
+        // Guard 5: reserves must cover the worst-case payout.
+        //
+        // Formula:
+        //   max_payout = wager × MULTIPLIER_STREAK_4_PLUS / 10_000
+        //              = wager × 100_000 / 10_000
+        //              = wager × 10
+        //
+        // We use the gross (pre-fee) 10x figure so the check is conservative —
+        // the contract always holds enough to pay out even before the fee is
+        // deducted from the winner's share.  Overflow in the multiplication
+        // is treated as insolvent (wager is unreasonably large).
         let stats = Self::load_stats(&env);
         let max_payout = wager
             .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
@@ -633,6 +643,49 @@ mod tests {
             &dummy_commitment(&env),
         );
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
+    }
+
+    /// Reserves equal to exactly max_payout (wager × 10) must be accepted.
+    #[test]
+    fn test_reserve_solvency_exact_boundary_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let wager = 10_000_000i128;
+        // max_payout = wager * 100_000 / 10_000 = wager * 10
+        fund_reserves(&env, &contract_id, wager * 10);
+
+        let player = Address::generate(&env);
+        assert!(client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)).is_ok());
+    }
+
+    /// Reserves one stroop below max_payout must be rejected.
+    #[test]
+    fn test_reserve_solvency_one_below_boundary_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let wager = 10_000_000i128;
+        fund_reserves(&env, &contract_id, wager * 10 - 1);
+
+        let player = Address::generate(&env);
+        assert_eq!(
+            client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)),
+            Err(Ok(Error::InsufficientReserves))
+        );
+    }
+
+    /// Reserves above max_payout must be accepted.
+    #[test]
+    fn test_reserve_solvency_above_boundary_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let wager = 10_000_000i128;
+        fund_reserves(&env, &contract_id, wager * 10 + 1);
+
+        let player = Address::generate(&env);
+        assert!(client.try_start_game(&player, &Side::Heads, &wager, &dummy_commitment(&env)).is_ok());
     }
 
     #[test]
