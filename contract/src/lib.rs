@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Bytes, BytesN, Env};
 
 /// Error codes for the coinflip contract
 #[contracterror]
@@ -168,6 +168,22 @@ pub fn calculate_payout(wager: i128, streak: u32, fee_bps: u32) -> Option<i128> 
     let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
     let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
     gross.checked_sub(fee)
+}
+
+/// Helper to verify a player's commitment hash.
+///
+/// Hashes the `secret` value using Soroban's SHA256 cryptographic utility
+/// and compares it against the stored `commitment` bytes.
+///
+/// Byte format assumptions:
+/// - `secret` is explicitly expected to be raw byte data (`Bytes`),
+///   as the user must submit the exact pre-image bytes that generated the target hash.
+/// - The hash is a raw SHA-256 output resolving to `BytesN<32>`.
+/// - Both the revealed secret hash and the `commitment` must match exactly 
+///   for the verification to pass.
+pub fn verify_commitment(env: &Env, secret: &Bytes, commitment: &BytesN<32>) -> bool {
+    let hash = env.crypto().sha256(secret);
+    &hash == commitment
 }
 
 #[contract]
@@ -530,6 +546,28 @@ mod tests {
         assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
     }
 
+    #[test]
+    fn test_verify_commitment() {
+        let env = Env::default();
+        let mut secret = Bytes::new(&env);
+        secret.push_back(1u8);
+        secret.push_back(2u8);
+        secret.push_back(3u8);
+
+        let commitment = env.crypto().sha256(&secret);
+
+        // Correct secret
+        assert!(verify_commitment(&env, &secret, &commitment));
+
+        // Incorrect secret
+        let mut wrong_secret = Bytes::new(&env);
+        wrong_secret.push_back(1u8);
+        wrong_secret.push_back(2u8);
+        wrong_secret.push_back(4u8);
+
+        assert!(!verify_commitment(&env, &wrong_secret, &commitment));
+    }
+
     // ── start_game validation ────────────────────────────────────────────────
 
     fn setup(env: &Env) -> (soroban_sdk::Address, CoinflipContractClient) {
@@ -537,7 +575,8 @@ mod tests {
         let client = CoinflipContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        let token = Address::generate(env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
         (contract_id, client)
     }
 
