@@ -947,3 +947,212 @@ mod player_game_storage_tests {
         }
     }
 }
+
+/// # Player Game Delete and Cleanup Tests
+///
+/// Absence semantics assumed by these tests:
+///   - After `remove(&StorageKey::PlayerGame(addr))`, `get(...)` returns `None`.
+///   - Deleting a key that was never written is a no-op and does not panic.
+///   - Deleting one player's key never affects any other player's key.
+///   - A key can be re-written after deletion and will be readable again.
+#[cfg(test)]
+mod player_game_delete_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn bytes32(env: &Env, seed: u8) -> BytesN<32> {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        BytesN::from_array(env, &b)
+    }
+
+    fn make_game(env: &Env, wager: i128) -> GameState {
+        GameState {
+            wager,
+            side: Side::Heads,
+            streak: 1,
+            commitment:      bytes32(env, 0xAA),
+            contract_random: bytes32(env, 0xBB),
+            phase: GamePhase::Committed,
+        }
+    }
+
+    // ── Unit tests ────────────────────────────────────────────────────────────
+
+    /// Deleting an existing game leaves None in storage.
+    #[test]
+    fn test_delete_existing_game_returns_none() {
+        let env = Env::default();
+        let contract_id = env.register(CoinflipContract, ());
+        let player = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&StorageKey::PlayerGame(player.clone()), &make_game(&env, 5_000_000));
+            env.storage().persistent().remove(&StorageKey::PlayerGame(player.clone()));
+        });
+
+        let result: Option<GameState> = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::PlayerGame(player.clone()))
+        });
+        assert!(result.is_none());
+    }
+
+    /// Deleting a key that was never written does not panic.
+    #[test]
+    fn test_delete_nonexistent_game_is_noop() {
+        let env = Env::default();
+        let contract_id = env.register(CoinflipContract, ());
+        let player = Address::generate(&env);
+
+        // Should not panic
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().remove(&StorageKey::PlayerGame(player.clone()));
+        });
+
+        let result: Option<GameState> = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::PlayerGame(player.clone()))
+        });
+        assert!(result.is_none());
+    }
+
+    /// A game can be re-written after deletion and is readable again.
+    #[test]
+    fn test_rewrite_after_delete() {
+        let env = Env::default();
+        let contract_id = env.register(CoinflipContract, ());
+        let player = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&StorageKey::PlayerGame(player.clone()), &make_game(&env, 1_000_000));
+            env.storage().persistent().remove(&StorageKey::PlayerGame(player.clone()));
+            env.storage().persistent().set(&StorageKey::PlayerGame(player.clone()), &make_game(&env, 9_000_000));
+        });
+
+        let loaded: GameState = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::PlayerGame(player.clone())).unwrap()
+        });
+        assert_eq!(loaded.wager, 9_000_000);
+    }
+
+    /// Deleting all players in sequence leaves all slots as None.
+    #[test]
+    fn test_cleanup_multiple_players() {
+        let env = Env::default();
+        let contract_id = env.register(CoinflipContract, ());
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let p3 = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&StorageKey::PlayerGame(p1.clone()), &make_game(&env, 1_000_000));
+            env.storage().persistent().set(&StorageKey::PlayerGame(p2.clone()), &make_game(&env, 2_000_000));
+            env.storage().persistent().set(&StorageKey::PlayerGame(p3.clone()), &make_game(&env, 3_000_000));
+            env.storage().persistent().remove(&StorageKey::PlayerGame(p1.clone()));
+            env.storage().persistent().remove(&StorageKey::PlayerGame(p2.clone()));
+            env.storage().persistent().remove(&StorageKey::PlayerGame(p3.clone()));
+        });
+
+        for p in [&p1, &p2, &p3] {
+            let result: Option<GameState> = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(p.clone()))
+            });
+            assert!(result.is_none());
+        }
+    }
+
+    /// Deleting one player does not affect a sibling player's slot.
+    #[test]
+    fn test_delete_one_does_not_affect_sibling() {
+        let env = Env::default();
+        let contract_id = env.register(CoinflipContract, ());
+        let player_a = Address::generate(&env);
+        let player_b = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&StorageKey::PlayerGame(player_a.clone()), &make_game(&env, 3_000_000));
+            env.storage().persistent().set(&StorageKey::PlayerGame(player_b.clone()), &make_game(&env, 7_000_000));
+            env.storage().persistent().remove(&StorageKey::PlayerGame(player_a.clone()));
+        });
+
+        let result_a: Option<GameState> = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::PlayerGame(player_a.clone()))
+        });
+        let result_b: GameState = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::PlayerGame(player_b.clone())).unwrap()
+        });
+
+        assert!(result_a.is_none());
+        assert_eq!(result_b.wager, 7_000_000);
+    }
+
+    // ── Property tests ────────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// For any wager, deleting after writing always yields None.
+        #[test]
+        fn prop_delete_always_yields_none(wager in 1_000_000i128..100_000_000i128) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let player = Address::generate(&env);
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::PlayerGame(player.clone()), &make_game(&env, wager));
+                env.storage().persistent().remove(&StorageKey::PlayerGame(player.clone()));
+            });
+
+            let result: Option<GameState> = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(player.clone()))
+            });
+            prop_assert!(result.is_none());
+        }
+
+        /// Deleting player A never removes player B's game.
+        #[test]
+        fn prop_delete_does_not_affect_sibling(
+            wager_a in 1_000_000i128..50_000_000i128,
+            wager_b in 50_000_001i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let player_a = Address::generate(&env);
+            let player_b = Address::generate(&env);
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::PlayerGame(player_a.clone()), &make_game(&env, wager_a));
+                env.storage().persistent().set(&StorageKey::PlayerGame(player_b.clone()), &make_game(&env, wager_b));
+                env.storage().persistent().remove(&StorageKey::PlayerGame(player_a.clone()));
+            });
+
+            let result_b: Option<GameState> = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(player_b.clone()))
+            });
+            prop_assert!(result_b.is_some());
+            prop_assert_eq!(result_b.unwrap().wager, wager_b);
+        }
+
+        /// A game written after deletion is always readable with the new wager.
+        #[test]
+        fn prop_rewrite_after_delete_is_readable(
+            wager_first  in 1_000_000i128..50_000_000i128,
+            wager_second in 50_000_001i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let player = Address::generate(&env);
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::PlayerGame(player.clone()), &make_game(&env, wager_first));
+                env.storage().persistent().remove(&StorageKey::PlayerGame(player.clone()));
+                env.storage().persistent().set(&StorageKey::PlayerGame(player.clone()), &make_game(&env, wager_second));
+            });
+
+            let loaded: GameState = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::PlayerGame(player.clone())).unwrap()
+            });
+            prop_assert_eq!(loaded.wager, wager_second);
+        }
+    }
+}
