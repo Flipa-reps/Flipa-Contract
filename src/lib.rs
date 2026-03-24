@@ -1,3 +1,23 @@
+//! # Coinflip Contract — Task 5 Checkpoint
+//!
+//! All 43 tests below must pass before game-flow implementation begins.
+//!
+//! ```text
+//! cargo test                                   # full suite (43)
+//! cargo test --lib tests::                     # unit tests (15)
+//! cargo test --lib property_tests::            # core property tests (13)
+//! cargo test --lib outcome_determinism_tests:: # determinism tests (6)
+//! cargo test --lib randomness_regression_tests:: # randomness regression (5)
+//! ```
+//!
+//! | Module                      | Count | Covers                                              |
+//! |-----------------------------|-------|-----------------------------------------------------|
+//! | `tests`                     |  15   | Multipliers, payout arithmetic, init, errors, enums |
+//! | `property_tests`            |  13   | Payout, monotonicity, commitment, config storage    |
+//! | `outcome_determinism_tests` |   6   | Identical inputs → identical outputs                |
+//! | `randomness_regression_tests`|  5   | Commit-reveal unilateral control paths              |
+//! | **Total**                   | **43**|                                                     |
+
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, BytesN, Env};
