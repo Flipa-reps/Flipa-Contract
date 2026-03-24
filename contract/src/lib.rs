@@ -607,59 +607,140 @@ mod property_tests {
 
     // Feature: soroban-coinflip-game, Property 24: State retrieval accuracy
     // Validates: Requirements 8.1, 8.2, 11.4
+    //
+    // Storage defaults assumed by these tests:
+    //   - ContractConfig.paused  → false  (contract starts unpaused)
+    //   - ContractStats.*        → 0      (all counters start at zero)
+    //   - StorageKey::PlayerGame → None   (no game exists until one is started)
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
-        
+
+        /// Round-trip: every field written to Config storage during initialize()
+        /// is read back unchanged, including admin and treasury addresses.
         #[test]
-        fn test_config_storage_accuracy(
-            fee_bps in 200u32..=500u32,
+        fn test_config_full_round_trip(
+            fee_bps   in 200u32..=500u32,
             min_wager in 1_000_000i128..10_000_000i128,
-            max_wager in 10_000_001i128..1_000_000_000i128
+            max_wager in 10_000_001i128..1_000_000_000i128,
         ) {
             let env = Env::default();
             let contract_id = env.register(CoinflipContract, ());
             let client = CoinflipContractClient::new(&env, &contract_id);
-            
-            let admin = Address::generate(&env);
+
+            let admin    = Address::generate(&env);
             let treasury = Address::generate(&env);
-            
+
             client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
-            
-            // Verify storage by reading back through contract storage
-            let stored_config: ContractConfig = env.as_contract(&contract_id, || {
+
+            let stored: ContractConfig = env.as_contract(&contract_id, || {
                 env.storage().persistent().get(&StorageKey::Config).unwrap()
             });
-            
-            prop_assert_eq!(stored_config.fee_bps, fee_bps);
-            prop_assert_eq!(stored_config.min_wager, min_wager);
-            prop_assert_eq!(stored_config.max_wager, max_wager);
-            prop_assert_eq!(stored_config.paused, false);
+
+            prop_assert_eq!(stored.admin,     admin);
+            prop_assert_eq!(stored.treasury,  treasury);
+            prop_assert_eq!(stored.fee_bps,   fee_bps);
+            prop_assert_eq!(stored.min_wager, min_wager);
+            prop_assert_eq!(stored.max_wager, max_wager);
+            // Storage default: contract starts unpaused
+            prop_assert_eq!(stored.paused, false);
         }
 
+        /// Round-trip: a mutated ContractConfig written directly to storage is
+        /// read back with every field intact (covers save_config / load_config).
         #[test]
-        fn test_stats_initialization(
-            fee_bps in 200u32..=500u32,
+        fn test_config_mutation_round_trip(
+            fee_bps   in 200u32..=500u32,
             min_wager in 1_000_000i128..10_000_000i128,
-            max_wager in 10_000_001i128..1_000_000_000i128
+            max_wager in 10_000_001i128..1_000_000_000i128,
+            paused    in proptest::bool::ANY,
         ) {
             let env = Env::default();
             let contract_id = env.register(CoinflipContract, ());
             let client = CoinflipContractClient::new(&env, &contract_id);
-            
-            let admin = Address::generate(&env);
+
+            let admin    = Address::generate(&env);
             let treasury = Address::generate(&env);
-            
+
+            // Initialise with valid params, then overwrite config with arbitrary paused flag
             client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
-            
-            // Verify stats are initialized to zero
-            let stored_stats: ContractStats = env.as_contract(&contract_id, || {
+
+            let mutated = ContractConfig {
+                admin:    admin.clone(),
+                treasury: treasury.clone(),
+                fee_bps,
+                min_wager,
+                max_wager,
+                paused,
+            };
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::Config, &mutated);
+            });
+
+            let stored: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+
+            prop_assert_eq!(stored, mutated);
+        }
+
+        /// Round-trip: every field written to Stats storage during initialize()
+        /// is read back as zero (storage default for all counters).
+        #[test]
+        fn test_stats_zero_default_round_trip(
+            fee_bps   in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            max_wager in 10_000_001i128..1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+
+            let stored: ContractStats = env.as_contract(&contract_id, || {
                 env.storage().persistent().get(&StorageKey::Stats).unwrap()
             });
-            
-            prop_assert_eq!(stored_stats.total_games, 0);
-            prop_assert_eq!(stored_stats.total_volume, 0);
-            prop_assert_eq!(stored_stats.total_fees, 0);
-            prop_assert_eq!(stored_stats.reserve_balance, 0);
+
+            // Storage defaults: all counters start at zero
+            prop_assert_eq!(stored.total_games,    0u64);
+            prop_assert_eq!(stored.total_volume,   0i128);
+            prop_assert_eq!(stored.total_fees,     0i128);
+            prop_assert_eq!(stored.reserve_balance, 0i128);
+        }
+
+        /// Round-trip: arbitrary ContractStats written to storage are read back
+        /// with every field intact (covers save_stats / load_stats).
+        #[test]
+        fn test_stats_mutation_round_trip(
+            total_games     in 0u64..u64::MAX,
+            total_volume    in 0i128..i128::MAX,
+            total_fees      in 0i128..i128::MAX,
+            reserve_balance in 0i128..i128::MAX,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+
+            let mutated = ContractStats { total_games, total_volume, total_fees, reserve_balance };
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::Stats, &mutated);
+            });
+
+            let stored: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+
+            prop_assert_eq!(stored, mutated);
         }
     }
 
