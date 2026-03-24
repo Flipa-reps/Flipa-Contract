@@ -201,6 +201,18 @@ pub struct CoinflipContract;
 impl CoinflipContract {
     /// Initialize the contract with configuration.
     ///
+    /// # Initialization invariant
+    ///
+    /// This function may only be called **once**. On the first call it writes
+    /// `StorageKey::Config` to persistent storage; every subsequent call checks
+    /// for that key and returns `Error::AlreadyInitialized` immediately,
+    /// leaving all existing state untouched.
+    ///
+    /// This is the sole re-initialization guard. There is no admin override or
+    /// migration path — a deployed contract's configuration is immutable after
+    /// the first successful `initialize` call (fields may be updated through
+    /// separate admin functions, but `initialize` itself cannot be re-run).
+    ///
     /// Accepted inputs:
     /// - `admin`    – any valid Stellar address; must differ from `treasury`
     /// - `treasury` – any valid Stellar address; must differ from `admin`
