@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, BytesN, Env};
 
 /// Error codes for the coinflip contract
 #[contracterror]
@@ -57,16 +57,29 @@ pub enum GamePhase {
     Completed,    // Game ended
 }
 
-/// Per-player game state
+/// Per-player game state persisted in `Committed` phase at game start.
+///
+/// Field meanings:
+/// - `wager`          – original bet in stroops; locked for the duration of the game
+/// - `side`           – player's chosen outcome (`Heads` or `Tails`)
+/// - `streak`         – consecutive wins so far; starts at 0, incremented on each win
+///                      (determines the multiplier tier on reveal)
+/// - `commitment`     – SHA-256 hash of the player's secret random value;
+///                      submitted up-front so the player cannot change their
+///                      random input after seeing the contract's contribution
+/// - `contract_random`– SHA-256 of the ledger sequence at game-start time;
+///                      combined with the player's revealed secret to produce
+///                      the final, unpredictable outcome
+/// - `phase`          – lifecycle position: `Committed` → `Revealed` → `Completed`
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GameState {
-    pub wager: i128,              // Original wager amount in stroops
-    pub side: Side,               // Heads (0) or Tails (1)
-    pub streak: u32,              // Current win streak (0-4+)
-    pub commitment: BytesN<32>,   // Hash commitment for randomness
-    pub contract_random: BytesN<32>, // Contract's random contribution
-    pub phase: GamePhase,         // Current phase
+    pub wager: i128,
+    pub side: Side,
+    pub streak: u32,
+    pub commitment: BytesN<32>,
+    pub contract_random: BytesN<32>,
+    pub phase: GamePhase,
 }
 
 /// Contract configuration
@@ -75,6 +88,7 @@ pub struct GameState {
 pub struct ContractConfig {
     pub admin: Address,           // Administrator address
     pub treasury: Address,        // Fee collection address
+    pub token: Address,           // SAC token address for wager custody (XLM or any SEP-41 token)
     pub fee_bps: u32,            // Fee in basis points (200-500 = 2-5%)
     pub min_wager: i128,         // Minimum wager in stroops
     pub max_wager: i128,         // Maximum wager in stroops
@@ -176,6 +190,7 @@ impl CoinflipContract {
         env: Env,
         admin: Address,
         treasury: Address,
+        token: Address,
         fee_bps: u32,
         min_wager: i128,
         max_wager: i128,
@@ -203,6 +218,7 @@ impl CoinflipContract {
         let config = ContractConfig {
             admin,
             treasury,
+            token,
             fee_bps,
             min_wager,
             max_wager,
@@ -262,6 +278,80 @@ impl CoinflipContract {
             .persistent()
             .remove(&StorageKey::PlayerGame(player.clone()));
     }
+
+    /// Begin a new coinflip game for `player`.
+    ///
+    /// Validation guards (in order):
+    /// 1. `ContractPaused`        – rejected when the contract is paused
+    /// 2. `WagerBelowMinimum`     – rejected when `wager < config.min_wager`
+    /// 3. `WagerAboveMaximum`     – rejected when `wager > config.max_wager`
+    /// 4. `ActiveGameExists`      – rejected when the player already has an
+    ///                              in-progress game (phase != Completed)
+    /// 5. `InsufficientReserves`  – rejected when the contract cannot cover the
+    ///                              maximum possible payout at the highest streak
+    ///
+    /// On success the game is stored in `Committed` phase and the player's
+    /// commitment hash is recorded for the subsequent reveal step.
+    pub fn start_game(
+        env: Env,
+        player: Address,
+        side: Side,
+        wager: i128,
+        commitment: BytesN<32>,
+    ) -> Result<(), Error> {
+        player.require_auth();
+
+        let config = Self::load_config(&env);
+
+        // Guard 1: contract must not be paused
+        if config.paused {
+            return Err(Error::ContractPaused);
+        }
+
+        // Guard 2 & 3: wager must be within configured bounds
+        if wager < config.min_wager {
+            return Err(Error::WagerBelowMinimum);
+        }
+        if wager > config.max_wager {
+            return Err(Error::WagerAboveMaximum);
+        }
+
+        // Guard 4: player must not have an active game
+        if let Some(existing) = Self::load_player_game(&env, &player) {
+            if existing.phase != GamePhase::Completed {
+                return Err(Error::ActiveGameExists);
+            }
+        }
+
+        // Guard 5: reserves must cover the worst-case payout (streak 4+, no fee deduction)
+        let stats = Self::load_stats(&env);
+        let max_payout = wager
+            .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        if stats.reserve_balance < max_payout {
+            return Err(Error::InsufficientReserves);
+        }
+
+        // Generate contract-side randomness contribution from ledger sequence
+        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let contract_random = env.crypto().sha256(
+            &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
+        );
+
+        let game = GameState {
+            wager,
+            side,
+            streak: 0,
+            commitment,
+            contract_random,
+            phase: GamePhase::Committed,
+        };
+
+        Self::save_player_game(&env, &player, &game);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -298,7 +388,8 @@ mod tests {
         let client = CoinflipContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let result = client.try_initialize(&addr, &addr, &300, &1_000_000, &100_000_000);
+        let token = Address::generate(&env);
+        let result = client.try_initialize(&addr, &addr, &token, &300, &1_000_000, &100_000_000);
         assert_eq!(result, Err(Ok(Error::AdminTreasuryConflict)));
     }
 
@@ -310,11 +401,12 @@ mod tests {
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
 
-        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
 
         // Second call must fail
-        let result = client.try_initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
         assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
     }
 
@@ -391,8 +483,9 @@ mod tests {
         
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
         
-        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
         
         // Verify config was stored
         let stored_config: ContractConfig = env.as_contract(&contract_id, || {
@@ -412,13 +505,14 @@ mod tests {
         
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
         
         // Fee too low
-        let result = client.try_initialize(&admin, &treasury, &100, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &treasury, &token, &100, &1_000_000, &100_000_000);
         assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
         
         // Fee too high
-        let result = client.try_initialize(&admin, &treasury, &600, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &treasury, &token, &600, &1_000_000, &100_000_000);
         assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
     }
 
@@ -430,10 +524,156 @@ mod tests {
         
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
         
         // Min >= Max
-        let result = client.try_initialize(&admin, &treasury, &300, &100_000_000, &1_000_000);
+        let result = client.try_initialize(&admin, &treasury, &token, &300, &100_000_000, &1_000_000);
         assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+    }
+
+    // ── start_game validation ────────────────────────────────────────────────
+
+    fn setup(env: &Env) -> (soroban_sdk::Address, CoinflipContractClient) {
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+        (contract_id, client)
+    }
+
+    fn dummy_commitment(env: &Env) -> BytesN<32> {
+        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[1u8; 32]))
+    }
+
+    /// Fund reserves directly so start_game solvency check passes.
+    fn fund_reserves(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &stats);
+        });
+    }
+
+    #[test]
+    fn test_start_game_rejects_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        // Pause the contract
+        env.as_contract(&contract_id, || {
+            let mut cfg = CoinflipContract::load_config(&env);
+            cfg.paused = true;
+            CoinflipContract::save_config(&env, &cfg);
+        });
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &10_000_000,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::ContractPaused)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_wager_below_minimum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &500_000, // below min_wager of 1_000_000
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_wager_above_maximum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &200_000_000, // above max_wager of 100_000_000
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_active_game() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        // First game succeeds
+        client.start_game(&player, &Side::Heads, &10_000_000, &dummy_commitment(&env));
+        // Second game must be rejected
+        let result = client.try_start_game(
+            &player,
+            &Side::Tails,
+            &10_000_000,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_insufficient_reserves() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        // Leave reserves at 0 (default after initialize)
+        let _ = contract_id;
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &10_000_000,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
+    }
+
+    #[test]
+    fn test_start_game_succeeds_with_valid_inputs() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &10_000_000,
+            &dummy_commitment(&env),
+        );
+        assert!(result.is_ok());
+
+        // Verify game state was stored correctly
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+        assert_eq!(game.wager, 10_000_000);
+        assert_eq!(game.side, Side::Heads);
+        assert_eq!(game.phase, GamePhase::Committed);
+        assert_eq!(game.streak, 0);
     }
 }
 
@@ -613,11 +853,11 @@ mod property_tests {
             let contract_id = env.register(CoinflipContract, ());
             let client = CoinflipContractClient::new(&env, &contract_id);
 
-            // Two independently generated addresses are always distinct
             let admin = Address::generate(&env);
             let treasury = Address::generate(&env);
+            let token = Address::generate(&env);
 
-            let result = client.try_initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+            let result = client.try_initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
             prop_assert!(result.is_ok());
         }
     }
@@ -639,10 +879,10 @@ mod property_tests {
             
             let admin = Address::generate(&env);
             let treasury = Address::generate(&env);
+            let token = Address::generate(&env);
             
-            client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+            client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
             
-            // Verify storage by reading back through contract storage
             let stored_config: ContractConfig = env.as_contract(&contract_id, || {
                 env.storage().persistent().get(&StorageKey::Config).unwrap()
             });
@@ -665,10 +905,10 @@ mod property_tests {
             
             let admin = Address::generate(&env);
             let treasury = Address::generate(&env);
+            let token = Address::generate(&env);
             
-            client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+            client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
             
-            // Verify stats are initialized to zero
             let stored_stats: ContractStats = env.as_contract(&contract_id, || {
                 env.storage().persistent().get(&StorageKey::Stats).unwrap()
             });
