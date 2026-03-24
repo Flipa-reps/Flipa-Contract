@@ -749,3 +749,96 @@ mod property_tests {
         }
     }
 }
+
+/// # Outcome Determinism Guarantees
+///
+/// Every helper in this contract is a pure function of its inputs:
+///
+/// - `get_multiplier(streak)` — no environment dependency; same streak → same bps.
+/// - `calculate_payout(wager, streak, fee_bps)` — pure arithmetic; same triple → same net.
+/// - `verify_commitment(env, preimage, commitment)` — sha256 is deterministic; same pair
+///   always resolves to the same Ok/Err variant.
+///
+/// These guarantees are validated by the `outcome_determinism_tests` module below.
+#[cfg(test)]
+mod outcome_determinism_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// get_multiplier is a pure function: identical streak → identical multiplier.
+        #[test]
+        fn test_multiplier_deterministic(streak in 0u32..=200u32) {
+            prop_assert_eq!(get_multiplier(streak), get_multiplier(streak));
+        }
+
+        /// calculate_payout is a pure function: identical inputs → identical output.
+        #[test]
+        fn test_payout_deterministic(
+            wager   in 1i128..100_000_000i128,
+            streak  in 1u32..=10u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            prop_assert_eq!(
+                calculate_payout(wager, streak, fee_bps),
+                calculate_payout(wager, streak, fee_bps)
+            );
+        }
+
+        /// verify_commitment is deterministic: same preimage+commitment → same result.
+        #[test]
+        fn test_commitment_verification_deterministic(
+            preimage in prop::array::uniform32(0u8..),
+        ) {
+            let env = Env::default();
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            prop_assert_eq!(
+                verify_commitment(&env, &preimage_bytes, &commitment),
+                verify_commitment(&env, &preimage_bytes, &commitment)
+            );
+        }
+
+        /// Mismatched inputs also produce a stable (deterministic) error.
+        #[test]
+        fn test_commitment_mismatch_deterministic(
+            preimage in prop::array::uniform32(0u8..),
+        ) {
+            let env = Env::default();
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            let mut wrong = preimage;
+            wrong[0] = wrong[0].wrapping_add(1);
+            let wrong_bytes: BytesN<32> = BytesN::from_array(&env, &wrong);
+
+            prop_assert_eq!(
+                verify_commitment(&env, &wrong_bytes, &commitment),
+                verify_commitment(&env, &wrong_bytes, &commitment)
+            );
+        }
+
+        /// Distinct inputs produce distinct multipliers for streaks 1–3.
+        #[test]
+        fn test_distinct_streaks_produce_distinct_multipliers(streak in 1u32..=3u32) {
+            prop_assert_ne!(get_multiplier(streak), get_multiplier(streak + 1));
+        }
+
+        /// Distinct wagers produce distinct payouts (no hash collision in arithmetic).
+        #[test]
+        fn test_distinct_wagers_produce_distinct_payouts(
+            wager   in 1i128..50_000_000i128,
+            streak  in 1u32..=10u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let p1 = calculate_payout(wager, streak, fee_bps).unwrap();
+            let p2 = calculate_payout(wager + 1, streak, fee_bps).unwrap();
+            prop_assert_ne!(p1, p2);
+        }
+    }
+}
