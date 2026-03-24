@@ -57,16 +57,29 @@ pub enum GamePhase {
     Completed,    // Game ended
 }
 
-/// Per-player game state
+/// Per-player game state persisted in `Committed` phase at game start.
+///
+/// Field meanings:
+/// - `wager`          – original bet in stroops; locked for the duration of the game
+/// - `side`           – player's chosen outcome (`Heads` or `Tails`)
+/// - `streak`         – consecutive wins so far; starts at 0, incremented on each win
+///                      (determines the multiplier tier on reveal)
+/// - `commitment`     – SHA-256 hash of the player's secret random value;
+///                      submitted up-front so the player cannot change their
+///                      random input after seeing the contract's contribution
+/// - `contract_random`– SHA-256 of the ledger sequence at game-start time;
+///                      combined with the player's revealed secret to produce
+///                      the final, unpredictable outcome
+/// - `phase`          – lifecycle position: `Committed` → `Revealed` → `Completed`
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GameState {
-    pub wager: i128,              // Original wager amount in stroops
-    pub side: Side,               // Heads (0) or Tails (1)
-    pub streak: u32,              // Current win streak (0-4+)
-    pub commitment: BytesN<32>,   // Hash commitment for randomness
-    pub contract_random: BytesN<32>, // Contract's random contribution
-    pub phase: GamePhase,         // Current phase
+    pub wager: i128,
+    pub side: Side,
+    pub streak: u32,
+    pub commitment: BytesN<32>,
+    pub contract_random: BytesN<32>,
+    pub phase: GamePhase,
 }
 
 /// Contract configuration
@@ -646,6 +659,63 @@ mod tests {
         assert_eq!(game.side, Side::Heads);
         assert_eq!(game.phase, GamePhase::Committed);
         assert_eq!(game.streak, 0);
+    }
+
+    /// Verifies every field of the persisted GameState after a successful start_game call.
+    /// Covers: wager, side, streak, commitment, contract_random, and phase.
+    #[test]
+    fn test_start_game_state_all_fields_persisted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let commitment = dummy_commitment(&env);
+
+        client.start_game(&player, &Side::Tails, &5_000_000, &commitment);
+
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        // wager: locked original bet
+        assert_eq!(game.wager, 5_000_000);
+        // side: player's chosen outcome
+        assert_eq!(game.side, Side::Tails);
+        // streak: always 0 at game start
+        assert_eq!(game.streak, 0);
+        // commitment: player's hash stored verbatim
+        assert_eq!(game.commitment, commitment);
+        // contract_random: non-zero (SHA-256 of ledger sequence)
+        assert_ne!(game.contract_random, BytesN::from_array(&env, &[0u8; 32]));
+        // phase: must be Committed immediately after start
+        assert_eq!(game.phase, GamePhase::Committed);
+    }
+
+    /// Two players starting games independently get isolated state.
+    #[test]
+    fn test_start_game_state_isolated_per_player() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+
+        client.start_game(&p1, &Side::Heads, &1_000_000, &dummy_commitment(&env));
+        client.start_game(&p2, &Side::Tails, &2_000_000, &dummy_commitment(&env));
+
+        let (g1, g2) = env.as_contract(&contract_id, || {(
+            CoinflipContract::load_player_game(&env, &p1).unwrap(),
+            CoinflipContract::load_player_game(&env, &p2).unwrap(),
+        )});
+
+        assert_eq!(g1.wager, 1_000_000);
+        assert_eq!(g1.side, Side::Heads);
+        assert_eq!(g2.wager, 2_000_000);
+        assert_eq!(g2.side, Side::Tails);
     }
 }
 
