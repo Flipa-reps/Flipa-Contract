@@ -296,6 +296,15 @@ impl CoinflipContract {
 
     /// Begin a new coinflip game for `player`.
     ///
+    /// Acceptance invariants:
+    /// - `player` must be a valid address and must authorize the call (`player.require_auth`).
+    /// - contract must be initialized and not paused.
+    /// - `wager` must be within `[config.min_wager, config.max_wager]`.
+    /// - the player must not already have an active game (only `Completed` games can be replaced).
+    /// - contract reserves must cover worst-case payout (`streak 4+` multiplier) to avoid insolvency.
+    /// - on success, the game state is persisted and global stats are updated (`total_games += 1`, `total_volume += wager`).
+    /// - player balance/transfer checks are assumed to be performed by the caller or higher-level token transfer semantics.
+    ///
     /// Validation guards (in order):
     /// 1. `ContractPaused`        – rejected when the contract is paused
     /// 2. `WagerBelowMinimum`     – rejected when `wager < config.min_wager`
@@ -388,6 +397,12 @@ impl CoinflipContract {
         };
 
         Self::save_player_game(&env, &player, &game);
+
+        // Update global statistics to reflect a new active game creation.
+        let mut stats = stats;
+        stats.total_games = stats.total_games.checked_add(1).unwrap_or(stats.total_games);
+        stats.total_volume = stats.total_volume.checked_add(wager).unwrap_or(stats.total_volume);
+        Self::save_stats(&env, &stats);
 
         Ok(())
     }
@@ -1327,6 +1342,73 @@ mod property_tests {
             prop_assert_eq!(stored_stats.total_volume, 0);
             prop_assert_eq!(stored_stats.total_fees, 0);
             prop_assert_eq!(stored_stats.reserve_balance, 0);
+        }
+    }
+
+    // Feature: soroban-coinflip-game, Property 25: start_game persistence + stats update
+    // Validates: successful game creation stores player state and updates aggregate counters.
+
+    fn fund_reserves(env: &Env, contract_id: &Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &stats);
+        });
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        #[test]
+        fn test_start_game_state_persistence_and_stats(
+            wager in 1_000_000i128..=100_000_000i128,
+            side in prop_oneof![Just(Side::Heads), Just(Side::Tails)],
+            commitment_bytes in prop::array::uniform32(any::<u8>())
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+
+            // Ensure reserves satisfy the worst-case payout for input wager.
+            let required_reserves = wager
+                .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(0);
+            fund_reserves(&env, &contract_id, required_reserves + 1_000_000);
+
+            let player = Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+
+            // check precondition to compare increments
+            let pre_stats: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+
+            let result = client.try_start_game(&player, &side, &wager, &commitment);
+            prop_assert!(result.is_ok());
+
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(game.wager, wager);
+            prop_assert_eq!(game.side, side);
+            prop_assert_eq!(game.phase, GamePhase::Committed);
+            prop_assert_eq!(game.streak, 0);
+
+            let post_stats: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+
+            prop_assert_eq!(post_stats.total_games, pre_stats.total_games + 1);
+            prop_assert_eq!(post_stats.total_volume, pre_stats.total_volume + wager);
         }
     }
 }
