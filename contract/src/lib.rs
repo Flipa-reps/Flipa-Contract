@@ -1,3 +1,23 @@
+//! # Coinflip Contract — Task 5 Checkpoint
+//!
+//! All 43 tests below must pass before game-flow implementation begins.
+//!
+//! ```text
+//! cargo test                                   # full suite (43)
+//! cargo test --lib tests::                     # unit tests (15)
+//! cargo test --lib property_tests::            # core property tests (13)
+//! cargo test --lib outcome_determinism_tests:: # determinism tests (6)
+//! cargo test --lib randomness_regression_tests:: # randomness regression (5)
+//! ```
+//!
+//! | Module                      | Count | Covers                                              |
+//! |-----------------------------|-------|-----------------------------------------------------|
+//! | `tests`                     |  15   | Multipliers, payout arithmetic, init, errors, enums |
+//! | `property_tests`            |  13   | Payout, monotonicity, commitment, config storage    |
+//! | `outcome_determinism_tests` |   6   | Identical inputs → identical outputs                |
+//! | `randomness_regression_tests`|  5   | Commit-reveal unilateral control paths              |
+//! | **Total**                   | **43**|                                                     |
+
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, BytesN, Env};
@@ -127,6 +147,30 @@ const MULTIPLIER_STREAK_2: u32 = 35_000; // 3.5x
 const MULTIPLIER_STREAK_3: u32 = 60_000; // 6.0x
 const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
 
+/// Verifies that a player's revealed preimage matches the stored commitment.
+///
+/// # Commitment Verification Invariants
+///
+/// 1. **Match succeeds**: `sha256(preimage) == commitment` → returns `Ok(())`
+/// 2. **Mismatch fails**: any other preimage → returns `Err(Error::CommitmentMismatch)`
+/// 3. **State is never mutated** by this function; callers are responsible for
+///    acting on the result before writing any state changes.
+/// 4. **Determinism**: the same `(preimage, commitment)` pair always produces
+///    the same result across invocations.
+pub fn verify_commitment(
+    env: &Env,
+    preimage: &BytesN<32>,
+    commitment: &BytesN<32>,
+) -> Result<(), Error> {
+    let hash = env.crypto().sha256(&preimage.clone().into());
+    let hash_bytes: BytesN<32> = hash.into();
+    if hash_bytes == *commitment {
+        Ok(())
+    } else {
+        Err(Error::CommitmentMismatch)
+    }
+}
+
 /// Returns the gross payout multiplier (in basis points, 10_000 = 1x)
 /// for the given win `streak` level.
 ///
@@ -169,6 +213,18 @@ pub struct CoinflipContract;
 #[contractimpl]
 impl CoinflipContract {
     /// Initialize the contract with configuration.
+    ///
+    /// # Initialization invariant
+    ///
+    /// This function may only be called **once**. On the first call it writes
+    /// `StorageKey::Config` to persistent storage; every subsequent call checks
+    /// for that key and returns `Error::AlreadyInitialized` immediately,
+    /// leaving all existing state untouched.
+    ///
+    /// This is the sole re-initialization guard. There is no admin override or
+    /// migration path — a deployed contract's configuration is immutable after
+    /// the first successful `initialize` call (fields may be updated through
+    /// separate admin functions, but `initialize` itself cannot be re-run).
     ///
     /// Accepted inputs:
     /// - `admin`    – any valid Stellar address; must differ from `treasury`
@@ -852,59 +908,246 @@ mod property_tests {
 
     // Feature: soroban-coinflip-game, Property 24: State retrieval accuracy
     // Validates: Requirements 8.1, 8.2, 11.4
+    //
+    // Storage defaults assumed by these tests:
+    //   - ContractConfig.paused  → false  (contract starts unpaused)
+    //   - ContractStats.*        → 0      (all counters start at zero)
+    //   - StorageKey::PlayerGame → None   (no game exists until one is started)
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
-        
+
+        /// Round-trip: every field written to Config storage during initialize()
+        /// is read back unchanged, including admin and treasury addresses.
         #[test]
-        fn test_config_storage_accuracy(
-            fee_bps in 200u32..=500u32,
+        fn test_config_full_round_trip(
+            fee_bps   in 200u32..=500u32,
             min_wager in 1_000_000i128..10_000_000i128,
-            max_wager in 10_000_001i128..1_000_000_000i128
+            max_wager in 10_000_001i128..1_000_000_000i128,
         ) {
             let env = Env::default();
             let contract_id = env.register(CoinflipContract, ());
             let client = CoinflipContractClient::new(&env, &contract_id);
-            
-            let admin = Address::generate(&env);
+
+            let admin    = Address::generate(&env);
             let treasury = Address::generate(&env);
-            
+
             client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
-            
-            // Verify storage by reading back through contract storage
-            let stored_config: ContractConfig = env.as_contract(&contract_id, || {
+
+            let stored: ContractConfig = env.as_contract(&contract_id, || {
                 env.storage().persistent().get(&StorageKey::Config).unwrap()
             });
-            
-            prop_assert_eq!(stored_config.fee_bps, fee_bps);
-            prop_assert_eq!(stored_config.min_wager, min_wager);
-            prop_assert_eq!(stored_config.max_wager, max_wager);
-            prop_assert_eq!(stored_config.paused, false);
+
+            prop_assert_eq!(stored.admin,     admin);
+            prop_assert_eq!(stored.treasury,  treasury);
+            prop_assert_eq!(stored.fee_bps,   fee_bps);
+            prop_assert_eq!(stored.min_wager, min_wager);
+            prop_assert_eq!(stored.max_wager, max_wager);
+            // Storage default: contract starts unpaused
+            prop_assert_eq!(stored.paused, false);
         }
 
+        /// Round-trip: a mutated ContractConfig written directly to storage is
+        /// read back with every field intact (covers save_config / load_config).
         #[test]
-        fn test_stats_initialization(
-            fee_bps in 200u32..=500u32,
+        fn test_config_mutation_round_trip(
+            fee_bps   in 200u32..=500u32,
             min_wager in 1_000_000i128..10_000_000i128,
-            max_wager in 10_000_001i128..1_000_000_000i128
+            max_wager in 10_000_001i128..1_000_000_000i128,
+            paused    in proptest::bool::ANY,
         ) {
             let env = Env::default();
             let contract_id = env.register(CoinflipContract, ());
             let client = CoinflipContractClient::new(&env, &contract_id);
-            
-            let admin = Address::generate(&env);
+
+            let admin    = Address::generate(&env);
             let treasury = Address::generate(&env);
-            
+
+            // Initialise with valid params, then overwrite config with arbitrary paused flag
             client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
-            
-            // Verify stats are initialized to zero
-            let stored_stats: ContractStats = env.as_contract(&contract_id, || {
+
+            let mutated = ContractConfig {
+                admin:    admin.clone(),
+                treasury: treasury.clone(),
+                fee_bps,
+                min_wager,
+                max_wager,
+                paused,
+            };
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::Config, &mutated);
+            });
+
+            let stored: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+
+            prop_assert_eq!(stored, mutated);
+        }
+
+        /// Round-trip: every field written to Stats storage during initialize()
+        /// is read back as zero (storage default for all counters).
+        #[test]
+        fn test_stats_zero_default_round_trip(
+            fee_bps   in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            max_wager in 10_000_001i128..1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &fee_bps, &min_wager, &max_wager);
+
+            let stored: ContractStats = env.as_contract(&contract_id, || {
                 env.storage().persistent().get(&StorageKey::Stats).unwrap()
             });
-            
-            prop_assert_eq!(stored_stats.total_games, 0);
-            prop_assert_eq!(stored_stats.total_volume, 0);
-            prop_assert_eq!(stored_stats.total_fees, 0);
-            prop_assert_eq!(stored_stats.reserve_balance, 0);
+
+            // Storage defaults: all counters start at zero
+            prop_assert_eq!(stored.total_games,    0u64);
+            prop_assert_eq!(stored.total_volume,   0i128);
+            prop_assert_eq!(stored.total_fees,     0i128);
+            prop_assert_eq!(stored.reserve_balance, 0i128);
+        }
+
+        /// Round-trip: arbitrary ContractStats written to storage are read back
+        /// with every field intact (covers save_stats / load_stats).
+        #[test]
+        fn test_stats_mutation_round_trip(
+            total_games     in 0u64..u64::MAX,
+            total_volume    in 0i128..i128::MAX,
+            total_fees      in 0i128..i128::MAX,
+            reserve_balance in 0i128..i128::MAX,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &300, &1_000_000, &100_000_000);
+
+            let mutated = ContractStats { total_games, total_volume, total_fees, reserve_balance };
+
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&StorageKey::Stats, &mutated);
+            });
+
+            let stored: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+
+            prop_assert_eq!(stored, mutated);
+        }
+    }
+
+    // Feature: soroban-coinflip-game, Property: commitment verification
+    //
+    // Invariants validated:
+    //   A. A preimage whose sha256 equals the stored commitment always succeeds.
+    //   B. A preimage that differs from the original always returns CommitmentMismatch.
+    //   C. A mismatch never mutates GameState (state-stability invariant).
+    //   D. Verification is deterministic: same inputs always produce the same result.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Invariant A: matching reveal always succeeds.
+        /// The commitment is built as sha256(preimage), so verify_commitment must
+        /// return Ok(()) for the original preimage.
+        #[test]
+        fn test_commitment_match_succeeds(preimage in prop::array::uniform32(0u8..)) {
+            let env = Env::default();
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            prop_assert!(verify_commitment(&env, &preimage_bytes, &commitment).is_ok());
+        }
+
+        /// Invariant B: any differing preimage returns CommitmentMismatch.
+        /// We flip the first byte to guarantee the preimage differs from the original.
+        #[test]
+        fn test_commitment_mismatch_fails(preimage in prop::array::uniform32(0u8..)) {
+            let env = Env::default();
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            // Construct a wrong preimage by flipping the first byte
+            let mut wrong = preimage;
+            wrong[0] = wrong[0].wrapping_add(1);
+            let wrong_bytes: BytesN<32> = BytesN::from_array(&env, &wrong);
+
+            prop_assert_eq!(
+                verify_commitment(&env, &wrong_bytes, &commitment),
+                Err(Error::CommitmentMismatch)
+            );
+        }
+
+        /// Invariant C: a mismatch does not mutate GameState.
+        /// We snapshot the GameState before calling verify_commitment with a wrong
+        /// preimage and assert the snapshot is identical afterwards.
+        #[test]
+        fn test_commitment_mismatch_does_not_mutate_state(
+            preimage in prop::array::uniform32(0u8..),
+            wager    in 1_000_000i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            // Build a representative GameState and store it
+            let player = Address::generate(&env);
+            let contract_random = BytesN::from_array(&env, &[0u8; 32]);
+            let game = GameState {
+                wager,
+                side: Side::Heads,
+                streak: 0,
+                commitment: commitment.clone(),
+                contract_random: contract_random.clone(),
+                phase: GamePhase::Committed,
+            };
+            env.as_contract(&contract_id, || {
+                env.storage()
+                    .persistent()
+                    .set(&StorageKey::PlayerGame(player.clone()), &game);
+            });
+
+            // Attempt a mismatched reveal — must not change stored state
+            let mut wrong = preimage;
+            wrong[0] = wrong[0].wrapping_add(1);
+            let wrong_bytes: BytesN<32> = BytesN::from_array(&env, &wrong);
+            let _ = verify_commitment(&env, &wrong_bytes, &commitment);
+
+            let stored: GameState = env.as_contract(&contract_id, || {
+                env.storage()
+                    .persistent()
+                    .get(&StorageKey::PlayerGame(player.clone()))
+                    .unwrap()
+            });
+            prop_assert_eq!(stored, game);
+        }
+
+        /// Invariant D: verification is deterministic — same inputs always agree.
+        #[test]
+        fn test_commitment_verification_is_deterministic(
+            preimage in prop::array::uniform32(0u8..),
+        ) {
+            let env = Env::default();
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            let r1 = verify_commitment(&env, &preimage_bytes, &commitment);
+            let r2 = verify_commitment(&env, &preimage_bytes, &commitment);
+            prop_assert_eq!(r1, r2);
         }
     }
 }
