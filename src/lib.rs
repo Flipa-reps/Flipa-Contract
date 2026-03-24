@@ -142,6 +142,7 @@ pub fn get_multiplier(streak: u32) -> u32 {
 /// 2. Integer division by 10,000 implicitly floors/truncates fractional stroops.
 /// 3. `fee_bps` <= 10_000 is mathematically required to avoid net < 0, enforced by config guards.
 /// 4. Subtractions are safe as `fee` is derived as a proportion of `gross` (<= `gross`).
+/// 5. Safe wager bound is `wager <= i128::MAX / 100_000` (approx 1.7e33 stroops) to avoid outer overflow.
 ///
 /// Returns `None` if any intermediate multiplication overflows `i128`.
 ///
@@ -520,6 +521,31 @@ mod property_tests {
         ) {
             let net = calculate_payout(wager, streak, fee_bps).unwrap();
             prop_assert!(net >= 0);
+        }
+
+        /// Assert safe behavior and clear None on overflow limits.
+        /// A wager exceeding i128::MAX / multiplier will safely return None instead of panicking.
+        #[test]
+        fn test_payout_overflow_returns_none(
+            wager in (i128::MAX / 100_000 + 1)..=i128::MAX,
+            streak in 4u32..=10u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let result = calculate_payout(wager, streak, fee_bps);
+            prop_assert!(result.is_none());
+        }
+
+        /// Defensive tests for extremely large, yet safely bounded wager values.
+        /// Ensure accurate calculation without panicking up to the absolute theoretical max.
+        #[test]
+        fn test_payout_large_bounded_wagers(
+            wager in (i128::MAX / 200_000)..(i128::MAX / 100_000),
+            streak in 1u32..=10u32,
+            fee_bps in 0u32..=10_000u32,
+        ) {
+            // These inputs are bounded slightly below the overflow failure point
+            let result = calculate_payout(wager, streak, fee_bps);
+            prop_assert!(result.is_some());
         }
     }
 
