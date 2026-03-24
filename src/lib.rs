@@ -137,6 +137,12 @@ pub fn get_multiplier(streak: u32) -> u32 {
 /// - fee   = gross × fee_bps / 10_000
 /// - net   = gross − fee
 ///
+/// Arithmetic Assumptions:
+/// 1. Uses `i128` to avert overflow during intermediate multiplications (up to `i128::MAX`).
+/// 2. Integer division by 10,000 implicitly floors/truncates fractional stroops.
+/// 3. `fee_bps` <= 10_000 is mathematically required to avoid net < 0, enforced by config guards.
+/// 4. Subtractions are safe as `fee` is derived as a proportion of `gross` (<= `gross`).
+///
 /// Returns `None` if any intermediate multiplication overflows `i128`.
 ///
 /// # Arguments
@@ -485,6 +491,35 @@ mod property_tests {
             let double = calculate_payout(wager * 2, streak, fee_bps).unwrap();
             // Integer division can cause a ±1 stroop rounding difference
             prop_assert!((double - single * 2).abs() <= 1);
+        }
+
+        /// Verify fee boundaries: 0% fee subtracts nothing, 100% fee reduces net to 0.
+        #[test]
+        fn test_payout_fee_boundaries(
+            wager in 1i128..100_000_000i128,
+            streak in 1u32..=10u32,
+        ) {
+            let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
+            
+            // 0% fee (0 bps)
+            let net_zero_fee = calculate_payout(wager, streak, 0).unwrap();
+            prop_assert_eq!(net_zero_fee, gross);
+
+            // 100% fee (10_000 bps)
+            let net_max_fee = calculate_payout(wager, streak, 10_000).unwrap();
+            prop_assert_eq!(net_max_fee, 0);
+        }
+
+        /// Verify non-negative outputs: net payout is never negative for any valid inputs,
+        /// and fee deduction mathematically never exceeds the gross amount.
+        #[test]
+        fn test_payout_non_negative(
+            wager in 0i128..1_000_000_000i128,
+            streak in 1u32..=10u32,
+            fee_bps in 0u32..=10_000u32,
+        ) {
+            let net = calculate_payout(wager, streak, fee_bps).unwrap();
+            prop_assert!(net >= 0);
         }
     }
 
