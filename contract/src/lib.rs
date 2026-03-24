@@ -1,3 +1,23 @@
+//! # Coinflip Contract — Task 5 Checkpoint
+//!
+//! All 43 tests below must pass before game-flow implementation begins.
+//!
+//! ```text
+//! cargo test                                   # full suite (43)
+//! cargo test --lib tests::                     # unit tests (15)
+//! cargo test --lib property_tests::            # core property tests (13)
+//! cargo test --lib outcome_determinism_tests:: # determinism tests (6)
+//! cargo test --lib randomness_regression_tests:: # randomness regression (5)
+//! ```
+//!
+//! | Module                      | Count | Covers                                              |
+//! |-----------------------------|-------|-----------------------------------------------------|
+//! | `tests`                     |  15   | Multipliers, payout arithmetic, init, errors, enums |
+//! | `property_tests`            |  13   | Payout, monotonicity, commitment, config storage    |
+//! | `outcome_determinism_tests` |   6   | Identical inputs → identical outputs                |
+//! | `randomness_regression_tests`|  5   | Commit-reveal unilateral control paths              |
+//! | **Total**                   | **43**|                                                     |
+
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, BytesN, Env};
@@ -113,6 +133,30 @@ const MULTIPLIER_STREAK_1: u32 = 19_000; // 1.9x
 const MULTIPLIER_STREAK_2: u32 = 35_000; // 3.5x
 const MULTIPLIER_STREAK_3: u32 = 60_000; // 6.0x
 const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
+
+/// Verifies that a player's revealed preimage matches the stored commitment.
+///
+/// # Commitment Verification Invariants
+///
+/// 1. **Match succeeds**: `sha256(preimage) == commitment` → returns `Ok(())`
+/// 2. **Mismatch fails**: any other preimage → returns `Err(Error::CommitmentMismatch)`
+/// 3. **State is never mutated** by this function; callers are responsible for
+///    acting on the result before writing any state changes.
+/// 4. **Determinism**: the same `(preimage, commitment)` pair always produces
+///    the same result across invocations.
+pub fn verify_commitment(
+    env: &Env,
+    preimage: &BytesN<32>,
+    commitment: &BytesN<32>,
+) -> Result<(), Error> {
+    let hash = env.crypto().sha256(&preimage.clone().into());
+    let hash_bytes: BytesN<32> = hash.into();
+    if hash_bytes == *commitment {
+        Ok(())
+    } else {
+        Err(Error::CommitmentMismatch)
+    }
+}
 
 /// Returns the gross payout multiplier (in basis points, 10_000 = 1x)
 /// for the given win `streak` level.
@@ -1153,6 +1197,112 @@ mod player_game_delete_tests {
                 env.storage().persistent().get(&StorageKey::PlayerGame(player.clone())).unwrap()
             });
             prop_assert_eq!(loaded.wager, wager_second);
+        }
+    }
+
+    // Feature: soroban-coinflip-game, Property: commitment verification
+    //
+    // Invariants validated:
+    //   A. A preimage whose sha256 equals the stored commitment always succeeds.
+    //   B. A preimage that differs from the original always returns CommitmentMismatch.
+    //   C. A mismatch never mutates GameState (state-stability invariant).
+    //   D. Verification is deterministic: same inputs always produce the same result.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Invariant A: matching reveal always succeeds.
+        /// The commitment is built as sha256(preimage), so verify_commitment must
+        /// return Ok(()) for the original preimage.
+        #[test]
+        fn test_commitment_match_succeeds(preimage in prop::array::uniform32(0u8..)) {
+            let env = Env::default();
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            prop_assert!(verify_commitment(&env, &preimage_bytes, &commitment).is_ok());
+        }
+
+        /// Invariant B: any differing preimage returns CommitmentMismatch.
+        /// We flip the first byte to guarantee the preimage differs from the original.
+        #[test]
+        fn test_commitment_mismatch_fails(preimage in prop::array::uniform32(0u8..)) {
+            let env = Env::default();
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            // Construct a wrong preimage by flipping the first byte
+            let mut wrong = preimage;
+            wrong[0] = wrong[0].wrapping_add(1);
+            let wrong_bytes: BytesN<32> = BytesN::from_array(&env, &wrong);
+
+            prop_assert_eq!(
+                verify_commitment(&env, &wrong_bytes, &commitment),
+                Err(Error::CommitmentMismatch)
+            );
+        }
+
+        /// Invariant C: a mismatch does not mutate GameState.
+        /// We snapshot the GameState before calling verify_commitment with a wrong
+        /// preimage and assert the snapshot is identical afterwards.
+        #[test]
+        fn test_commitment_mismatch_does_not_mutate_state(
+            preimage in prop::array::uniform32(0u8..),
+            wager    in 1_000_000i128..100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = env.register(CoinflipContract, ());
+
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            // Build a representative GameState and store it
+            let player = Address::generate(&env);
+            let contract_random = BytesN::from_array(&env, &[0u8; 32]);
+            let game = GameState {
+                wager,
+                side: Side::Heads,
+                streak: 0,
+                commitment: commitment.clone(),
+                contract_random: contract_random.clone(),
+                phase: GamePhase::Committed,
+            };
+            env.as_contract(&contract_id, || {
+                env.storage()
+                    .persistent()
+                    .set(&StorageKey::PlayerGame(player.clone()), &game);
+            });
+
+            // Attempt a mismatched reveal — must not change stored state
+            let mut wrong = preimage;
+            wrong[0] = wrong[0].wrapping_add(1);
+            let wrong_bytes: BytesN<32> = BytesN::from_array(&env, &wrong);
+            let _ = verify_commitment(&env, &wrong_bytes, &commitment);
+
+            let stored: GameState = env.as_contract(&contract_id, || {
+                env.storage()
+                    .persistent()
+                    .get(&StorageKey::PlayerGame(player.clone()))
+                    .unwrap()
+            });
+            prop_assert_eq!(stored, game);
+        }
+
+        /// Invariant D: verification is deterministic — same inputs always agree.
+        #[test]
+        fn test_commitment_verification_is_deterministic(
+            preimage in prop::array::uniform32(0u8..),
+        ) {
+            let env = Env::default();
+            let preimage_bytes: BytesN<32> = BytesN::from_array(&env, &preimage);
+            let hash = env.crypto().sha256(&preimage_bytes.clone().into());
+            let commitment: BytesN<32> = hash.into();
+
+            let r1 = verify_commitment(&env, &preimage_bytes, &commitment);
+            let r2 = verify_commitment(&env, &preimage_bytes, &commitment);
+            prop_assert_eq!(r1, r2);
         }
     }
 }
