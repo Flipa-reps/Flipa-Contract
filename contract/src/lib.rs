@@ -1705,3 +1705,310 @@ mod property_tests {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature: Loss Forfeiture (Fund Safety Critical)                  Issue #120
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// INVARIANTS VERIFIED:
+//
+//  LF-1  On any loss, `reveal` returns `Ok(false)`.
+//  LF-2  On any loss, the player's game state is completely deleted from
+//        storage — no stale entry remains.
+//  LF-3  On any loss, `reserve_balance` increases by exactly the forfeited
+//        wager — no more, no less.
+//  LF-4  After a loss the player slot is free: a new `start_game` call with
+//        a valid wager succeeds immediately.
+//  LF-5  A loss resets the streak to 0 for the next game (no streak carry-over).
+//  LF-6  Both sides (Heads / Tails) trigger the same forfeiture semantics when
+//        the outcome is the opposite side.
+//  LF-7  Reserve overflow is handled safely: `checked_add` prevents wrapping
+//        even when `reserve_balance` is near `i128::MAX`.
+//
+// OUTCOME DERIVATION (test environment):
+//   contract_random = sha256(ledger_seq.to_be_bytes())
+//   In tests, ledger sequence defaults to 0, so:
+//     contract_random = sha256([0x00, 0x00, 0x00, 0x00])
+//     contract_random[0] = 0xdf  (low bit = 1)
+//   outcome_bit = (sha256(secret)[0] XOR contract_random[0]) & 1
+//     0 → Heads, 1 → Tails
+//
+//   Calibrated loss secrets (verified by sha256 computation):
+//     [3u8; 32] → sha256[0]=0x64 (low bit 0) XOR 0xdf → bit 1 → Tails → LOSS for Heads
+//     [2u8; 32] → sha256[0]=0x65 (low bit 1) XOR 0xdf → bit 0 → Heads → LOSS for Tails
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod loss_forfeiture_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // ── Shared helpers ────────────────────────────────────────────────────────
+
+    /// Initialise a fresh contract with standard fee / wager bounds and fund
+    /// reserves generously so `InsufficientReserves` never fires.
+    fn setup_loss_env(env: &Env) -> (soroban_sdk::Address, CoinflipContractClient) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+
+        let admin    = soroban_sdk::Address::generate(env);
+        let treasury = soroban_sdk::Address::generate(env);
+        let token    = soroban_sdk::Address::generate(env);
+
+        // fee = 300 bps (3 %), wager range [1_000_000, 1_000_000_000]
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000);
+
+        // Fund reserves to the safe ceiling so payout checks always pass.
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = i128::MAX / 2;
+            CoinflipContract::save_stats(env, &stats);
+        });
+
+        (contract_id, client)
+    }
+
+    /// Return a secret that deterministically produces a LOSS for `side`.
+    ///
+    /// In the default test environment (ledger sequence = 0):
+    ///   contract_random = sha256([0,0,0,0]), first byte = 0xdf (low bit = 1)
+    ///   outcome_bit = (sha256(secret)[0] XOR 0xdf) & 1
+    ///     0 → Heads, 1 → Tails
+    ///
+    /// Calibrated by sha256 computation:
+    ///   [3u8; 32] → sha256[0]=0x64 (low bit 0) XOR 0xdf → bit 1 → Tails → LOSS for Heads
+    ///   [2u8; 32] → sha256[0]=0x65 (low bit 1) XOR 0xdf → bit 0 → Heads → LOSS for Tails
+    fn loss_secret_for_side(env: &Env, side: &Side) -> soroban_sdk::Bytes {
+        match side {
+            // Player chose Heads → need Tails outcome → [3u8; 32]
+            Side::Heads => soroban_sdk::Bytes::from_slice(env, &[3u8; 32]),
+            // Player chose Tails → need Heads outcome → [2u8; 32]
+            Side::Tails => soroban_sdk::Bytes::from_slice(env, &[2u8; 32]),
+        }
+    }
+
+    // ── Property tests ────────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // ── LF-1 & LF-2: reveal returns false and game state is deleted ───────
+        //
+        // For any valid wager and either side, a losing reveal must:
+        //   • return Ok(false)
+        //   • leave no game state in storage for the player
+        /// PROPERTY LF-1/LF-2: losing reveal returns false and clears game state.
+        ///
+        /// Post-loss invariants:
+        ///   - `reveal` returns `false` (not an error, not `true`)
+        ///   - `load_player_game` returns `None` — slot is fully deleted
+        #[test]
+        fn prop_loss_returns_false_and_clears_state(
+            wager in 1_000_000i128..=100_000_000i128,
+            side  in prop_oneof![Just(Side::Heads), Just(Side::Tails)],
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_loss_env(&env);
+
+            let player = soroban_sdk::Address::generate(&env);
+            let secret = loss_secret_for_side(&env, &side);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &side, &wager, &commitment);
+
+            // LF-1: must return false
+            let result = client.reveal(&player, &secret);
+            prop_assert!(!result, "reveal must return false on a loss");
+
+            // LF-2: game state must be fully deleted
+            let stored: Option<GameState> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player)
+            });
+            prop_assert!(stored.is_none(),
+                "game state must be deleted from storage after a loss");
+        }
+
+        // ── LF-3: forfeited wager is credited to reserves exactly ─────────────
+        //
+        // For any valid wager, after a loss:
+        //   reserve_balance_after == reserve_balance_before + wager
+        //
+        // This is the core fund-safety invariant: every lost wager must flow
+        // into the reserve pool without truncation, rounding, or duplication.
+        /// PROPERTY LF-3: forfeited wager is credited to reserves exactly.
+        ///
+        /// Post-loss invariant:
+        ///   reserve_balance_after = reserve_balance_before + wager  (exact)
+        #[test]
+        fn prop_loss_credits_exact_wager_to_reserves(
+            wager in 1_000_000i128..=100_000_000i128,
+            side  in prop_oneof![Just(Side::Heads), Just(Side::Tails)],
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_loss_env(&env);
+
+            // Snapshot reserves before the game starts
+            let reserves_before: i128 = env.as_contract(&contract_id, || {
+                CoinflipContract::load_stats(&env).reserve_balance
+            });
+
+            let player = soroban_sdk::Address::generate(&env);
+            let secret = loss_secret_for_side(&env, &side);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &side, &wager, &commitment);
+            client.reveal(&player, &secret);
+
+            let reserves_after: i128 = env.as_contract(&contract_id, || {
+                CoinflipContract::load_stats(&env).reserve_balance
+            });
+
+            prop_assert_eq!(
+                reserves_after,
+                reserves_before + wager,
+                "reserve_balance must increase by exactly the forfeited wager"
+            );
+        }
+
+        // ── LF-4 & LF-5: slot is freed and streak resets after loss ──────────
+        //
+        // After a loss, the player must be able to start a fresh game
+        // immediately, and the new game must begin with streak = 0.
+        /// PROPERTY LF-4/LF-5: player can start a new game after a loss with streak = 0.
+        ///
+        /// Post-loss invariants:
+        ///   - `start_game` succeeds for the same player (slot is free)
+        ///   - new game has `streak == 0` (no carry-over from the lost game)
+        ///   - new game is in `Committed` phase
+        #[test]
+        fn prop_loss_frees_slot_and_resets_streak(
+            wager in 1_000_000i128..=100_000_000i128,
+            side  in prop_oneof![Just(Side::Heads), Just(Side::Tails)],
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_loss_env(&env);
+
+            let player = soroban_sdk::Address::generate(&env);
+            let secret = loss_secret_for_side(&env, &side);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &side, &wager, &commitment);
+            client.reveal(&player, &secret);
+
+            // LF-4: new game must be accepted
+            let new_secret = soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]);
+            let new_commitment: BytesN<32> = env.crypto().sha256(&new_secret).into();
+            let result = client.try_start_game(&player, &side, &wager, &new_commitment);
+            prop_assert!(result.is_ok(),
+                "start_game must succeed after a loss (slot must be free)");
+
+            // LF-5: new game streak must be 0
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game.streak, 0,
+                "streak must be 0 at the start of a new game after a loss");
+            prop_assert_eq!(game.phase, GamePhase::Committed,
+                "new game must be in Committed phase");
+        }
+
+        // ── LF-6: both sides produce identical forfeiture semantics ──────────
+        //
+        // The loss path must behave identically regardless of which side the
+        // player chose.  This guards against any accidental side-specific
+        // branching in the loss code.
+        /// PROPERTY LF-6: forfeiture semantics are side-agnostic.
+        ///
+        /// Invariant: reserve delta is identical for Heads-loss and Tails-loss
+        /// given the same wager amount.
+        #[test]
+        fn prop_loss_forfeiture_is_side_agnostic(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            // --- Heads loss ---
+            let env_h = Env::default();
+            let (contract_id_h, client_h) = setup_loss_env(&env_h);
+            let reserves_before_h: i128 = env_h.as_contract(&contract_id_h, || {
+                CoinflipContract::load_stats(&env_h).reserve_balance
+            });
+            let player_h = soroban_sdk::Address::generate(&env_h);
+            let secret_h = loss_secret_for_side(&env_h, &Side::Heads);
+            let commitment_h: BytesN<32> = env_h.crypto().sha256(&secret_h).into();
+            client_h.start_game(&player_h, &Side::Heads, &wager, &commitment_h);
+            client_h.reveal(&player_h, &secret_h);
+            let delta_h = env_h.as_contract(&contract_id_h, || {
+                CoinflipContract::load_stats(&env_h).reserve_balance
+            }) - reserves_before_h;
+
+            // --- Tails loss ---
+            let env_t = Env::default();
+            let (contract_id_t, client_t) = setup_loss_env(&env_t);
+            let reserves_before_t: i128 = env_t.as_contract(&contract_id_t, || {
+                CoinflipContract::load_stats(&env_t).reserve_balance
+            });
+            let player_t = soroban_sdk::Address::generate(&env_t);
+            let secret_t = loss_secret_for_side(&env_t, &Side::Tails);
+            let commitment_t: BytesN<32> = env_t.crypto().sha256(&secret_t).into();
+            client_t.start_game(&player_t, &Side::Tails, &wager, &commitment_t);
+            client_t.reveal(&player_t, &secret_t);
+            let delta_t = env_t.as_contract(&contract_id_t, || {
+                CoinflipContract::load_stats(&env_t).reserve_balance
+            }) - reserves_before_t;
+
+            prop_assert_eq!(delta_h, delta_t,
+                "reserve delta must be identical for Heads-loss and Tails-loss");
+            prop_assert_eq!(delta_h, wager,
+                "reserve delta must equal the forfeited wager");
+        }
+    }
+
+    // ── LF-7: reserve overflow safety (single deterministic case) ────────────
+    //
+    // When reserve_balance is near i128::MAX, a loss must not wrap or panic.
+    // The contract uses checked_add with an unwrap_or fallback, so the balance
+    // must remain unchanged (saturate) rather than overflow.
+    //
+    // This is a unit-style test (not proptest) because the near-MAX value is
+    // a fixed edge case, not a random range.
+    /// PROPERTY LF-7: reserve overflow is handled safely near i128::MAX.
+    ///
+    /// Invariant: reserve_balance never wraps on a loss when already near MAX.
+    #[test]
+    fn prop_loss_reserve_overflow_is_safe() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let admin    = soroban_sdk::Address::generate(&env);
+        let treasury = soroban_sdk::Address::generate(&env);
+        let token    = soroban_sdk::Address::generate(&env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000);
+
+        // Set reserves to i128::MAX so checked_add saturates on the loss credit.
+        let near_max = i128::MAX;
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(&env);
+            stats.reserve_balance = near_max;
+            CoinflipContract::save_stats(&env, &stats);
+        });
+
+        let player = soroban_sdk::Address::generate(&env);
+        let wager  = 1_000_000i128;
+        let secret = soroban_sdk::Bytes::from_slice(&env, &[3u8; 32]); // loss for Heads
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+        // Must not panic or wrap — checked_add fallback keeps balance at near_max
+        let result = client.try_reveal(&player, &secret);
+        assert!(result.is_ok(), "reveal must not panic on reserve overflow edge case");
+
+        let stats: ContractStats = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        });
+        // Balance must be >= near_max (saturated, not wrapped to negative)
+        assert!(stats.reserve_balance >= near_max,
+            "reserve_balance must not wrap below near_max on overflow");
+    }
+}
