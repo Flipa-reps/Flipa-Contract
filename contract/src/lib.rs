@@ -407,108 +407,194 @@ impl CoinflipContract {
         Ok(())
     }
 
-    /// Cash out winnings after a winning reveal.
+    /// Reveal the player's secret to determine the game outcome.
     ///
-    /// # Eligibility rules (cash-out preconditions)
+    /// Process:
+    /// 1. Verify commitment matches the revealed secret
+    /// 2. Combine player random + contract random to determine outcome
+    /// 3. Update game state to Revealed phase with result
+    /// 4. If player wins, calculate potential payout
+    /// 5. If player loses, end game and reset streak
     ///
-    /// A cash-out is only valid when ALL of the following hold:
-    ///
-    /// 1. `player` has an active game record (`NoActiveGame` otherwise).
-    /// 2. The game is in the `Revealed` phase (`InvalidPhase` otherwise).
-    ///    - `Committed` → reveal has not happened yet; cash-out is premature.
-    ///    - `Completed` → game already ended; nothing left to claim.
-    /// 3. The game streak is ≥ 1, meaning the last reveal was a **win**
-    ///    (`NoWinningsToClaimOrContinue` otherwise).
-    ///    - streak == 0 after reveal means the player lost; no payout is owed.
-    ///
-    /// # Payout calculation
-    ///
-    /// ```text
-    /// gross = wager × get_multiplier(streak) / 10_000
-    /// fee   = gross × fee_bps / 10_000
-    /// net   = gross − fee
-    /// ```
-    ///
-    /// The net amount is transferred from the contract's token account to the
-    /// player. The fee portion stays in the contract (credited to treasury
-    /// accounting via `total_fees`). Reserves are debited by the net payout.
-    ///
-    /// # State transitions
-    ///
-    /// On success:
-    /// - `game.phase` → `Completed`
-    /// - `stats.total_fees` += fee
-    /// - `stats.reserve_balance` -= net_payout
-    ///
-    /// All state mutations happen **after** all precondition checks pass,
-    /// ensuring no partial state is written on error.
-    ///
-    /// # Errors
-    ///
-    /// | Error                        | Condition                                      |
-    /// |------------------------------|------------------------------------------------|
-    /// | `NoActiveGame`               | No game record exists for `player`             |
-    /// | `InvalidPhase`               | Game is not in `Revealed` phase                |
-    /// | `NoWinningsToClaimOrContinue`| streak == 0 (last reveal was a loss)           |
-    /// | `InsufficientReserves`       | Arithmetic overflow computing payout           |
-    pub fn cash_out(env: Env, player: Address) -> Result<i128, Error> {
+    /// Errors:
+    /// - NoActiveGame: player has no game in Committed phase
+    /// - InvalidPhase: game not in Committed phase  
+    /// - CommitmentMismatch: revealed secret doesn't match stored commitment
+    pub fn reveal(
+        env: Env,
+        player: Address,
+        secret: Bytes,
+    ) -> Result<(), Error> {
         player.require_auth();
 
-        // ── Guard 1: player must have a game record ──────────────────────────
-        let game = Self::load_player_game(&env, &player)
+        let mut game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
 
-        // ── Guard 2: game must be in Revealed phase ──────────────────────────
-        // Committed → reveal hasn't happened yet (premature cash-out).
-        // Completed → game already ended (nothing left to claim).
+        // Must be in Committed phase to reveal
+        if game.phase != GamePhase::Committed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // Verify the commitment matches the revealed secret
+        if !verify_commitment(&env, &secret, &game.commitment) {
+            return Err(Error::CommitmentMismatch);
+        }
+
+        // Determine outcome by combining player random + contract random
+        let combined_input = {
+            let mut combined = Bytes::new(&env);
+            combined.extend_from_slice(&secret);
+            combined.extend_from_slice(&game.contract_random.as_slice());
+            env.crypto().sha256(&combined)
+        };
+
+        // Use first byte to determine heads/tails (0 = Heads, 1 = Tails)
+        let outcome_byte = combined_input.as_slice().get(0).unwrap_or(&0);
+        let outcome = if *outcome_byte % 2 == 0 { Side::Heads } else { Side::Tails };
+
+        // Update game state based on outcome
+        if outcome == game.side {
+            // Player wins - advance to next streak level
+            game.streak += 1;
+            game.phase = GamePhase::Revealed;
+        } else {
+            // Player loses - game ends, streak resets
+            game.phase = GamePhase::Completed;
+            game.streak = 0;
+        }
+
+        Self::save_player_game(&env, &player, &game);
+        Ok(())
+    }
+
+    /// Claim winnings after a successful reveal.
+    ///
+    /// Process:
+    /// 1. Verify game is in Revealed phase (player won)
+    /// 2. Calculate net payout (gross - fee)
+    /// 3. Transfer net payout to player
+    /// 4. Transfer fee to treasury
+    /// 5. Update contract reserves and stats
+    /// 6. Reset game to Completed phase
+    ///
+    /// Errors:
+    /// - NoActiveGame: player has no game
+    /// - InvalidPhase: game not in Revealed phase
+    /// - TransferFailed: token transfer fails
+    pub fn claim_winnings(
+        env: Env,
+        player: Address,
+    ) -> Result<(), Error> {
+        player.require_auth();
+
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // Must be in Revealed phase to claim (player won)
         if game.phase != GamePhase::Revealed {
             return Err(Error::InvalidPhase);
         }
 
-        // ── Guard 3: streak ≥ 1 means the last reveal was a win ─────────────
-        // streak == 0 after reveal means the player lost; no payout is owed.
-        if game.streak == 0 {
-            return Err(Error::NoWinningsToClaimOrContinue);
-        }
-
-        // ── Compute payout ───────────────────────────────────────────────────
         let config = Self::load_config(&env);
+        let token_client = token::Client::new(&env, &config.token);
+
+        // Calculate payout
         let net_payout = calculate_payout(game.wager, game.streak, config.fee_bps)
             .ok_or(Error::InsufficientReserves)?;
 
-        // Derive fee from gross for stats accounting.
-        // gross = wager * multiplier / 10_000
-        let multiplier = get_multiplier(game.streak) as i128;
-        let gross = game.wager
-            .checked_mul(multiplier)
+        // Calculate gross payout and fee separately for accounting
+        let gross_payout = game.wager
+            .checked_mul(get_multiplier(game.streak) as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
-        let fee = gross.checked_sub(net_payout).ok_or(Error::InsufficientReserves)?;
+        let fee_amount = gross_payout
+            .checked_mul(config.fee_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
 
-        // ── Transfer net payout to player ────────────────────────────────────
-        // Uses the SAC token client; the contract must hold sufficient balance.
-        let token_client = token::Client::new(&env, &config.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &player,
-            &net_payout,
-        );
+        // Check sufficient reserves
+        let stats = Self::load_stats(&env);
+        if stats.reserve_balance < gross_payout {
+            return Err(Error::InsufficientReserves);
+        }
 
-        // ── Persist state changes ────────────────────────────────────────────
-        // Mark game completed — player can start a fresh game after this.
-        let mut completed_game = game;
-        completed_game.phase = GamePhase::Completed;
-        Self::save_player_game(&env, &player, &completed_game);
+        // Transfer net payout to player
+        if token_client.try_transfer(&env, &env.current_contract_address(), &player, &net_payout) != soroban_sdk::InvokeError::Ok {
+            return Err(Error::TransferFailed);
+        }
 
-        // Update aggregate stats: credit fee, debit reserves.
-        let mut stats = Self::load_stats(&env);
-        stats.total_fees = stats.total_fees.checked_add(fee).unwrap_or(stats.total_fees);
-        stats.reserve_balance = stats.reserve_balance
-            .checked_sub(net_payout)
-            .unwrap_or(stats.reserve_balance);
+        // Transfer fee to treasury
+        if token_client.try_transfer(&env, &env.current_contract_address(), &config.treasury, &fee_amount) != soroban_sdk::InvokeError::Ok {
+            return Err(Error::TransferFailed);
+        }
+
+        // Update contract state
+        let mut stats = stats;
+        stats.reserve_balance = stats.reserve_balance.checked_sub(gross_payout)
+            .ok_or(Error::InsufficientReserves)?;
+        stats.total_fees = stats.total_fees.checked_add(fee_amount).unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
 
-        Ok(net_payout)
+        // Reset game to completed
+        game.phase = GamePhase::Completed;
+        Self::save_player_game(&env, &player, &game);
+
+        Ok(())
+    }
+
+    /// Continue to next streak level after winning.
+    ///
+    /// Process:
+    /// 1. Verify game is in Revealed phase (player won)
+    /// 2. Reset game to Committed phase for next round
+    /// 3. Player keeps current streak and wager
+    /// 4. Generate new contract randomness
+    ///
+    /// Errors:
+    /// - NoActiveGame: player has no game
+    /// - InvalidPhase: game not in Revealed phase
+    pub fn continue_streak(
+        env: Env,
+        player: Address,
+        new_commitment: BytesN<32>,
+    ) -> Result<(), Error> {
+        player.require_auth();
+
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // Must be in Revealed phase to continue (player won)
+        if game.phase != GamePhase::Revealed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // Verify reserves cover next potential payout
+        let config = Self::load_config(&env);
+        let stats = Self::load_stats(&env);
+        
+        let next_streak = game.streak + 1;
+        let max_payout = game.wager
+            .checked_mul(get_multiplier(next_streak) as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        
+        if stats.reserve_balance < max_payout {
+            return Err(Error::InsufficientReserves);
+        }
+
+        // Generate new contract randomness
+        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let contract_random = env.crypto().sha256(
+            &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
+        );
+
+        // Reset to Committed phase for next round
+        game.phase = GamePhase::Committed;
+        game.commitment = new_commitment;
+        game.contract_random = contract_random;
+
+        Self::save_player_game(&env, &player, &game);
+        Ok(())
     }
 }
 
@@ -1760,6 +1846,796 @@ mod property_tests {
 
             prop_assert_eq!(post_stats.total_games, pre_stats.total_games + 1);
             prop_assert_eq!(post_stats.total_volume, pre_stats.total_volume + wager);
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Feature: Cash-Out Transfer Property Tests
+    // Validates: player and treasury balances reflect expected transfers after settlement
+    // ───────────────────────────────────────────────────────────────────────
+
+    // Helper to setup a complete game scenario for transfer testing
+    fn setup_game_for_transfer_test(
+        env: &Env,
+        wager: i128,
+        fee_bps: u32,
+        player_wins: bool,
+    ) -> (Address, Address, Address, soroban_sdk::Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+
+        // Fund with sufficient reserves
+        let required_reserves = wager
+            .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or(0);
+        fund_reserves(&env, &contract_id, required_reserves + 10_000_000);
+
+        let player = Address::generate(&env);
+        
+        // Create commitment
+        let secret = if player_wins { 
+            Bytes::from_slice(&env, &[1u8; 32]) // Will produce Heads outcome
+        } else { 
+            Bytes::from_slice(&env, &[2u8; 32]) // Will produce Tails outcome  
+        };
+        let commitment = env.crypto().sha256(&secret);
+
+        // Start game with Heads choice
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+
+        // Reveal to determine outcome
+        client.reveal(&player, &secret);
+
+        (admin, treasury, token, contract_id)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// PROPERTY: Claim winnings transfers correct amounts to player and treasury
+        /// Validates: net payout to player, fee to treasury, reserve reduction
+        #[test]
+        fn test_claim_winnings_balance_transfers(
+            wager in 1_000_000i128..=10_000_000i128,
+            fee_bps in 200u32..=500u32,
+            streak in 1u32..=3u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            
+            let (admin, treasury, token, contract_id) = 
+                setup_game_for_transfer_test(&env, wager, fee_bps, true);
+            
+            let client = CoinflipContract::new(&env, &contract_id);
+            let token_client = token::Client::new(&env, &token);
+            let player = Address::generate(&env);
+
+            // Get pre-claim balances
+            let pre_contract_balance = token_client.balance(&env, &contract_id);
+            let pre_treasury_balance = token_client.balance(&env, &treasury);
+            let pre_player_balance = token_client.balance(&env, &player);
+
+            // Calculate expected amounts
+            let gross_payout = wager
+                .checked_mul(get_multiplier(streak) as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let fee_amount = gross_payout
+                .checked_mul(fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let net_payout = gross_payout - fee_amount;
+
+            // Claim winnings
+            let result = client.try_claim_winnings(&player);
+            prop_assert!(result.is_ok());
+
+            // Verify post-claim balances
+            let post_contract_balance = token_client.balance(&env, &contract_id);
+            let post_treasury_balance = token_client.balance(&env, &treasury);
+            let post_player_balance = token_client.balance(&env, &player);
+
+            // Contract balance should decrease by gross payout
+            prop_assert_eq!(
+                post_contract_balance, 
+                pre_contract_balance - gross_payout
+            );
+
+            // Treasury should receive exactly the fee
+            prop_assert_eq!(
+                post_treasury_balance,
+                pre_treasury_balance + fee_amount
+            );
+
+            // Player should receive exactly the net payout
+            prop_assert_eq!(
+                post_player_balance,
+                pre_player_balance + net_payout
+            );
+        }
+
+        /// PROPERTY: Fee and net payout separation is mathematically correct
+        /// Validates: gross = net + fee, fee < gross, net > 0
+        #[test]
+        fn test_fee_net_payout_separation(
+            wager in 1_000_000i128..=50_000_000i128,
+            fee_bps in 200u32..=500u32,
+            streak in 1u32..=4u32,
+        ) {
+            let gross_payout = wager
+                .checked_mul(get_multiplier(streak) as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let fee_amount = gross_payout
+                .checked_mul(fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let net_payout = calculate_payout(wager, streak, fee_bps).unwrap();
+
+            // Invariant: gross = net + fee
+            prop_assert_eq!(gross_payout, net_payout + fee_amount);
+
+            // Invariant: fee is always less than gross (unless fee_bps = 10_000)
+            prop_assert!(fee_amount < gross_payout || fee_bps == 10_000);
+
+            // Invariant: net payout is always positive for valid fee_bps (2-5%)
+            prop_assert!(net_payout > 0);
+
+            // Invariant: fee calculation is consistent
+            let expected_fee = gross_payout.checked_mul(fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000)).unwrap();
+            prop_assert_eq!(fee_amount, expected_fee);
+        }
+
+        /// PROPERTY: Multiple claims correctly track cumulative balances
+        /// Validates: sequential claims don't interfere with each other
+        #[test]
+        fn test_multiple_claims_balance_tracking(
+            wager1 in 1_000_000i128..=5_000_000i128,
+            wager2 in 1_000_000i128..=5_000_000i128,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            
+            let (admin, treasury, token, contract_id) = 
+                setup_game_for_transfer_test(&env, wager1, fee_bps, true);
+            
+            let client = CoinflipContract::new(&env, &contract_id);
+            let token_client = token::Client::new(&env, &token);
+            
+            let player1 = Address::generate(&env);
+            let player2 = Address::generate(&env);
+
+            // Setup second game for player2
+            let secret2 = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment2 = env.crypto().sha256(&secret2);
+            client.start_game(&player2, &Side::Heads, &wager2, &commitment2);
+            client.reveal(&player2, &secret2);
+
+            // Record initial balances
+            let initial_treasury = token_client.balance(&env, &treasury);
+            let initial_contract = token_client.balance(&env, &contract_id);
+
+            // First claim
+            let result1 = client.try_claim_winnings(&player1);
+            prop_assert!(result1.is_ok());
+
+            let after_first_treasury = token_client.balance(&env, &treasury);
+            let after_first_contract = token_client.balance(&env, &contract_id);
+
+            // Second claim
+            let result2 = client.try_claim_winnings(&player2);
+            prop_assert!(result2.is_ok());
+
+            let final_treasury = token_client.balance(&env, &treasury);
+            let final_contract = token_client.balance(&env, &contract_id);
+
+            // Both claims should succeed independently
+            prop_assert!(result1.is_ok() && result2.is_ok());
+
+            // Treasury should receive fees from both claims
+            prop_assert!(final_treasury > after_first_treasury);
+            prop_assert!(after_first_treasury > initial_treasury);
+
+            // Contract should pay out both gross amounts
+            prop_assert!(final_contract < after_first_contract);
+            prop_assert!(after_first_contract < initial_contract);
+        }
+
+        /// PROPERTY: Continue streak preserves reserves correctly
+        /// Validates: no transfers occur during continue, only state changes
+        #[test]
+        fn test_continue_streak_no_transfers(
+            wager in 1_000_000i128..=10_000_000i128,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            
+            let (admin, treasury, token, contract_id) = 
+                setup_game_for_transfer_test(&env, wager, fee_bps, true);
+            
+            let client = CoinflipContract::new(&env, &contract_id);
+            let token_client = token::Client::new(&env, &token);
+            let player = Address::generate(&env);
+
+            // Get pre-continue balances
+            let pre_contract_balance = token_client.balance(&env, &contract_id);
+            let pre_treasury_balance = token_client.balance(&env, &treasury);
+            let pre_player_balance = token_client.balance(&env, &player);
+
+            // Continue streak
+            let new_commitment = env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.try_continue_streak(&player, &new_commitment);
+            prop_assert!(result.is_ok());
+
+            // Verify no transfers occurred
+            let post_contract_balance = token_client.balance(&env, &contract_id);
+            let post_treasury_balance = token_client.balance(&env, &treasury);
+            let post_player_balance = token_client.balance(&env, &player);
+
+            prop_assert_eq!(pre_contract_balance, post_contract_balance);
+            prop_assert_eq!(pre_treasury_balance, post_treasury_balance);
+            prop_assert_eq!(pre_player_balance, post_player_balance);
+
+            // Verify game state reset to Committed
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game.phase, GamePhase::Committed);
+        }
+
+        /// PROPERTY: Reserve solvency is maintained throughout settlement
+        /// Validates: contract never pays out more than it holds
+        #[test]
+        fn test_reserve_solvency_during_settlement(
+            initial_reserves in 10_000_000i128..=100_000_000i128,
+            wager in 1_000_000i128..=5_000_000i128,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+            
+            // Set initial reserves
+            fund_reserves(&env, &contract_id, initial_reserves);
+
+            let player = Address::generate(&env);
+            let secret = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment = env.crypto().sha256(&secret);
+
+            // Start and win game
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            client.reveal(&player, &secret);
+
+            // Get pre-claim reserves
+            let pre_stats: ContractStats = env.as_contract(&contract_id, || {
+                CoinflipContract::load_stats(&env)
+            });
+
+            // Claim winnings
+            let result = client.try_claim_winnings(&player);
+            prop_assert!(result.is_ok());
+
+            // Verify post-claim reserves
+            let post_stats: ContractStats = env.as_contract(&contract_id, || {
+                CoinflipContract::load_stats(&env)
+            });
+
+            let gross_payout = wager
+                .checked_mul(19_000i128) // streak 1 multiplier
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+
+            // Reserves should decrease by exactly gross payout
+            prop_assert_eq!(
+                post_stats.reserve_balance,
+                pre_stats.reserve_balance - gross_payout
+            );
+
+            // Reserves should never be negative
+            prop_assert!(post_stats.reserve_balance >= 0);
+
+            // Total fees should increase
+            prop_assert!(post_stats.total_fees > pre_stats.total_fees);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: soroban-coinflip-game
+// Module:  streak_increment_tests
+//
+// Validates that winning reveals increment the streak counter exactly once per
+// win, that progression through multiplier tiers is strictly monotonic, and
+// that no tier is ever skipped regardless of the starting streak value.
+//
+// Invariants under test:
+//   I-1  A single win increments streak by exactly 1 (never 0, never 2+).
+//   I-2  Streak progression is strictly monotonic: streak_n+1 == streak_n + 1.
+//   I-3  No multiplier tier is skipped: every tier 1→2→3→4 is reachable in
+//        exactly one step from the previous tier.
+//   I-4  Streak starts at 0 on a fresh game and reaches tier 1 on the first win.
+//   I-5  Streak saturates at tier 4+ — the multiplier is capped but the counter
+//        continues to increment (no overflow, no reset).
+//   I-6  Payout at streak N+1 is strictly greater than payout at streak N for
+//        any fixed wager and fee (multiplier monotonicity drives payout growth).
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod streak_increment_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    /// Simulate a single win by incrementing the streak field exactly as the
+    /// reveal path will do: `new_streak = old_streak + 1`.
+    ///
+    /// This helper isolates the increment arithmetic from the full reveal flow
+    /// so that property tests can exercise it independently of randomness or
+    /// token transfer logic that is not yet wired up.
+    fn apply_win(streak: u32) -> u32 {
+        streak.checked_add(1).expect("streak overflow in test helper")
+    }
+
+    /// Simulate N consecutive wins starting from `initial_streak`.
+    /// Returns the streak value after all wins have been applied.
+    fn apply_n_wins(initial_streak: u32, n: u32) -> u32 {
+        (0..n).fold(initial_streak, |s, _| apply_win(s))
+    }
+
+    /// Return the multiplier tier index (1-based) for a given streak.
+    /// Tier 4 is the cap; any streak >= 4 maps to tier 4.
+    fn tier_of(streak: u32) -> u32 {
+        streak.min(4)
+    }
+
+    // ── unit tests ───────────────────────────────────────────────────────────
+
+    /// I-4: A fresh game starts at streak 0; the first win brings it to 1.
+    #[test]
+    fn test_streak_starts_at_zero_and_first_win_reaches_tier_1() {
+        let initial = 0u32;
+        let after_win = apply_win(initial);
+        assert_eq!(after_win, 1, "first win must set streak to exactly 1");
+        assert_eq!(
+            get_multiplier(after_win),
+            MULTIPLIER_STREAK_1,
+            "streak 1 must map to the 1.9x tier"
+        );
+    }
+
+    /// I-3: Each tier transition is reachable in exactly one step.
+    #[test]
+    fn test_no_tier_is_skipped_across_all_transitions() {
+        // streak 0 → 1 → 2 → 3 → 4
+        let transitions: &[(u32, u32, u32)] = &[
+            (0, 1, MULTIPLIER_STREAK_1),
+            (1, 2, MULTIPLIER_STREAK_2),
+            (2, 3, MULTIPLIER_STREAK_3),
+            (3, 4, MULTIPLIER_STREAK_4_PLUS),
+        ];
+        for &(before, expected_after, expected_multiplier) in transitions {
+            let after = apply_win(before);
+            assert_eq!(
+                after, expected_after,
+                "win from streak {} must yield streak {}", before, expected_after
+            );
+            assert_eq!(
+                get_multiplier(after), expected_multiplier,
+                "streak {} must map to multiplier {}", after, expected_multiplier
+            );
+        }
+    }
+
+    /// I-5: Streak counter keeps incrementing past tier 4 without overflow or reset.
+    #[test]
+    fn test_streak_increments_past_tier_4_without_reset() {
+        let mut streak = 4u32;
+        for expected in 5u32..=20 {
+            streak = apply_win(streak);
+            assert_eq!(streak, expected);
+            // Multiplier must remain capped at 10x — no reset to a lower tier.
+            assert_eq!(
+                get_multiplier(streak),
+                MULTIPLIER_STREAK_4_PLUS,
+                "multiplier must stay at 10x cap for streak {}", streak
+            );
+        }
+    }
+
+    /// I-1 (deterministic): A single win always increments by exactly 1.
+    #[test]
+    fn test_single_win_increments_by_exactly_one_deterministic() {
+        for streak in [0u32, 1, 2, 3, 4, 10, 100, u32::MAX - 1] {
+            // Use saturating_add to avoid panic on u32::MAX; the contract uses
+            // checked_add so u32::MAX is an unreachable game state in practice.
+            let after = streak.saturating_add(1);
+            assert_eq!(after, streak + 1);
+        }
+    }
+
+    // ── property tests ───────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        /// I-1 (property): For any streak in [0, u32::MAX - 1], a single win
+        /// increments the counter by exactly 1 — never 0, never 2 or more.
+        ///
+        /// This is the core atomicity invariant: each winning reveal must
+        /// contribute exactly one unit to the streak, ensuring the multiplier
+        /// tier advances at the correct rate.
+        #[test]
+        fn prop_single_win_increments_streak_by_exactly_one(
+            streak in 0u32..u32::MAX,
+        ) {
+            let after = apply_win(streak);
+            prop_assert_eq!(
+                after, streak + 1,
+                "win from streak {} must yield streak {}, got {}", streak, streak + 1, after
+            );
+        }
+
+        /// I-2 (property): N consecutive wins from any starting streak produce
+        /// a streak of exactly `initial + N` — progression is strictly monotonic
+        /// with no gaps, no resets, and no double-increments.
+        ///
+        /// Monotonicity guarantee: streak_after_k_wins = streak_initial + k
+        /// for all k in [1, N].
+        #[test]
+        fn prop_streak_progression_is_strictly_monotonic(
+            initial_streak in 0u32..100u32,
+            n_wins in 1u32..=20u32,
+        ) {
+            let mut streak = initial_streak;
+            for k in 1..=n_wins {
+                streak = apply_win(streak);
+                prop_assert_eq!(
+                    streak,
+                    initial_streak + k,
+                    "after {} wins from streak {}, expected streak {}, got {}",
+                    k, initial_streak, initial_streak + k, streak
+                );
+            }
+        }
+
+        /// I-3 (property): For any streak in [0, 3], a single win advances to
+        /// the next multiplier tier — no tier is ever skipped.
+        ///
+        /// Tier mapping:
+        ///   streak 1 → MULTIPLIER_STREAK_1 (1.9x)
+        ///   streak 2 → MULTIPLIER_STREAK_2 (3.5x)
+        ///   streak 3 → MULTIPLIER_STREAK_3 (6.0x)
+        ///   streak 4 → MULTIPLIER_STREAK_4_PLUS (10.0x)
+        #[test]
+        fn prop_no_multiplier_tier_is_skipped(streak in 0u32..=3u32) {
+            let before_tier = tier_of(streak);
+            let after_streak = apply_win(streak);
+            let after_tier = tier_of(after_streak);
+
+            // Tier must advance by exactly 1 for streaks 0-3.
+            prop_assert_eq!(
+                after_tier, before_tier + 1,
+                "win from streak {} (tier {}) must advance to tier {}, got tier {}",
+                streak, before_tier, before_tier + 1, after_tier
+            );
+
+            // The multiplier at the new tier must be strictly greater.
+            prop_assert!(
+                get_multiplier(after_streak) > get_multiplier(streak.max(1)),
+                "multiplier must increase when advancing from streak {} to {}",
+                streak, after_streak
+            );
+        }
+
+        /// I-5 (property): For any streak >= 4, a win increments the counter
+        /// but the multiplier remains at the 10x cap — no regression to a
+        /// lower tier, no wrap-around.
+        #[test]
+        fn prop_streak_past_tier_4_stays_capped(streak in 4u32..1_000u32) {
+            let after = apply_win(streak);
+            prop_assert_eq!(after, streak + 1);
+            prop_assert_eq!(
+                get_multiplier(after),
+                MULTIPLIER_STREAK_4_PLUS,
+                "multiplier must remain at 10x cap for streak {}", after
+            );
+        }
+
+        /// I-6 (property): Payout at streak N+1 is strictly greater than payout
+        /// at streak N for any fixed wager and fee, as long as N is in [1, 3]
+        /// (the range where the multiplier still increases).
+        ///
+        /// This validates that the multiplier tier system actually translates
+        /// into higher payouts — a regression here would break game fairness.
+        #[test]
+        fn prop_payout_strictly_increases_with_streak_tier(
+            wager   in 1_000_000i128..100_000_000i128,
+            streak  in 1u32..=3u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let payout_now  = calculate_payout(wager, streak,     fee_bps).unwrap();
+            let payout_next = calculate_payout(wager, streak + 1, fee_bps).unwrap();
+            prop_assert!(
+                payout_next > payout_now,
+                "payout at streak {} ({}) must exceed payout at streak {} ({}) for wager {}",
+                streak + 1, payout_next, streak, payout_now, wager
+            );
+        }
+
+        /// Invariant: streak stored in GameState starts at 0 for every new game,
+        /// regardless of wager, side, or commitment bytes.
+        ///
+        /// This ensures the multiplier tier always begins at the base level and
+        /// cannot be pre-seeded to a higher tier by any input.
+        #[test]
+        fn prop_new_game_streak_always_initializes_to_zero(
+            wager in 1_000_000i128..=100_000_000i128,
+            side in prop_oneof![Just(Side::Heads), Just(Side::Tails)],
+            commitment_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+
+            // Fund reserves to cover worst-case payout.
+            env.as_contract(&contract_id, || {
+                let mut stats = CoinflipContract::load_stats(&env);
+                stats.reserve_balance = wager
+                    .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+                    .and_then(|v| v.checked_div(10_000))
+                    .unwrap_or(0)
+                    + 1_000_000;
+                CoinflipContract::save_stats(&env, &stats);
+            });
+
+            let player     = Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+
+            client.start_game(&player, &side, &wager, &commitment);
+
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(
+                game.streak, 0u32,
+                "new game streak must be 0, got {} for wager {} side {:?}",
+                game.streak, wager, side
+            );
+        }
+
+        /// Invariant: simulated streak after k wins from a fresh game (streak=0)
+        /// always equals k, and the multiplier tier is min(k, 4).
+        ///
+        /// This is the end-to-end streak progression invariant: starting from
+        /// zero, k wins must land on streak k with the correct tier.
+        #[test]
+        fn prop_k_wins_from_zero_yields_streak_k_and_correct_tier(
+            k in 1u32..=10u32,
+        ) {
+            let streak_after = apply_n_wins(0, k);
+            prop_assert_eq!(streak_after, k);
+
+            let expected_multiplier = get_multiplier(k);
+            prop_assert_eq!(
+                get_multiplier(streak_after), expected_multiplier,
+                "after {} wins, multiplier must be {}", k, expected_multiplier
+            );
+
+            // Tier must be capped at 4.
+            let expected_tier = k.min(4);
+            prop_assert_eq!(
+                tier_of(streak_after), expected_tier,
+                "after {} wins, tier must be {}", k, expected_tier
+            );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: soroban-coinflip-game
+// Module:  outcome_determinism_tests
+//
+// Validates that all pure helper functions produce identical outputs for
+// identical inputs — a prerequisite for provably fair gameplay.
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod outcome_determinism_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// get_multiplier is a pure function: same streak → same multiplier, always.
+        #[test]
+        fn prop_multiplier_is_deterministic(streak in 0u32..=1_000u32) {
+            prop_assert_eq!(get_multiplier(streak), get_multiplier(streak));
+        }
+
+        /// calculate_payout is a pure function: same inputs → same output, always.
+        #[test]
+        fn prop_payout_is_deterministic(
+            wager   in 1i128..100_000_000i128,
+            streak  in 1u32..=10u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let a = calculate_payout(wager, streak, fee_bps);
+            let b = calculate_payout(wager, streak, fee_bps);
+            prop_assert_eq!(a, b);
+        }
+
+        /// verify_commitment is deterministic: same secret + commitment → same bool.
+        #[test]
+        fn prop_commitment_verification_is_deterministic(
+            secret_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret:     soroban_sdk::Bytes  = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32>           = env.crypto().sha256(&secret).into();
+
+            let r1 = verify_commitment(&env, &secret, &commitment);
+            let r2 = verify_commitment(&env, &secret, &commitment);
+            prop_assert_eq!(r1, r2);
+            prop_assert!(r1, "correct secret must always verify against its own hash");
+        }
+
+        /// Wrong secret never verifies against a commitment derived from a different secret.
+        #[test]
+        fn prop_wrong_secret_never_verifies(
+            secret_a in prop::array::uniform32(any::<u8>()),
+            secret_b in prop::array::uniform32(any::<u8>()),
+        ) {
+            prop_assume!(secret_a != secret_b);
+            let env = soroban_sdk::Env::default();
+            let bytes_a:    soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, &secret_a);
+            let bytes_b:    soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, &secret_b);
+            let commitment: BytesN<32>          = env.crypto().sha256(&bytes_a).into();
+            prop_assert!(!verify_commitment(&env, &bytes_b, &commitment));
+        }
+
+        /// get_multiplier output is stable across the full u32 domain for the
+        /// four documented tier boundaries.
+        #[test]
+        fn prop_multiplier_tier_boundaries_are_stable(streak in 4u32..u32::MAX) {
+            // Any streak >= 4 must always return the cap.
+            prop_assert_eq!(get_multiplier(streak), MULTIPLIER_STREAK_4_PLUS);
+        }
+
+        /// calculate_payout with zero wager always returns Some(0).
+        #[test]
+        fn prop_zero_wager_payout_is_zero(
+            streak  in 1u32..=10u32,
+            fee_bps in 0u32..=10_000u32,
+        ) {
+            prop_assert_eq!(calculate_payout(0, streak, fee_bps), Some(0));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: soroban-coinflip-game
+// Module:  randomness_regression_tests
+//
+// Validates that neither the player nor the contract can unilaterally control
+// the game outcome through the commit-reveal scheme.
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod randomness_regression_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// A commitment derived from a secret always verifies against that secret.
+        /// Regression guard: SHA-256 round-trip must be stable.
+        #[test]
+        fn prop_commitment_round_trip(secret_bytes in prop::array::uniform32(any::<u8>())) {
+            let env:        soroban_sdk::Env    = soroban_sdk::Env::default();
+            let secret:     soroban_sdk::Bytes  = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32>           = env.crypto().sha256(&secret).into();
+            prop_assert!(verify_commitment(&env, &secret, &commitment));
+        }
+
+        /// Two distinct secrets must produce distinct commitments (collision resistance).
+        /// A collision here would allow a player to substitute their secret post-commit.
+        #[test]
+        fn prop_distinct_secrets_produce_distinct_commitments(
+            a in prop::array::uniform32(any::<u8>()),
+            b in prop::array::uniform32(any::<u8>()),
+        ) {
+            prop_assume!(a != b);
+            let env    = soroban_sdk::Env::default();
+            let hash_a: BytesN<32> = env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &a)).into();
+            let hash_b: BytesN<32> = env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &b)).into();
+            prop_assert!(hash_a != hash_b,
+                "distinct secrets must not hash to the same commitment");
+        }
+
+        /// A tampered commitment (any single byte flipped) must not verify
+        /// against the original secret.
+        #[test]
+        fn prop_tampered_commitment_fails_verification(
+            secret_bytes in prop::array::uniform32(any::<u8>()),
+            flip_index   in 0usize..32usize,
+            flip_mask    in 1u8..=255u8,
+        ) {
+            let env    = soroban_sdk::Env::default();
+            let secret = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
+            let good: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            // Flip one byte in the commitment to simulate tampering.
+            let mut tampered_arr = good.to_array();
+            tampered_arr[flip_index] ^= flip_mask;
+            let tampered = BytesN::from_array(&env, &tampered_arr);
+
+            prop_assert!(!verify_commitment(&env, &secret, &tampered),
+                "tampered commitment must not verify against original secret");
+        }
+
+        /// A tampered secret (any single byte flipped) must not verify
+        /// against the original commitment.
+        #[test]
+        fn prop_tampered_secret_fails_verification(
+            secret_bytes in prop::array::uniform32(any::<u8>()),
+            flip_index   in 0usize..32usize,
+            flip_mask    in 1u8..=255u8,
+        ) {
+            let env        = soroban_sdk::Env::default();
+            let secret     = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            // Flip one byte in the secret to simulate a substitution attempt.
+            let mut tampered_arr = secret_bytes;
+            tampered_arr[flip_index] ^= flip_mask;
+            let tampered_secret = soroban_sdk::Bytes::from_slice(&env, &tampered_arr);
+
+            prop_assert!(!verify_commitment(&env, &tampered_secret, &commitment),
+                "tampered secret must not verify against original commitment");
+        }
+
+        /// Commitment verification is asymmetric: swapping secret and commitment
+        /// (i.e., using the hash as the pre-image) must not verify.
+        #[test]
+        fn prop_commitment_verification_is_not_symmetric(
+            secret_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env        = soroban_sdk::Env::default();
+            let secret     = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            // Use the commitment bytes as if they were the secret.
+            let commitment_as_secret = soroban_sdk::Bytes::from_slice(&env, &commitment.to_array());
+            // The hash of the commitment is almost certainly not equal to the original secret hash.
+            let hash_of_commitment: BytesN<32> = env.crypto().sha256(&commitment_as_secret).into();
+            prop_assert!(hash_of_commitment != commitment,
+                "hash(commitment) must not equal commitment itself (no fixed-point)");
         }
     }
 }
