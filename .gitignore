@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+contract/target/
 Cargo.lock
 
 # IDE files

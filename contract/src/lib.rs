@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Bytes, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Bytes, BytesN, Env};
 
 /// Error codes for the coinflip contract
 #[contracterror]
@@ -182,7 +182,7 @@ pub fn calculate_payout(wager: i128, streak: u32, fee_bps: u32) -> Option<i128> 
 /// - Both the revealed secret hash and the `commitment` must match exactly 
 ///   for the verification to pass.
 pub fn verify_commitment(env: &Env, secret: &Bytes, commitment: &BytesN<32>) -> bool {
-    let hash = env.crypto().sha256(secret);
+    let hash: BytesN<32> = env.crypto().sha256(secret).into();
     &hash == commitment
 }
 
@@ -383,9 +383,9 @@ impl CoinflipContract {
 
         // Generate contract-side randomness contribution from ledger sequence
         let seq_bytes = env.ledger().sequence().to_be_bytes();
-        let contract_random = env.crypto().sha256(
+        let contract_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
-        );
+        ).into();
 
         let game = GameState {
             wager,
@@ -405,6 +405,95 @@ impl CoinflipContract {
         Self::save_stats(&env, &stats);
 
         Ok(())
+    }
+
+    /// Reveal the outcome of a committed coinflip game.
+    ///
+    /// The player submits the `secret` whose SHA-256 hash was committed in
+    /// `start_game`.  The contract XORs the first byte of the player's secret
+    /// hash with the first byte of the contract's own random contribution to
+    /// produce a single deterministic bit — `0` → Heads, `1` → Tails.
+    ///
+    /// # Win path
+    /// - Outcome matches the player's chosen `side`.
+    /// - `streak` is incremented by 1.
+    /// - Game phase transitions to `Revealed`, awaiting the player's next
+    ///   decision (cash out or continue).
+    ///
+    /// # Loss path — Forfeiture semantics
+    /// - Outcome does NOT match the player's chosen `side`.
+    /// - The wager is **forfeited**: it remains in the contract reserves
+    ///   (i.e. `reserve_balance` is credited with the wager amount).
+    /// - The player's game state is **deleted** from persistent storage,
+    ///   freeing the slot for a future game.
+    /// - `Error::CommitmentMismatch` is returned so the caller knows the
+    ///   game ended in a loss.  No further action is required from the player.
+    ///
+    /// # Validation guards (in order)
+    /// 1. `NoActiveGame`        – player has no stored game state
+    /// 2. `InvalidPhase`        – game is not in `Committed` phase
+    /// 3. `CommitmentMismatch`  – revealed secret does not match stored hash
+    ///    (also returned on a loss — see Loss path above)
+    ///
+    /// # Security notes
+    /// - The commitment scheme prevents the player from changing their secret
+    ///   after observing the contract's random contribution.
+    /// - The contract's random contribution is derived from the ledger sequence
+    ///   at game-start time, making it unpredictable at commitment time.
+    /// - Both contributions are hashed independently before XOR, preventing
+    ///   any single party from biasing the outcome.
+    pub fn reveal(
+        env: Env,
+        player: Address,
+        secret: Bytes,
+    ) -> Result<bool, Error> {
+        player.require_auth();
+
+        // Guard 1: player must have an active game
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // Guard 2: game must be in Committed phase
+        if game.phase != GamePhase::Committed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // Guard 3: verify the revealed secret matches the stored commitment
+        if !verify_commitment(&env, &secret, &game.commitment) {
+            return Err(Error::CommitmentMismatch);
+        }
+
+        // Derive outcome: XOR first byte of player-secret hash with first byte
+        // of contract random, then take the low bit to get Heads (0) or Tails (1).
+        let secret_hash: BytesN<32> = env.crypto().sha256(&secret).into();
+        let player_byte = secret_hash.get(0).unwrap_or(0);
+        let contract_byte = game.contract_random.get(0).unwrap_or(0);
+        let outcome_bit = (player_byte ^ contract_byte) & 1;
+        let outcome = if outcome_bit == 0 { Side::Heads } else { Side::Tails };
+
+        let won = outcome == game.side;
+
+        if won {
+            // Win path: increment streak, advance to Revealed phase.
+            game.streak = game.streak.saturating_add(1);
+            game.phase = GamePhase::Revealed;
+            Self::save_player_game(&env, &player, &game);
+            Ok(true)
+        } else {
+            // Loss path — forfeiture:
+            // 1. Credit the wager back to contract reserves so the house keeps it.
+            // 2. Delete the player's game state to free storage and signal game-over.
+            let mut stats = Self::load_stats(&env);
+            stats.reserve_balance = stats
+                .reserve_balance
+                .checked_add(game.wager)
+                .unwrap_or(stats.reserve_balance);
+            Self::save_stats(&env, &stats);
+
+            Self::delete_player_game(&env, &player);
+
+            Ok(false)
+        }
     }
 }
 
@@ -593,7 +682,7 @@ mod tests {
         secret.push_back(2u8);
         secret.push_back(3u8);
 
-        let commitment = env.crypto().sha256(&secret);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
         // Correct secret
         assert!(verify_commitment(&env, &secret, &commitment));
@@ -620,7 +709,7 @@ mod tests {
     }
 
     fn dummy_commitment(env: &Env) -> BytesN<32> {
-        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[1u8; 32]))
+        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[1u8; 32])).into()
     }
 
     /// Fund reserves directly so start_game solvency check passes.
@@ -751,6 +840,212 @@ mod tests {
         assert_eq!(game.side, Side::Heads);
         assert_eq!(game.phase, GamePhase::Committed);
         assert_eq!(game.streak, 0);
+    }
+
+    // ── reveal: loss cleanup ─────────────────────────────────────────────────
+
+    /// Build a secret + matching commitment for reveal tests.
+    fn make_secret_and_commitment(env: &Env, bytes: &[u8]) -> (Bytes, BytesN<32>) {
+        let secret = Bytes::from_slice(env, bytes);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        (secret, commitment)
+    }
+
+    /// Returns the outcome Side that the contract will compute for `player`'s
+    /// current game given `secret`.  Reads `contract_random` from stored state.
+    fn compute_outcome(env: &Env, contract_id: &Address, player: &Address, secret: &Bytes) -> Side {
+        let secret_hash: BytesN<32> = env.crypto().sha256(secret).into();
+        let player_byte: u8 = secret_hash.get(0).unwrap_or(0) as u8;
+        let contract_byte: u8 = env.as_contract(contract_id, || {
+            let game = CoinflipContract::load_player_game(env, player).unwrap();
+            game.contract_random.get(0).unwrap_or(0) as u8
+        });
+        let outcome_bit = (player_byte ^ contract_byte) & 1;
+        if outcome_bit == 0 { Side::Heads } else { Side::Tails }
+    }
+
+    #[test]
+    fn test_reveal_rejects_no_active_game() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]);
+        let result = client.try_reveal(&player, &secret);
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    #[test]
+    fn test_reveal_rejects_wrong_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let secret_bytes = [7u8; 32];
+        let (secret, commitment) = make_secret_and_commitment(&env, &secret_bytes);
+
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+
+        // Manually advance phase to Revealed to simulate wrong phase
+        env.as_contract(&contract_id, || {
+            let mut game = CoinflipContract::load_player_game(&env, &player).unwrap();
+            game.phase = GamePhase::Revealed;
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+
+        let result = client.try_reveal(&player, &secret);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    #[test]
+    fn test_reveal_rejects_wrong_secret() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let (_secret, commitment) = make_secret_and_commitment(&env, &[5u8; 32]);
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+
+        // Submit a different secret — commitment mismatch
+        let wrong_secret = Bytes::from_slice(&env, &[99u8; 32]);
+        let result = client.try_reveal(&player, &wrong_secret);
+        assert_eq!(result, Err(Ok(Error::CommitmentMismatch)));
+    }
+
+    #[test]
+    fn test_reveal_loss_clears_game_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let secret_bytes = [3u8; 32];
+        let (secret, commitment) = make_secret_and_commitment(&env, &secret_bytes);
+
+        let player = Address::generate(&env);
+
+        // Pick the losing side
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+        let outcome = compute_outcome(&env, &contract_id, &player, &secret);
+        let losing_side = if outcome == Side::Heads { Side::Tails } else { Side::Heads };
+
+        // Restart with the losing side
+        env.as_contract(&contract_id, || {
+            let mut game = CoinflipContract::load_player_game(&env, &player).unwrap();
+            game.side = losing_side;
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+
+        let result = client.try_reveal(&player, &secret);
+        assert_eq!(result, Ok(Ok(false)), "Expected loss (false)");
+
+        // Game state must be gone
+        let game_after: Option<GameState> = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player)
+        });
+        assert!(game_after.is_none(), "Game state must be deleted on loss");
+    }
+
+    #[test]
+    fn test_reveal_loss_credits_wager_to_reserves() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let initial_reserves = 1_000_000_000i128;
+        fund_reserves(&env, &contract_id, initial_reserves);
+
+        let wager = 10_000_000i128;
+        let secret_bytes = [3u8; 32];
+        let (secret, commitment) = make_secret_and_commitment(&env, &secret_bytes);
+
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+
+        let outcome = compute_outcome(&env, &contract_id, &player, &secret);
+        let losing_side = if outcome == Side::Heads { Side::Tails } else { Side::Heads };
+
+        env.as_contract(&contract_id, || {
+            let mut game = CoinflipContract::load_player_game(&env, &player).unwrap();
+            game.side = losing_side;
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+
+        client.reveal(&player, &secret);
+
+        let stats_after: ContractStats = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        });
+        assert_eq!(
+            stats_after.reserve_balance,
+            initial_reserves + wager,
+            "Wager must be credited to reserves on loss"
+        );
+    }
+
+    #[test]
+    fn test_reveal_win_increments_streak_and_advances_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let secret_bytes = [3u8; 32];
+        let (secret, commitment) = make_secret_and_commitment(&env, &secret_bytes);
+
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+
+        // Force the winning side
+        let outcome = compute_outcome(&env, &contract_id, &player, &secret);
+        env.as_contract(&contract_id, || {
+            let mut game = CoinflipContract::load_player_game(&env, &player).unwrap();
+            game.side = outcome;
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+
+        let result = client.try_reveal(&player, &secret);
+        assert_eq!(result, Ok(Ok(true)), "Expected win (true)");
+
+        let game_after: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+        assert_eq!(game_after.streak, 1, "Streak must be 1 after first win");
+        assert_eq!(game_after.phase, GamePhase::Revealed, "Phase must be Revealed after win");
+    }
+
+    #[test]
+    fn test_reveal_loss_allows_new_game_after() {
+        // After a loss clears state, the player must be able to start a fresh game.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let secret_bytes = [3u8; 32];
+        let (secret, commitment) = make_secret_and_commitment(&env, &secret_bytes);
+
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+
+        let outcome = compute_outcome(&env, &contract_id, &player, &secret);
+        let losing_side = if outcome == Side::Heads { Side::Tails } else { Side::Heads };
+        env.as_contract(&contract_id, || {
+            let mut game = CoinflipContract::load_player_game(&env, &player).unwrap();
+            game.side = losing_side;
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+
+        client.reveal(&player, &secret);
+
+        // Should be able to start a new game immediately
+        let new_commitment = dummy_commitment(&env);
+        let result = client.try_start_game(&player, &Side::Heads, &10_000_000, &new_commitment);
+        assert!(result.is_ok(), "Player must be able to start a new game after a loss");
     }
 }
 
@@ -928,7 +1223,7 @@ mod property_tests {
     }
 
     fn dummy_commitment_prop(env: &Env) -> BytesN<32> {
-        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[42u8; 32]))
+        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[42u8; 32])).into()
     }
 
     proptest! {
