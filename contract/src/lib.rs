@@ -942,6 +942,253 @@ mod tests {
         assert_eq!(game.phase, GamePhase::Committed);
         assert_eq!(game.streak, 0);
     }
+
+    // ── cash_out validation ──────────────────────────────────────────────────
+
+    /// Inject a game directly into storage at a specific phase/streak,
+    /// bypassing start_game so tests can exercise any state combination.
+    fn inject_game(
+        env: &Env,
+        contract_id: &soroban_sdk::Address,
+        player: &Address,
+        phase: GamePhase,
+        streak: u32,
+        wager: i128,
+    ) {
+        let dummy = dummy_commitment(env);
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment: dummy.clone(),
+            contract_random: dummy,
+            phase,
+        };
+        env.as_contract(contract_id, || {
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+    }
+
+    /// Set reserve_balance so the contract can cover the payout.
+    fn set_reserves(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &stats);
+        });
+    }
+
+    // ── Guard 1: NoActiveGame ────────────────────────────────────────────────
+
+    #[test]
+    fn test_cash_out_rejects_no_active_game() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // No game record exists for this player.
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    // ── Guard 2: InvalidPhase ────────────────────────────────────────────────
+
+    #[test]
+    fn test_cash_out_rejects_committed_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Game exists but reveal hasn't happened yet.
+        inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    #[test]
+    fn test_cash_out_rejects_completed_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Game already ended — nothing left to claim.
+        inject_game(&env, &contract_id, &player, GamePhase::Completed, 1, 10_000_000);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    // ── Guard 3: NoWinningsToClaimOrContinue ─────────────────────────────────
+
+    #[test]
+    fn test_cash_out_rejects_losing_state_streak_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Revealed but streak == 0 means the player lost.
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
+    }
+
+    // ── Happy path ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cash_out_succeeds_streak_1() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let wager = 10_000_000i128;
+        // gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
+        // fee   = 19_000_000 * 300  / 10_000 =    570_000
+        // net   = 18_430_000
+        let expected_net = 18_430_000i128;
+        let expected_fee = 570_000i128;
+
+        set_reserves(&env, &contract_id, 100_000_000);
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Ok(Ok(expected_net)));
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+        assert_eq!(game.phase, GamePhase::Completed);
+
+        // Stats: fee credited, reserves debited.
+        let stats: ContractStats = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        });
+        assert_eq!(stats.total_fees, expected_fee);
+        assert_eq!(stats.reserve_balance, 100_000_000 - expected_net);
+    }
+
+    #[test]
+    fn test_cash_out_succeeds_streak_2() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let wager = 5_000_000i128;
+        // gross = 5_000_000 * 35_000 / 10_000 = 17_500_000
+        // fee   = 17_500_000 * 300  / 10_000 =    525_000
+        // net   = 16_975_000
+        let expected_net = 16_975_000i128;
+
+        set_reserves(&env, &contract_id, 100_000_000);
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, wager);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Ok(Ok(expected_net)));
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+        assert_eq!(game.phase, GamePhase::Completed);
+    }
+
+    #[test]
+    fn test_cash_out_succeeds_streak_4_plus() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let wager = 1_000_000i128;
+        // gross = 1_000_000 * 100_000 / 10_000 = 10_000_000
+        // fee   = 10_000_000 * 300   / 10_000 =    300_000
+        // net   = 9_700_000
+        let expected_net = 9_700_000i128;
+
+        set_reserves(&env, &contract_id, 100_000_000);
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 4, wager);
+
+        let result = client.try_cash_out(&player);
+        assert_eq!(result, Ok(Ok(expected_net)));
+    }
+
+    // ── Post-cash-out: player can start a new game ───────────────────────────
+
+    #[test]
+    fn test_cash_out_allows_new_game_after_completion() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        set_reserves(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 10_000_000);
+
+        // Cash out succeeds.
+        assert!(client.try_cash_out(&player).is_ok());
+
+        // Reserves still cover a new game — player can start again.
+        let result = client.try_start_game(
+            &player,
+            &Side::Tails,
+            &10_000_000,
+            &dummy_commitment(&env),
+        );
+        assert!(result.is_ok(), "player must be able to start a new game after cash-out");
+    }
+
+    // ── Guard ordering: all checks fire before any state mutation ────────────
+
+    #[test]
+    fn test_cash_out_no_state_mutation_on_invalid_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
+
+        let before: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        let _ = client.try_cash_out(&player);
+
+        let after: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        // State must be identical — no partial mutation on error.
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_cash_out_no_state_mutation_on_losing_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
+
+        let before_stats: ContractStats = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        });
+
+        let _ = client.try_cash_out(&player);
+
+        let after_stats: ContractStats = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        });
+
+        // Stats must be unchanged — no fee or reserve mutation on error.
+        assert_eq!(before_stats.total_fees, after_stats.total_fees);
+        assert_eq!(before_stats.reserve_balance, after_stats.reserve_balance);
+    }
 }
 
 #[cfg(test)]
