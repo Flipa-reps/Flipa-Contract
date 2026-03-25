@@ -406,6 +406,196 @@ impl CoinflipContract {
 
         Ok(())
     }
+
+    /// Reveal the player's secret to determine the game outcome.
+    ///
+    /// Process:
+    /// 1. Verify commitment matches the revealed secret
+    /// 2. Combine player random + contract random to determine outcome
+    /// 3. Update game state to Revealed phase with result
+    /// 4. If player wins, calculate potential payout
+    /// 5. If player loses, end game and reset streak
+    ///
+    /// Errors:
+    /// - NoActiveGame: player has no game in Committed phase
+    /// - InvalidPhase: game not in Committed phase  
+    /// - CommitmentMismatch: revealed secret doesn't match stored commitment
+    pub fn reveal(
+        env: Env,
+        player: Address,
+        secret: Bytes,
+    ) -> Result<(), Error> {
+        player.require_auth();
+
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // Must be in Committed phase to reveal
+        if game.phase != GamePhase::Committed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // Verify the commitment matches the revealed secret
+        if !verify_commitment(&env, &secret, &game.commitment) {
+            return Err(Error::CommitmentMismatch);
+        }
+
+        // Determine outcome by combining player random + contract random
+        let combined_input = {
+            let mut combined = Bytes::new(&env);
+            combined.extend_from_slice(&secret);
+            combined.extend_from_slice(&game.contract_random.as_slice());
+            env.crypto().sha256(&combined)
+        };
+
+        // Use first byte to determine heads/tails (0 = Heads, 1 = Tails)
+        let outcome_byte = combined_input.as_slice().get(0).unwrap_or(&0);
+        let outcome = if *outcome_byte % 2 == 0 { Side::Heads } else { Side::Tails };
+
+        // Update game state based on outcome
+        if outcome == game.side {
+            // Player wins - advance to next streak level
+            game.streak += 1;
+            game.phase = GamePhase::Revealed;
+        } else {
+            // Player loses - game ends, streak resets
+            game.phase = GamePhase::Completed;
+            game.streak = 0;
+        }
+
+        Self::save_player_game(&env, &player, &game);
+        Ok(())
+    }
+
+    /// Claim winnings after a successful reveal.
+    ///
+    /// Process:
+    /// 1. Verify game is in Revealed phase (player won)
+    /// 2. Calculate net payout (gross - fee)
+    /// 3. Transfer net payout to player
+    /// 4. Transfer fee to treasury
+    /// 5. Update contract reserves and stats
+    /// 6. Reset game to Completed phase
+    ///
+    /// Errors:
+    /// - NoActiveGame: player has no game
+    /// - InvalidPhase: game not in Revealed phase
+    /// - TransferFailed: token transfer fails
+    pub fn claim_winnings(
+        env: Env,
+        player: Address,
+    ) -> Result<(), Error> {
+        player.require_auth();
+
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // Must be in Revealed phase to claim (player won)
+        if game.phase != GamePhase::Revealed {
+            return Err(Error::InvalidPhase);
+        }
+
+        let config = Self::load_config(&env);
+        let token_client = token::Client::new(&env, &config.token);
+
+        // Calculate payout
+        let net_payout = calculate_payout(game.wager, game.streak, config.fee_bps)
+            .ok_or(Error::InsufficientReserves)?;
+
+        // Calculate gross payout and fee separately for accounting
+        let gross_payout = game.wager
+            .checked_mul(get_multiplier(game.streak) as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        let fee_amount = gross_payout
+            .checked_mul(config.fee_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+
+        // Check sufficient reserves
+        let stats = Self::load_stats(&env);
+        if stats.reserve_balance < gross_payout {
+            return Err(Error::InsufficientReserves);
+        }
+
+        // Transfer net payout to player
+        if token_client.try_transfer(&env, &env.current_contract_address(), &player, &net_payout) != soroban_sdk::InvokeError::Ok {
+            return Err(Error::TransferFailed);
+        }
+
+        // Transfer fee to treasury
+        if token_client.try_transfer(&env, &env.current_contract_address(), &config.treasury, &fee_amount) != soroban_sdk::InvokeError::Ok {
+            return Err(Error::TransferFailed);
+        }
+
+        // Update contract state
+        let mut stats = stats;
+        stats.reserve_balance = stats.reserve_balance.checked_sub(gross_payout)
+            .ok_or(Error::InsufficientReserves)?;
+        stats.total_fees = stats.total_fees.checked_add(fee_amount).unwrap_or(stats.total_fees);
+        Self::save_stats(&env, &stats);
+
+        // Reset game to completed
+        game.phase = GamePhase::Completed;
+        Self::save_player_game(&env, &player, &game);
+
+        Ok(())
+    }
+
+    /// Continue to next streak level after winning.
+    ///
+    /// Process:
+    /// 1. Verify game is in Revealed phase (player won)
+    /// 2. Reset game to Committed phase for next round
+    /// 3. Player keeps current streak and wager
+    /// 4. Generate new contract randomness
+    ///
+    /// Errors:
+    /// - NoActiveGame: player has no game
+    /// - InvalidPhase: game not in Revealed phase
+    pub fn continue_streak(
+        env: Env,
+        player: Address,
+        new_commitment: BytesN<32>,
+    ) -> Result<(), Error> {
+        player.require_auth();
+
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // Must be in Revealed phase to continue (player won)
+        if game.phase != GamePhase::Revealed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // Verify reserves cover next potential payout
+        let config = Self::load_config(&env);
+        let stats = Self::load_stats(&env);
+        
+        let next_streak = game.streak + 1;
+        let max_payout = game.wager
+            .checked_mul(get_multiplier(next_streak) as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        
+        if stats.reserve_balance < max_payout {
+            return Err(Error::InsufficientReserves);
+        }
+
+        // Generate new contract randomness
+        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let contract_random = env.crypto().sha256(
+            &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
+        );
+
+        // Reset to Committed phase for next round
+        game.phase = GamePhase::Committed;
+        game.commitment = new_commitment;
+        game.contract_random = contract_random;
+
+        Self::save_player_game(&env, &player, &game);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1409,6 +1599,314 @@ mod property_tests {
 
             prop_assert_eq!(post_stats.total_games, pre_stats.total_games + 1);
             prop_assert_eq!(post_stats.total_volume, pre_stats.total_volume + wager);
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Feature: Cash-Out Transfer Property Tests
+    // Validates: player and treasury balances reflect expected transfers after settlement
+    // ───────────────────────────────────────────────────────────────────────
+
+    // Helper to setup a complete game scenario for transfer testing
+    fn setup_game_for_transfer_test(
+        env: &Env,
+        wager: i128,
+        fee_bps: u32,
+        player_wins: bool,
+    ) -> (Address, Address, Address, soroban_sdk::Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+
+        // Fund with sufficient reserves
+        let required_reserves = wager
+            .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or(0);
+        fund_reserves(&env, &contract_id, required_reserves + 10_000_000);
+
+        let player = Address::generate(&env);
+        
+        // Create commitment
+        let secret = if player_wins { 
+            Bytes::from_slice(&env, &[1u8; 32]) // Will produce Heads outcome
+        } else { 
+            Bytes::from_slice(&env, &[2u8; 32]) // Will produce Tails outcome  
+        };
+        let commitment = env.crypto().sha256(&secret);
+
+        // Start game with Heads choice
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+
+        // Reveal to determine outcome
+        client.reveal(&player, &secret);
+
+        (admin, treasury, token, contract_id)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// PROPERTY: Claim winnings transfers correct amounts to player and treasury
+        /// Validates: net payout to player, fee to treasury, reserve reduction
+        #[test]
+        fn test_claim_winnings_balance_transfers(
+            wager in 1_000_000i128..=10_000_000i128,
+            fee_bps in 200u32..=500u32,
+            streak in 1u32..=3u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            
+            let (admin, treasury, token, contract_id) = 
+                setup_game_for_transfer_test(&env, wager, fee_bps, true);
+            
+            let client = CoinflipContract::new(&env, &contract_id);
+            let token_client = token::Client::new(&env, &token);
+            let player = Address::generate(&env);
+
+            // Get pre-claim balances
+            let pre_contract_balance = token_client.balance(&env, &contract_id);
+            let pre_treasury_balance = token_client.balance(&env, &treasury);
+            let pre_player_balance = token_client.balance(&env, &player);
+
+            // Calculate expected amounts
+            let gross_payout = wager
+                .checked_mul(get_multiplier(streak) as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let fee_amount = gross_payout
+                .checked_mul(fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let net_payout = gross_payout - fee_amount;
+
+            // Claim winnings
+            let result = client.try_claim_winnings(&player);
+            prop_assert!(result.is_ok());
+
+            // Verify post-claim balances
+            let post_contract_balance = token_client.balance(&env, &contract_id);
+            let post_treasury_balance = token_client.balance(&env, &treasury);
+            let post_player_balance = token_client.balance(&env, &player);
+
+            // Contract balance should decrease by gross payout
+            prop_assert_eq!(
+                post_contract_balance, 
+                pre_contract_balance - gross_payout
+            );
+
+            // Treasury should receive exactly the fee
+            prop_assert_eq!(
+                post_treasury_balance,
+                pre_treasury_balance + fee_amount
+            );
+
+            // Player should receive exactly the net payout
+            prop_assert_eq!(
+                post_player_balance,
+                pre_player_balance + net_payout
+            );
+        }
+
+        /// PROPERTY: Fee and net payout separation is mathematically correct
+        /// Validates: gross = net + fee, fee < gross, net > 0
+        #[test]
+        fn test_fee_net_payout_separation(
+            wager in 1_000_000i128..=50_000_000i128,
+            fee_bps in 200u32..=500u32,
+            streak in 1u32..=4u32,
+        ) {
+            let gross_payout = wager
+                .checked_mul(get_multiplier(streak) as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let fee_amount = gross_payout
+                .checked_mul(fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let net_payout = calculate_payout(wager, streak, fee_bps).unwrap();
+
+            // Invariant: gross = net + fee
+            prop_assert_eq!(gross_payout, net_payout + fee_amount);
+
+            // Invariant: fee is always less than gross (unless fee_bps = 10_000)
+            prop_assert!(fee_amount < gross_payout || fee_bps == 10_000);
+
+            // Invariant: net payout is always positive for valid fee_bps (2-5%)
+            prop_assert!(net_payout > 0);
+
+            // Invariant: fee calculation is consistent
+            let expected_fee = gross_payout.checked_mul(fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000)).unwrap();
+            prop_assert_eq!(fee_amount, expected_fee);
+        }
+
+        /// PROPERTY: Multiple claims correctly track cumulative balances
+        /// Validates: sequential claims don't interfere with each other
+        #[test]
+        fn test_multiple_claims_balance_tracking(
+            wager1 in 1_000_000i128..=5_000_000i128,
+            wager2 in 1_000_000i128..=5_000_000i128,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            
+            let (admin, treasury, token, contract_id) = 
+                setup_game_for_transfer_test(&env, wager1, fee_bps, true);
+            
+            let client = CoinflipContract::new(&env, &contract_id);
+            let token_client = token::Client::new(&env, &token);
+            
+            let player1 = Address::generate(&env);
+            let player2 = Address::generate(&env);
+
+            // Setup second game for player2
+            let secret2 = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment2 = env.crypto().sha256(&secret2);
+            client.start_game(&player2, &Side::Heads, &wager2, &commitment2);
+            client.reveal(&player2, &secret2);
+
+            // Record initial balances
+            let initial_treasury = token_client.balance(&env, &treasury);
+            let initial_contract = token_client.balance(&env, &contract_id);
+
+            // First claim
+            let result1 = client.try_claim_winnings(&player1);
+            prop_assert!(result1.is_ok());
+
+            let after_first_treasury = token_client.balance(&env, &treasury);
+            let after_first_contract = token_client.balance(&env, &contract_id);
+
+            // Second claim
+            let result2 = client.try_claim_winnings(&player2);
+            prop_assert!(result2.is_ok());
+
+            let final_treasury = token_client.balance(&env, &treasury);
+            let final_contract = token_client.balance(&env, &contract_id);
+
+            // Both claims should succeed independently
+            prop_assert!(result1.is_ok() && result2.is_ok());
+
+            // Treasury should receive fees from both claims
+            prop_assert!(final_treasury > after_first_treasury);
+            prop_assert!(after_first_treasury > initial_treasury);
+
+            // Contract should pay out both gross amounts
+            prop_assert!(final_contract < after_first_contract);
+            prop_assert!(after_first_contract < initial_contract);
+        }
+
+        /// PROPERTY: Continue streak preserves reserves correctly
+        /// Validates: no transfers occur during continue, only state changes
+        #[test]
+        fn test_continue_streak_no_transfers(
+            wager in 1_000_000i128..=10_000_000i128,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            
+            let (admin, treasury, token, contract_id) = 
+                setup_game_for_transfer_test(&env, wager, fee_bps, true);
+            
+            let client = CoinflipContract::new(&env, &contract_id);
+            let token_client = token::Client::new(&env, &token);
+            let player = Address::generate(&env);
+
+            // Get pre-continue balances
+            let pre_contract_balance = token_client.balance(&env, &contract_id);
+            let pre_treasury_balance = token_client.balance(&env, &treasury);
+            let pre_player_balance = token_client.balance(&env, &player);
+
+            // Continue streak
+            let new_commitment = env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.try_continue_streak(&player, &new_commitment);
+            prop_assert!(result.is_ok());
+
+            // Verify no transfers occurred
+            let post_contract_balance = token_client.balance(&env, &contract_id);
+            let post_treasury_balance = token_client.balance(&env, &treasury);
+            let post_player_balance = token_client.balance(&env, &player);
+
+            prop_assert_eq!(pre_contract_balance, post_contract_balance);
+            prop_assert_eq!(pre_treasury_balance, post_treasury_balance);
+            prop_assert_eq!(pre_player_balance, post_player_balance);
+
+            // Verify game state reset to Committed
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game.phase, GamePhase::Committed);
+        }
+
+        /// PROPERTY: Reserve solvency is maintained throughout settlement
+        /// Validates: contract never pays out more than it holds
+        #[test]
+        fn test_reserve_solvency_during_settlement(
+            initial_reserves in 10_000_000i128..=100_000_000i128,
+            wager in 1_000_000i128..=5_000_000i128,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token = Address::generate(&env);
+
+            client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+            
+            // Set initial reserves
+            fund_reserves(&env, &contract_id, initial_reserves);
+
+            let player = Address::generate(&env);
+            let secret = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment = env.crypto().sha256(&secret);
+
+            // Start and win game
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            client.reveal(&player, &secret);
+
+            // Get pre-claim reserves
+            let pre_stats: ContractStats = env.as_contract(&contract_id, || {
+                CoinflipContract::load_stats(&env)
+            });
+
+            // Claim winnings
+            let result = client.try_claim_winnings(&player);
+            prop_assert!(result.is_ok());
+
+            // Verify post-claim reserves
+            let post_stats: ContractStats = env.as_contract(&contract_id, || {
+                CoinflipContract::load_stats(&env)
+            });
+
+            let gross_payout = wager
+                .checked_mul(19_000i128) // streak 1 multiplier
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+
+            // Reserves should decrease by exactly gross payout
+            prop_assert_eq!(
+                post_stats.reserve_balance,
+                pre_stats.reserve_balance - gross_payout
+            );
+
+            // Reserves should never be negative
+            prop_assert!(post_stats.reserve_balance >= 0);
+
+            // Total fees should increase
+            prop_assert!(post_stats.total_fees > pre_stats.total_fees);
         }
     }
 }
