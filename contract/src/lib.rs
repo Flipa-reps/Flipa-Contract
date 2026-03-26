@@ -21,8 +21,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Ad
 /// | 11   | `InvalidPhase`               | Game state     | `reveal`, `claim_winnings`, `continue_streak` |
 /// | 12   | `CommitmentMismatch`         | Reveal         | `reveal`                           |
 /// | 13   | `RevealTimeout`              | Reveal         | (reserved)                         |
-/// | 20   | `NoWinningsToClaimOrContinue`| Action         | (reserved)                         |
-/// | 21   | `InvalidCommitment`          | Action         | (reserved)                         |
+/// | 20   | `NoWinningsToClaimOrContinue`| Action         | `continue_streak`                  |
+/// | 21   | `InvalidCommitment`          | Action         | `continue_streak`                  |
 /// | 30   | `Unauthorized`               | Admin          | (reserved)                         |
 /// | 31   | `InvalidFeePercentage`       | Admin          | `initialize`                       |
 /// | 32   | `InvalidWagerLimits`         | Admin          | `initialize`                       |
@@ -132,11 +132,13 @@ pub enum Error {
 
     // ── Action errors (20–21) ───────────────────────────────────────────────
 
-    /// Player has no winnings to claim or continue (reserved).
+    /// Player has no winnings to claim or continue (streak == 0 in Revealed phase).
+    /// Returned by: `continue_streak` (guard 3).
     /// Code: 20 — see [`error_codes::NO_WINNINGS_TO_CLAIM_OR_CONTINUE`]
     NoWinningsToClaimOrContinue = 20,
 
-    /// Commitment value is invalid (reserved).
+    /// Commitment value is invalid (all-zero bytes treated as missing/placeholder).
+    /// Returned by: `continue_streak` (guard 4).
     /// Code: 21 — see [`error_codes::INVALID_COMMITMENT`]
     InvalidCommitment = 21,
 
@@ -738,17 +740,42 @@ impl CoinflipContract {
         Ok(net_payout)
     }
 
-    /// Continue to next streak level after winning.
+    /// Continue to the next streak level after a confirmed win.
     ///
-    /// Process:
-    /// 1. Verify game is in Revealed phase (player won)
-    /// 2. Reset game to Committed phase for next round
-    /// 3. Player keeps current streak and wager
-    /// 4. Generate new contract randomness
+    /// ## Eligibility rules
     ///
-    /// Errors:
-    /// - NoActiveGame: player has no game
-    /// - InvalidPhase: game not in Revealed phase
+    /// A player may call `continue_streak` **only** when all of the following
+    /// hold simultaneously:
+    ///
+    /// 1. **Active game exists** – a `GameState` record is present in storage
+    ///    for `player`.
+    /// 2. **Revealed phase** – the game must be in `GamePhase::Revealed`,
+    ///    meaning `reveal` has already been called and the outcome is known.
+    /// 3. **Positive streak** – `game.streak >= 1`, confirming the player
+    ///    actually won the last flip.  A `Revealed` game with `streak == 0`
+    ///    represents a loss state and must not be continued.
+    /// 4. **Non-zero commitment** – `new_commitment` must not be the all-zero
+    ///    32-byte value.  An all-zero commitment is treated as a missing or
+    ///    placeholder value and is rejected with `InvalidCommitment`.
+    /// 5. **Sufficient reserves** – the contract must hold enough reserves to
+    ///    cover the worst-case payout at the *next* streak level.
+    ///
+    /// ## Process (on success)
+    ///
+    /// 1. All precondition guards are evaluated (no state mutation on failure).
+    /// 2. New contract randomness is derived from the current ledger sequence.
+    /// 3. Game phase is reset to `Committed` with the fresh commitment and
+    ///    randomness; the streak counter and wager are preserved.
+    ///
+    /// ## Errors
+    ///
+    /// | Error                        | Condition                                      |
+    /// |------------------------------|------------------------------------------------|
+    /// | `NoActiveGame`               | No game record exists for `player`             |
+    /// | `InvalidPhase`               | Game is not in `Revealed` phase                |
+    /// | `NoWinningsToClaimOrContinue`| `streak == 0` (player lost the last flip)      |
+    /// | `InvalidCommitment`          | `new_commitment` is all-zero bytes             |
+    /// | `InsufficientReserves`       | Reserves cannot cover the next streak payout   |
     pub fn continue_streak(
         env: Env,
         player: Address,
@@ -756,40 +783,57 @@ impl CoinflipContract {
     ) -> Result<(), Error> {
         player.require_auth();
 
+        // Guard 1: player must have an active game
         let mut game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
 
-        // Must be in Revealed phase to continue (player won)
+        // Guard 2: game must be in Revealed phase
         if game.phase != GamePhase::Revealed {
             return Err(Error::InvalidPhase);
         }
 
-        // Verify reserves cover next potential payout
+        // Guard 3: streak must be >= 1 (player actually won)
+        // A Revealed game with streak == 0 is a loss state — continuation is
+        // not permitted; the player must start a fresh game instead.
+        if game.streak == 0 {
+            return Err(Error::NoWinningsToClaimOrContinue);
+        }
+
+        // Guard 4: commitment must not be all-zero bytes (missing / placeholder)
+        if new_commitment == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(Error::InvalidCommitment);
+        }
+
+        // Guard 5: reserves must cover the next streak's worst-case payout
         let config = Self::load_config(&env);
         let stats = Self::load_stats(&env);
-        
-        let next_streak = game.streak + 1;
+
+        let next_streak = game.streak.saturating_add(1);
         let max_payout = game.wager
             .checked_mul(get_multiplier(next_streak) as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
-        
+
         if stats.reserve_balance < max_payout {
             return Err(Error::InsufficientReserves);
         }
 
-        // Generate new contract randomness
+        // Generate new contract randomness from the current ledger sequence
         let seq_bytes = env.ledger().sequence().to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         ).into();
 
-        // Reset to Committed phase for next round
+        // Reset to Committed phase; preserve streak and wager
         game.phase = GamePhase::Committed;
         game.commitment = new_commitment;
         game.contract_random = contract_random.into();
 
         Self::save_player_game(&env, &player, &game);
+
+        // suppress unused-variable warning for config (loaded for future use)
+        let _ = config;
+
         Ok(())
     }
 
