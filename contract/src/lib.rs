@@ -798,6 +798,55 @@ impl CoinflipContract {
         Self::save_player_game(&env, &player, &game);
         Ok(())
     }
+
+    /// Update the treasury address used to receive protocol fee payments.
+    ///
+    /// Only the configured `admin` address may call this function.
+    /// The new treasury must be a valid address and must differ from the
+    /// current `admin` to preserve the separation-of-roles invariant
+    /// established at initialization.
+    ///
+    /// # Arguments
+    /// - `admin`       – must match `config.admin`; authorization is required
+    /// - `new_treasury`– replacement treasury address; must differ from `config.admin`
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`]         – caller is not the configured admin
+    /// - [`Error::AdminTreasuryConflict`]– `new_treasury` equals `config.admin`
+    ///
+    /// # Security
+    /// - `admin.require_auth()` is called before any state is read or written,
+    ///   ensuring the Soroban auth engine rejects unsigned invocations.
+    /// - The conflict guard fires before the storage write, so an invalid
+    ///   treasury address never reaches persistent state.
+    /// - No player game state is touched; only `ContractConfig.treasury` changes.
+    /// - Fees already collected in prior games are unaffected; only future
+    ///   `claim_winnings` and `cash_out` settlements route to the new address.
+    pub fn set_treasury(
+        env: Env,
+        admin: Address,
+        new_treasury: Address,
+    ) -> Result<(), Error> {
+        // Guard 1: require admin authorization before touching any state.
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+
+        // Guard 2: caller must be the configured admin.
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard 3: treasury must remain distinct from admin (separation of roles).
+        if new_treasury == config.admin {
+            return Err(Error::AdminTreasuryConflict);
+        }
+
+        config.treasury = new_treasury;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1390,6 +1439,128 @@ mod tests {
         // Stats must be unchanged — no fee or reserve mutation on error.
         assert_eq!(before_stats.total_fees, after_stats.total_fees);
         assert_eq!(before_stats.reserve_balance, after_stats.reserve_balance);
+    }
+
+    // ── set_treasury tests ───────────────────────────────────────────────────
+
+    fn get_admin(env: &Env, contract_id: &Address) -> Address {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_config(env).admin
+        })
+    }
+
+    fn get_treasury(env: &Env, contract_id: &Address) -> Address {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_config(env).treasury
+        })
+    }
+
+    #[test]
+    fn test_set_treasury_succeeds_for_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+        let new_treasury = Address::generate(&env);
+
+        client.set_treasury(&admin, &new_treasury);
+
+        assert_eq!(get_treasury(&env, &contract_id), new_treasury);
+    }
+
+    #[test]
+    fn test_set_treasury_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let stranger = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        let result = client.try_set_treasury(&stranger, &new_treasury);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_treasury_rejects_admin_as_treasury() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        // Attempting to set treasury to the admin address must be rejected.
+        let result = client.try_set_treasury(&admin, &admin);
+        assert_eq!(result, Err(Ok(Error::AdminTreasuryConflict)));
+    }
+
+    #[test]
+    fn test_set_treasury_no_state_mutation_on_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let before_treasury = get_treasury(&env, &contract_id);
+
+        let stranger = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+        let _ = client.try_set_treasury(&stranger, &new_treasury);
+
+        assert_eq!(get_treasury(&env, &contract_id), before_treasury);
+    }
+
+    #[test]
+    fn test_set_treasury_no_state_mutation_on_conflict() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+        let before_treasury = get_treasury(&env, &contract_id);
+
+        let _ = client.try_set_treasury(&admin, &admin);
+
+        assert_eq!(get_treasury(&env, &contract_id), before_treasury);
+    }
+
+    #[test]
+    fn test_set_treasury_can_be_updated_multiple_times() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let treasury_a = Address::generate(&env);
+        let treasury_b = Address::generate(&env);
+
+        client.set_treasury(&admin, &treasury_a);
+        assert_eq!(get_treasury(&env, &contract_id), treasury_a);
+
+        client.set_treasury(&admin, &treasury_b);
+        assert_eq!(get_treasury(&env, &contract_id), treasury_b);
+    }
+
+    #[test]
+    fn test_set_treasury_does_not_affect_other_config_fields() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let new_treasury = Address::generate(&env);
+        client.set_treasury(&admin, &new_treasury);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        // Only treasury changes; everything else must be identical.
+        assert_eq!(after.treasury, new_treasury);
+        assert_eq!(after.admin, before.admin);
+        assert_eq!(after.fee_bps, before.fee_bps);
+        assert_eq!(after.min_wager, before.min_wager);
+        assert_eq!(after.max_wager, before.max_wager);
+        assert_eq!(after.paused, before.paused);
     }
 }
 
