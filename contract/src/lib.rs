@@ -3834,3 +3834,184 @@ mod loss_forfeiture_tests {
             "reserve_balance must not wrap below near_max on overflow");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// cashout_cleanup_tests — post-payout state cleanup and duplicate-claim safety
+//
+// Invariants verified:
+//   CC-1  After a successful cash_out the game phase is Completed.
+//         The storage entry is retained (for audit) but the phase gate
+//         prevents any further payout from the same record.
+//   CC-2  A second cash_out call on the same player always returns
+//         InvalidPhase — the Completed phase blocks re-entry.
+//   CC-3  No state mutation (phase, reserves, fees) occurs when cash_out
+//         is called on an already-Completed game.
+//   CC-4  After cash_out the player can start a brand-new game, proving
+//         the Completed record does not permanently lock the player.
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod cashout_cleanup_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // ── shared helpers ───────────────────────────────────────────────────────
+
+    fn setup_env() -> (Env, soroban_sdk::Address, CoinflipContractClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let admin    = soroban_sdk::Address::generate(&env);
+        let treasury = soroban_sdk::Address::generate(&env);
+        let token    = soroban_sdk::Address::generate(&env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        (env, contract_id, client)
+    }
+
+    fn inject(env: &Env, cid: &soroban_sdk::Address, player: &soroban_sdk::Address,
+              phase: GamePhase, streak: u32, wager: i128) {
+        let dummy: BytesN<32> = env.crypto().sha256(
+            &soroban_sdk::Bytes::from_slice(env, &[0u8; 32])
+        ).into();
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment: dummy.clone(),
+            contract_random: dummy,
+            phase,
+        };
+        env.as_contract(cid, || {
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+    }
+
+    fn set_reserves(env: &Env, cid: &soroban_sdk::Address, amount: i128) {
+        env.as_contract(cid, || {
+            let mut s = CoinflipContract::load_stats(env);
+            s.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &s);
+        });
+    }
+
+    fn read_game(env: &Env, cid: &soroban_sdk::Address,
+                 player: &soroban_sdk::Address) -> Option<GameState> {
+        env.as_contract(cid, || CoinflipContract::load_player_game(env, player))
+    }
+
+    fn read_stats(env: &Env, cid: &soroban_sdk::Address) -> ContractStats {
+        env.as_contract(cid, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        })
+    }
+
+    // ── CC-1: phase is Completed after successful cash_out ───────────────────
+
+    proptest! {
+        /// CC-1: For any valid wager and streak (1-4), a successful cash_out
+        /// always leaves the game in Completed phase.
+        #[test]
+        fn prop_cash_out_always_sets_completed_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let (env, cid, client) = setup_env();
+            let player = soroban_sdk::Address::generate(&env);
+            set_reserves(&env, &cid, i128::MAX / 2);
+            inject(&env, &cid, &player, GamePhase::Revealed, streak, wager);
+
+            let result = client.try_cash_out(&player);
+            prop_assert!(result.is_ok(), "cash_out must succeed for valid Revealed game");
+
+            let game = read_game(&env, &cid, &player)
+                .expect("game record must still exist after cash_out");
+            prop_assert_eq!(game.phase, GamePhase::Completed,
+                "phase must be Completed after cash_out");
+        }
+    }
+
+    // ── CC-2: duplicate cash_out always returns InvalidPhase ─────────────────
+
+    proptest! {
+        /// CC-2: A second cash_out on the same player always fails with
+        /// InvalidPhase, regardless of wager or streak.
+        #[test]
+        fn prop_duplicate_cash_out_always_fails(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let (env, cid, client) = setup_env();
+            let player = soroban_sdk::Address::generate(&env);
+            set_reserves(&env, &cid, i128::MAX / 2);
+            inject(&env, &cid, &player, GamePhase::Revealed, streak, wager);
+
+            // First call must succeed.
+            prop_assert!(client.try_cash_out(&player).is_ok());
+
+            // Second call must be rejected — Completed phase blocks re-entry.
+            let second = client.try_cash_out(&player);
+            prop_assert_eq!(second, Err(Ok(Error::InvalidPhase)),
+                "duplicate cash_out must return InvalidPhase");
+        }
+    }
+
+    // ── CC-3: no state mutation on duplicate cash_out ────────────────────────
+
+    proptest! {
+        /// CC-3: When cash_out is called on an already-Completed game, neither
+        /// reserves nor fees change — the contract is fully idempotent on error.
+        #[test]
+        fn prop_duplicate_cash_out_no_state_mutation(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let (env, cid, client) = setup_env();
+            let player = soroban_sdk::Address::generate(&env);
+            set_reserves(&env, &cid, i128::MAX / 2);
+            inject(&env, &cid, &player, GamePhase::Revealed, streak, wager);
+
+            // First cash_out — legitimate payout.
+            let _ = client.try_cash_out(&player);
+            let stats_after_first = read_stats(&env, &cid);
+
+            // Second cash_out — must be a no-op.
+            let _ = client.try_cash_out(&player);
+            let stats_after_second = read_stats(&env, &cid);
+
+            prop_assert_eq!(stats_after_first.reserve_balance,
+                            stats_after_second.reserve_balance,
+                "reserve_balance must not change on duplicate cash_out");
+            prop_assert_eq!(stats_after_first.total_fees,
+                            stats_after_second.total_fees,
+                "total_fees must not change on duplicate cash_out");
+        }
+    }
+
+    // ── CC-4: player can start a new game after cash_out ─────────────────────
+
+    proptest! {
+        /// CC-4: After cash_out the Completed record does not permanently lock
+        /// the player — start_game must succeed for any valid wager.
+        #[test]
+        fn prop_new_game_allowed_after_cash_out(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let (env, cid, client) = setup_env();
+            let player = soroban_sdk::Address::generate(&env);
+            set_reserves(&env, &cid, i128::MAX / 2);
+            inject(&env, &cid, &player, GamePhase::Revealed, 1, wager);
+
+            // Cash out first.
+            prop_assert!(client.try_cash_out(&player).is_ok());
+
+            // New game must be accepted.
+            let commitment: BytesN<32> = env.crypto().sha256(
+                &soroban_sdk::Bytes::from_slice(&env, &[7u8; 32])
+            ).into();
+            let result = client.try_start_game(&player, &Side::Tails, &wager, &commitment);
+            prop_assert!(result.is_ok(),
+                "start_game must succeed after cash_out for wager={}", wager);
+        }
+    }
+}
