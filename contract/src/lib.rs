@@ -3046,6 +3046,303 @@ mod property_tests {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Feature: soroban-coinflip-game
+// Module:  cumulative_fee_tests
+//
+// Verifies that `total_fees` in ContractStats accumulates correctly across
+// multiple sequential payouts and across fee_bps configuration changes.
+//
+// Accounting identity under test:
+//   total_fees_after == total_fees_before + Σ fee_i
+//   where fee_i = floor(gross_i * fee_bps_i / 10_000)
+//   and   gross_i = floor(wager_i * multiplier(streak_i) / 10_000)
+//
+// Properties:
+//   P-1  After N sequential cash-outs, total_fees equals the sum of each
+//        individual fee computed from (wager, streak, fee_bps).
+//   P-2  Fee accumulation is additive and order-independent: the total is the
+//        same regardless of which player cashes out first.
+//   P-3  A fee_bps change between payouts is reflected immediately — earlier
+//        payouts use the old rate, later payouts use the new rate.
+//   P-4  At fee_bps = 200 (minimum) and fee_bps = 500 (maximum), the running
+//        total stays within the mathematically expected bounds.
+//   P-5  total_fees never decreases (fees are never refunded).
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod cumulative_fee_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    /// Set up a fresh contract with ample reserves and return (contract_id, client).
+    fn setup(env: &Env, fee_bps: u32) -> soroban_sdk::Address {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+
+        let admin    = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token    = Address::generate(env);
+
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+
+        // Inject large reserves so no payout is blocked by InsufficientReserves.
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = i128::MAX / 2;
+            CoinflipContract::save_stats(env, &stats);
+        });
+
+        contract_id
+    }
+
+    /// Inject a Revealed-phase game for `player` with the given streak/wager,
+    /// then call cash_out and return the fee that should have been recorded.
+    ///
+    /// Fee formula (mirrors contract logic):
+    ///   gross = wager * multiplier(streak) / 10_000
+    ///   fee   = gross * fee_bps / 10_000
+    fn do_cash_out(
+        env: &Env,
+        contract_id: &soroban_sdk::Address,
+        player: &Address,
+        wager: i128,
+        streak: u32,
+        fee_bps: u32,
+    ) -> i128 {
+        let dummy: BytesN<32> = env
+            .crypto()
+            .sha256(&soroban_sdk::Bytes::from_slice(env, &[7u8; 32]))
+            .into();
+
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment: dummy.clone(),
+            contract_random: dummy,
+            phase: GamePhase::Revealed,
+        };
+        env.as_contract(contract_id, || {
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+
+        let client = CoinflipContractClient::new(env, contract_id);
+        client.cash_out(player);
+
+        // Expected fee for this payout
+        let gross = wager
+            .checked_mul(get_multiplier(streak) as i128)
+            .unwrap()
+            / 10_000;
+        gross
+            .checked_mul(fee_bps as i128)
+            .unwrap()
+            / 10_000
+    }
+
+    /// Read total_fees from contract storage.
+    fn read_total_fees(env: &Env, contract_id: &soroban_sdk::Address) -> i128 {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_stats(env).total_fees
+        })
+    }
+
+    // ── unit tests ────────────────────────────────────────────────────────
+
+    /// P-1 (unit): Three sequential cash-outs by different players.
+    ///
+    /// Accounting notes:
+    ///   wager=10_000_000, streak=1 (1.9x), fee_bps=300
+    ///     gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
+    ///     fee   = 19_000_000 * 300   / 10_000 =    570_000
+    ///
+    ///   wager=5_000_000, streak=2 (3.5x), fee_bps=300
+    ///     gross = 5_000_000 * 35_000 / 10_000 = 17_500_000
+    ///     fee   = 17_500_000 * 300   / 10_000 =    525_000
+    ///
+    ///   wager=2_000_000, streak=4 (10x), fee_bps=300
+    ///     gross = 2_000_000 * 100_000 / 10_000 = 20_000_000
+    ///     fee   = 20_000_000 * 300    / 10_000 =    600_000
+    ///
+    ///   expected total_fees = 570_000 + 525_000 + 600_000 = 1_695_000
+    #[test]
+    fn test_fees_accumulate_across_three_payouts() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let p3 = Address::generate(&env);
+
+        let fee1 = do_cash_out(&env, &contract_id, &p1, 10_000_000, 1, 300);
+        let fee2 = do_cash_out(&env, &contract_id, &p2,  5_000_000, 2, 300);
+        let fee3 = do_cash_out(&env, &contract_id, &p3,  2_000_000, 4, 300);
+
+        assert_eq!(fee1, 570_000);
+        assert_eq!(fee2, 525_000);
+        assert_eq!(fee3, 600_000);
+        assert_eq!(read_total_fees(&env, &contract_id), fee1 + fee2 + fee3);
+    }
+
+    /// P-3 (unit): Fee rate change between payouts is applied immediately.
+    ///
+    /// Accounting notes:
+    ///   Round 1 — fee_bps=200:
+    ///     wager=10_000_000, streak=1 → gross=19_000_000, fee=380_000
+    ///   Round 2 — fee_bps=500 (updated via update_fee):
+    ///     wager=10_000_000, streak=1 → gross=19_000_000, fee=950_000
+    ///   expected total_fees = 380_000 + 950_000 = 1_330_000
+    #[test]
+    fn test_fees_accumulate_after_fee_bps_change() {
+        let env = Env::default();
+        let contract_id = setup(&env, 200);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+
+        // First payout at fee_bps=200
+        let fee1 = do_cash_out(&env, &contract_id, &p1, 10_000_000, 1, 200);
+        assert_eq!(fee1, 380_000);
+        assert_eq!(read_total_fees(&env, &contract_id), 380_000);
+
+        // Update fee_bps to 500 directly in storage (no admin entrypoint exists)
+        env.as_contract(&contract_id, || {
+            let mut cfg = CoinflipContract::load_config(&env);
+            cfg.fee_bps = 500;
+            CoinflipContract::save_config(&env, &cfg);
+        });
+
+        // Second payout at fee_bps=500
+        let fee2 = do_cash_out(&env, &contract_id, &p2, 10_000_000, 1, 500);
+        assert_eq!(fee2, 950_000);
+        assert_eq!(read_total_fees(&env, &contract_id), fee1 + fee2);
+    }
+
+    /// P-5 (unit): total_fees never decreases — verified after each step.
+    #[test]
+    fn test_total_fees_never_decreases() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+
+        let mut running = 0i128;
+        for streak in 1u32..=4 {
+            let player = Address::generate(&env);
+            let fee = do_cash_out(&env, &contract_id, &player, 5_000_000, streak, 300);
+            running += fee;
+            let stored = read_total_fees(&env, &contract_id);
+            assert!(stored >= running - 1, // allow ±1 stroop integer-division rounding
+                "total_fees decreased at streak {}: stored={} running={}", streak, stored, running);
+        }
+    }
+
+    // ── property tests ────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// P-1 (property): For N random sequential cash-outs, total_fees equals
+        /// the sum of individually computed fees.
+        ///
+        /// The test generates up to 5 (wager, streak) pairs and verifies that
+        /// the contract's running total matches the hand-computed sum at every
+        /// step, not just at the end.
+        #[test]
+        fn prop_cumulative_fees_match_sum_of_individual_fees(
+            wagers  in proptest::collection::vec(1_000_000i128..=100_000_000i128, 1..=5),
+            streaks in proptest::collection::vec(1u32..=4u32, 1..=5),
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+
+            let n = wagers.len().min(streaks.len());
+            let mut expected_total = 0i128;
+
+            for i in 0..n {
+                let player = Address::generate(&env);
+                let fee = do_cash_out(&env, &contract_id, &player, wagers[i], streaks[i], fee_bps);
+                expected_total += fee;
+
+                let stored = read_total_fees(&env, &contract_id);
+                // Allow ±1 stroop per payout for integer-division rounding
+                prop_assert!(
+                    (stored - expected_total).abs() <= i as i128 + 1,
+                    "After payout {}: stored={} expected={}", i + 1, stored, expected_total
+                );
+            }
+        }
+
+        /// P-4 (property): At fee_bps boundaries (200 and 500), total_fees stays
+        /// within the mathematically expected range for any wager/streak combo.
+        ///
+        /// Lower bound: fee >= wager * multiplier(streak) / 10_000 * 200 / 10_000
+        /// Upper bound: fee <= wager * multiplier(streak) / 10_000 * 500 / 10_000
+        #[test]
+        fn prop_cumulative_fees_within_rate_bounds(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 1u32..=4u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+
+            let player = Address::generate(&env);
+            do_cash_out(&env, &contract_id, &player, wager, streak, fee_bps);
+
+            let stored = read_total_fees(&env, &contract_id);
+            let gross = wager
+                .checked_mul(get_multiplier(streak) as i128)
+                .unwrap()
+                / 10_000;
+
+            let fee_min = gross * 200 / 10_000;
+            let fee_max = gross * 500 / 10_000;
+
+            prop_assert!(
+                stored >= fee_min && stored <= fee_max,
+                "fee={} not in [{}, {}] for wager={} streak={} fee_bps={}",
+                stored, fee_min, fee_max, wager, streak, fee_bps
+            );
+        }
+
+        /// P-2 (property): Fee accumulation is additive — two payouts in either
+        /// order produce the same total_fees.
+        #[test]
+        fn prop_fee_accumulation_is_order_independent(
+            wager1  in 1_000_000i128..=50_000_000i128,
+            wager2  in 1_000_000i128..=50_000_000i128,
+            streak1 in 1u32..=4u32,
+            streak2 in 1u32..=4u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            // Order A: player1 then player2
+            let env_a = Env::default();
+            let cid_a = setup(&env_a, fee_bps);
+            let pa1 = Address::generate(&env_a);
+            let pa2 = Address::generate(&env_a);
+            do_cash_out(&env_a, &cid_a, &pa1, wager1, streak1, fee_bps);
+            do_cash_out(&env_a, &cid_a, &pa2, wager2, streak2, fee_bps);
+            let total_a = read_total_fees(&env_a, &cid_a);
+
+            // Order B: player2 then player1
+            let env_b = Env::default();
+            let cid_b = setup(&env_b, fee_bps);
+            let pb1 = Address::generate(&env_b);
+            let pb2 = Address::generate(&env_b);
+            do_cash_out(&env_b, &cid_b, &pb2, wager2, streak2, fee_bps);
+            do_cash_out(&env_b, &cid_b, &pb1, wager1, streak1, fee_bps);
+            let total_b = read_total_fees(&env_b, &cid_b);
+
+            prop_assert_eq!(total_a, total_b,
+                "Fee totals differ by order: A={} B={}", total_a, total_b);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: soroban-coinflip-game
 // Module:  streak_increment_tests
 //
 // Validates that winning reveals increment the streak counter exactly once per
