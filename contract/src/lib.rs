@@ -1,3 +1,32 @@
+//! # Tossd Coinflip Contract
+//!
+//! Provably fair coinflip game on the Stellar/Soroban smart contract platform.
+//!
+//! ## Architecture
+//!
+//! The contract is a single `lib.rs` module containing:
+//! - Public API functions exposed via `#[contractimpl]`
+//! - Supporting types (`GameState`, `ContractConfig`, `ContractStats`, `Error`, …)
+//! - Pure helper functions (`get_multiplier`, `calculate_payout`, `verify_commitment`)
+//! - A comprehensive test suite (unit, property-based, integration harness)
+//!
+//! ## Commit-Reveal Randomness
+//!
+//! 1. Player hashes a secret: `commitment = SHA-256(secret)`
+//! 2. Player calls `start_game` with the commitment; contract stores
+//!    `contract_random = SHA-256(ledger_sequence)`.
+//! 3. Player calls `reveal(secret)`; contract verifies the commitment and
+//!    derives the outcome from `SHA-256(secret || contract_random)`.
+//!
+//! Neither party can unilaterally control the outcome:
+//! - The player cannot change their secret after committing.
+//! - The contract cannot change the ledger sequence after the game starts.
+//!
+//! ## Error Code Stability
+//!
+//! All [`Error`] variants map to stable `u32` codes (see [`error_codes`]).
+//! These codes are part of the public protocol and must not change across upgrades.
+
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Bytes, BytesN, Env};
@@ -178,22 +207,41 @@ pub enum Error {
     AlreadyInitialized = 51,
 }
 
-/// Side choice for the coinflip
+/// The player's chosen side for a coinflip.
+///
+/// Submitted at game creation and compared against the derived outcome
+/// in `reveal` to determine win/loss.
+///
+/// Serialized as `u32` via `#[repr(u32)]` for stable on-chain storage.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Side {
+    /// Heads — discriminant 0.
     Heads = 0,
+    /// Tails — discriminant 1.
     Tails = 1,
 }
 
-/// Game phase tracking
+/// Lifecycle phase of a player's active game.
+///
+/// State transitions:
+/// ```text
+/// Committed ──(reveal wins)──► Revealed ──(cash_out / claim_winnings)──► Completed
+///           ──(reveal loses)──────────────────────────────────────────► (deleted)
+///           ──(continue_streak)──► Committed  (streak preserved)
+/// ```
+///
+/// Only `Completed` games may be replaced by a new `start_game` call.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum GamePhase {
-    Committed,    // Waiting for reveal
-    Revealed,     // Outcome determined, awaiting decision
-    Completed,    // Game ended
+    /// Wager placed and commitment recorded; waiting for the player to call `reveal`.
+    Committed,
+    /// Outcome determined; player must call `cash_out`, `claim_winnings`, or `continue_streak`.
+    Revealed,
+    /// Game has ended (win settled or loss forfeited); slot is available for a new game.
+    Completed,
 }
 
 /// Per-player game state persisted in `Committed` phase at game start.
@@ -225,36 +273,62 @@ pub struct GameState {
     pub phase: GamePhase,
 }
 
-/// Contract configuration
+/// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
+///
+/// All fields are set at `initialize` time and may be updated by the admin
+/// via `set_fee`, `set_treasury`, `set_wager_limits`, and `set_paused`.
+/// In-flight games snapshot `fee_bps` into [`GameState`] so admin changes
+/// never retroactively alter active game payouts.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractConfig {
-    pub admin: Address,           // Administrator address
-    pub treasury: Address,        // Fee collection address
-    pub token: Address,           // SAC token address for wager custody (XLM or any SEP-41 token)
-    pub fee_bps: u32,            // Fee in basis points (200-500 = 2-5%)
-    pub min_wager: i128,         // Minimum wager in stroops
-    pub max_wager: i128,         // Maximum wager in stroops
-    pub paused: bool,            // Emergency pause flag
+    /// Administrator address; the only account permitted to call admin functions.
+    pub admin: Address,
+    /// Fee collection address; receives the protocol fee on every settled win.
+    pub treasury: Address,
+    /// SAC token address used for wager custody (XLM or any SEP-41 token).
+    pub token: Address,
+    /// Protocol fee in basis points (200–500 = 2–5%).
+    pub fee_bps: u32,
+    /// Inclusive minimum wager in stroops.
+    pub min_wager: i128,
+    /// Inclusive maximum wager in stroops.
+    pub max_wager: i128,
+    /// Emergency pause flag; when `true`, `start_game` is rejected.
+    pub paused: bool,
 }
 
-/// Contract statistics
+/// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
+///
+/// Updated atomically alongside game state transitions.
+/// `reserve_balance` is the authoritative on-chain reserve figure used for
+/// solvency checks in `start_game` and `continue_streak`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractStats {
-    pub total_games: u64,        // Total games played
-    pub total_volume: i128,      // Total XLM wagered
-    pub total_fees: i128,        // Total fees collected
-    pub reserve_balance: i128,   // Current contract reserves
+    /// Cumulative count of games started (incremented in `start_game`).
+    pub total_games: u64,
+    /// Cumulative XLM wagered across all games, in stroops.
+    pub total_volume: i128,
+    /// Cumulative protocol fees collected across all settled wins, in stroops.
+    pub total_fees: i128,
+    /// Current contract reserve balance in stroops; decremented on payouts,
+    /// incremented when the house wins (loss forfeiture).
+    pub reserve_balance: i128,
 }
 
-/// Storage keys for contract data
+/// Persistent storage key variants for the contract's data model.
+///
+/// Used with `env.storage().persistent()` for all reads and writes.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageKey {
-    Config,                    // Global configuration
-    Stats,                     // Global statistics
-    PlayerGame(Address),       // Per-player game state
+    /// Global contract configuration ([`ContractConfig`]).
+    Config,
+    /// Global aggregate statistics ([`ContractStats`]).
+    Stats,
+    /// Per-player game state ([`GameState`]), keyed by player address.
+    PlayerGame(Address),
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -329,6 +403,35 @@ pub fn verify_commitment(env: &Env, secret: &Bytes, commitment: &BytesN<32>) -> 
     &hash == commitment
 }
 
+/// Provably fair coinflip game contract for the Stellar/Soroban platform.
+///
+/// ## Public API
+///
+/// | Function           | Caller  | Description                                              |
+/// |--------------------|---------|----------------------------------------------------------|
+/// | `initialize`       | deployer| One-time setup: config, token, fee, wager bounds         |
+/// | `start_game`       | player  | Place a wager and submit a commitment hash               |
+/// | `reveal`           | player  | Reveal secret to determine win/loss outcome              |
+/// | `cash_out`         | player  | Settle a win without a token transfer (returns amount)   |
+/// | `claim_winnings`   | player  | Settle a win with on-chain token transfer                |
+/// | `continue_streak`  | player  | Risk current winnings for the next streak multiplier     |
+/// | `set_paused`       | admin   | Enable/disable new game creation                         |
+/// | `set_treasury`     | admin   | Update the fee collection address                        |
+/// | `set_wager_limits` | admin   | Update inclusive min/max wager bounds                    |
+/// | `set_fee`          | admin   | Update the protocol fee (200–500 bps)                    |
+///
+/// ## Randomness Model
+///
+/// Outcomes are derived from `SHA-256(player_secret || contract_random)` where
+/// `contract_random = SHA-256(ledger_sequence)`.  Neither party can unilaterally
+/// control the result: the player commits before the ledger sequence is known,
+/// and the contract cannot change the sequence after the commitment is stored.
+///
+/// ## Reserve Solvency
+///
+/// Before accepting any new game or streak continuation, the contract verifies
+/// that `reserve_balance >= worst_case_payout` (streak 4+ multiplier).
+/// This prevents the contract from accepting bets it cannot honour.
 #[contract]
 pub struct CoinflipContract;
 
@@ -396,11 +499,14 @@ impl CoinflipContract {
         Ok(())
     }
     
-    // Storage helper functions (internal use)
+    // ── Internal storage helpers ────────────────────────────────────────────
+
+    /// Persist `config` to permanent storage.
     fn save_config(env: &Env, config: &ContractConfig) {
         env.storage().persistent().set(&StorageKey::Config, config);
     }
 
+    /// Load the contract configuration. Panics if the contract is not initialized.
     fn load_config(env: &Env) -> ContractConfig {
         env.storage()
             .persistent()
@@ -408,10 +514,12 @@ impl CoinflipContract {
             .unwrap()
     }
 
+    /// Persist `stats` to permanent storage.
     fn save_stats(env: &Env, stats: &ContractStats) {
         env.storage().persistent().set(&StorageKey::Stats, stats);
     }
 
+    /// Load aggregate contract statistics. Panics if the contract is not initialized.
     fn load_stats(env: &Env) -> ContractStats {
         env.storage()
             .persistent()
@@ -419,18 +527,21 @@ impl CoinflipContract {
             .unwrap()
     }
 
+    /// Persist a player's game state to permanent storage.
     fn save_player_game(env: &Env, player: &Address, game: &GameState) {
         env.storage()
             .persistent()
             .set(&StorageKey::PlayerGame(player.clone()), game);
     }
 
+    /// Load a player's game state. Returns `None` if no game exists for `player`.
     fn load_player_game(env: &Env, player: &Address) -> Option<GameState> {
         env.storage()
             .persistent()
             .get(&StorageKey::PlayerGame(player.clone()))
     }
 
+    /// Remove a player's game state from storage (called on loss or after settlement).
     fn delete_player_game(env: &Env, player: &Address) {
         env.storage()
             .persistent()
@@ -624,20 +735,38 @@ impl CoinflipContract {
         }
     }
 
-    /// Claim winnings after a successful reveal.
+    /// Claim winnings after a successful reveal via on-chain token transfer.
     ///
-    /// Process:
-    /// 1. Verify game is in Revealed phase (player won)
-    /// 2. Calculate net payout (gross - fee)
-    /// 3. Transfer net payout to player
-    /// 4. Transfer fee to treasury
-    /// 5. Update contract reserves and stats
-    /// 6. Reset game to Completed phase
+    /// This is the transfer-backed settlement path.  For a no-transfer accounting
+    /// settlement (e.g. in test harnesses or off-chain integrations), use `cash_out`.
     ///
-    /// Errors:
-    /// - NoActiveGame: player has no game
-    /// - InvalidPhase: game not in Revealed phase (preventing double-claim)
-    /// - TransferFailed: token transfer fails
+    /// # Process
+    /// 1. Verify the game is in `Revealed` phase with a positive streak (player won).
+    /// 2. Calculate gross payout (`wager × multiplier / 10_000`) and fee (`gross × fee_bps / 10_000`).
+    /// 3. Verify `reserve_balance >= gross_payout` to ensure solvency.
+    /// 4. Transfer `net_payout` (gross − fee) to `player` via the SAC token client.
+    /// 5. Transfer `fee_amount` to `config.treasury`.
+    /// 6. Deduct `gross_payout` from `reserve_balance`; add `fee_amount` to `total_fees`.
+    /// 7. Advance game phase to `Completed`.
+    ///
+    /// # Arguments
+    /// - `player` – must authorize; must have an active game in `Revealed` phase
+    ///
+    /// # Returns
+    /// `Ok(())` on successful settlement.
+    ///
+    /// # Errors
+    /// | Error                  | Condition                                              |
+    /// |------------------------|--------------------------------------------------------|
+    /// | `NoActiveGame`         | No game record exists for `player`                     |
+    /// | `InvalidPhase`         | Game is not in `Revealed` phase                        |
+    /// | `InsufficientReserves` | `reserve_balance < gross_payout` or arithmetic overflow|
+    /// | `TransferFailed`       | SAC token transfer fails (propagated from token client)|
+    ///
+    /// # Note on streak == 0
+    /// A `Revealed` game with `streak == 0` indicates a loss; the game record is
+    /// deleted by `reveal` on the loss path, so `claim_winnings` will return
+    /// `NoActiveGame` rather than a dedicated loss error.
     pub fn claim_winnings(
         env: Env,
         player: Address,
@@ -695,16 +824,29 @@ impl CoinflipContract {
         Ok(())
     }
 
-    /// Cash out winnings after a successful reveal (no token transfer).
+    /// Cash out winnings after a successful reveal (accounting-only, no token transfer).
     ///
-    /// Guards:
-    /// 1. `NoActiveGame`               – player has no game
-    /// 2. `InvalidPhase`               – game not in Revealed phase
-    /// 3. `NoWinningsToClaimOrContinue` – streak == 0 (player lost)
+    /// Settles the game by updating reserve and fee accounting without issuing
+    /// an on-chain token transfer.  Use `claim_winnings` for the transfer-backed path.
     ///
-    /// On success: calculates net payout, deducts it from reserves, records
-    /// the fee in stats, sets game phase to Completed, and returns the net
-    /// payout amount.
+    /// # Arguments
+    /// - `player` – must authorize; must have an active game in `Revealed` phase
+    ///
+    /// # Returns
+    /// `Ok(net_payout)` — the net payout amount in stroops on success.
+    ///
+    /// # Guards (evaluated in order, no state mutation on failure)
+    /// 1. `NoActiveGame`                – no game record exists for `player`
+    /// 2. `InvalidPhase`                – game is not in `Revealed` phase
+    /// 3. `NoWinningsToClaimOrContinue` – `streak == 0` (player lost the last flip)
+    ///
+    /// # Errors
+    /// | Error                          | Condition                                        |
+    /// |--------------------------------|--------------------------------------------------|
+    /// | `NoActiveGame`                 | No game record exists for `player`               |
+    /// | `InvalidPhase`                 | Game is not in `Revealed` phase                  |
+    /// | `NoWinningsToClaimOrContinue`  | `streak == 0` — loss state, nothing to cash out  |
+    /// | `InsufficientReserves`         | Arithmetic overflow in payout calculation        |
     pub fn cash_out(
         env: Env,
         player: Address,
