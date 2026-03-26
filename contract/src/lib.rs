@@ -449,7 +449,10 @@ impl CoinflipContract {
     /// 2. `WagerBelowMinimum`     – rejected when `wager < config.min_wager`
     /// 3. `WagerAboveMaximum`     – rejected when `wager > config.max_wager`
     /// 4. `ActiveGameExists`      – rejected when the player already has an
-    ///                              in-progress game (phase != Completed)
+    ///                              in-progress game (phase != Completed).
+    ///                              This ensures strict per-player game isolation
+    ///                              and prevents concurrent game starts that could
+    ///                              exploit race conditions.
     /// 5. `InsufficientReserves`  – rejected when the contract cannot cover the
     ///                              maximum possible payout at the highest streak
     ///
@@ -557,7 +560,7 @@ impl CoinflipContract {
     ///
     /// Errors:
     /// - NoActiveGame: player has no game in Committed phase
-    /// - InvalidPhase: game not in Committed phase  
+    /// - InvalidPhase: game not in Committed phase (preventing double-reveal)
     /// - CommitmentMismatch: revealed secret doesn't match stored commitment
     pub fn reveal(
         env: Env,
@@ -626,7 +629,7 @@ impl CoinflipContract {
     ///
     /// Errors:
     /// - NoActiveGame: player has no game
-    /// - InvalidPhase: game not in Revealed phase
+    /// - InvalidPhase: game not in Revealed phase (preventing double-claim)
     /// - TransferFailed: token transfer fails
     pub fn claim_winnings(
         env: Env,
@@ -4382,6 +4385,114 @@ mod loss_forfeiture_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Feature: Concurrency & Sequential Order Guards
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod concurrency_edge_case_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_rapid_sequential_start_attempts() {
+        let env = Env::default();
+        let min_wager = 1_000_000;
+        let max_wager = 100_000_000;
+        let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        let commitment = dummy_commitment_prop(&env);
+
+        // First attempt succeeds
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+
+        // Second attempt immediately fails with ActiveGameExists
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment);
+        assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
+    }
+
+    #[test]
+    fn test_start_game_allowed_after_claim() {
+        let env = Env::default();
+        let min_wager = 1_000_000;
+        let max_wager = 100_000_000;
+        let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]); // Win for Heads in test env
+        let commitment = env.crypto().sha256(&secret).into();
+
+        // Game 1: start -> reveal (win) -> claim
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+        client.reveal(&player, &secret);
+        client.claim_winnings(&player);
+
+        // Game 2 must be allowed immediately after claim
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment);
+        assert!(result.is_ok(), "Expected Game 2 to be accepted after Game 1 claim");
+    }
+
+    #[test]
+    fn test_start_game_allowed_after_cash_out() {
+        let env = Env::default();
+        let min_wager = 1_000_000;
+        let max_wager = 100_000_000;
+        let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]); // Win for Heads in test env
+        let commitment = env.crypto().sha256(&secret).into();
+
+        // Game 1: start -> reveal (win) -> cash_out
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+        client.reveal(&player, &secret);
+        let payout = client.try_cash_out(&player);
+        assert!(payout.is_ok());
+
+        // Game 2 must be allowed immediately after cash_out
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment);
+        assert!(result.is_ok(), "Expected Game 2 to be accepted after Game 1 cash_out");
+    }
+
+    #[test]
+    fn test_rapid_sequential_reveal_attempts() {
+        let env = Env::default();
+        let min_wager = 1_000_000;
+        let max_wager = 100_000_000;
+        let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]);
+        let commitment = env.crypto().sha256(&secret).into();
+
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+
+        // First reveal succeeds
+        client.reveal(&player, &secret);
+
+        // Second reveal fails with InvalidPhase because game moved to Revealed phase
+        let result = client.try_reveal(&player, &secret);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(50))]
+        #[test]
+        fn prop_start_game_idempotency_guard(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+            let player = Address::generate(&env);
+            let commitment = dummy_commitment_prop(&env);
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
+        }
+    }
+}
+
 // Integration Test Harness
 // ═══════════════════════════════════════════════════════════════════════════
 //
@@ -4475,8 +4586,8 @@ mod integration_tests {
         fn new() -> Self {
             let env = Env::default();
             env.mock_all_auths();
-
             let contract_id = env.register(CoinflipContract, ());
+
             // SAFETY: the client lifetime is tied to `env` which lives in the
             // same struct; we extend it to 'static here for ergonomics inside
             // the test module. The struct must not outlive the env.
@@ -4561,11 +4672,7 @@ mod integration_tests {
         /// Read the current `ContractStats` from storage.
         fn stats(&self) -> ContractStats {
             self.env.as_contract(&self.contract_id, || {
-                self.env
-                    .storage()
-                    .persistent()
-                    .get(&StorageKey::Stats)
-                    .unwrap()
+                self.env.storage().persistent().get(&StorageKey::Stats).unwrap()
             })
         }
 
@@ -4641,136 +4748,76 @@ mod integration_tests {
     // Integration Tests
     // ─────────────────────────────────────────────────────────────────────
 
-    // ── Full win → cash_out flow ──────────────────────────────────────────
-
-    /// Happy path: player starts a game, wins, and cashes out.
-    ///
-    /// Verifies:
-    /// - `reveal` returns `true`
-    /// - `cash_out` returns the correct net payout
-    /// - game phase transitions to `Completed`
-    /// - reserve balance decreases by net payout
-    /// - fee is credited to stats
     #[test]
     fn test_full_win_then_cash_out() {
         let h = Harness::new();
         let player = h.player();
         h.fund(1_000_000_000);
-
         let wager = DEFAULT_WAGER;
         let won = h.play_win_round(&player, wager);
         assert!(won, "seed 1 + Heads must win");
-
         let expected_net = calculate_payout(wager, 1, DEFAULT_FEE_BPS).unwrap();
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
-
         let game = h.game_state(&player);
         assert_eq!(game.phase, GamePhase::Completed);
-
         let stats = h.stats();
-        // reserves reduced by net payout
         assert_eq!(stats.reserve_balance, 1_000_000_000 - expected_net);
-        // fee credited
         let gross = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
         let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128).unwrap() / 10_000;
         assert_eq!(stats.total_fees, fee);
     }
 
-    // ── Full loss flow ────────────────────────────────────────────────────
-
-    /// Player starts a game and loses on reveal.
-    ///
-    /// Verifies:
-    /// - `reveal` returns `false`
-    /// - game state is deleted (no lingering record)
-    /// - wager is credited to reserves (house keeps it)
     #[test]
     fn test_full_loss_forfeits_wager_to_reserves() {
         let h = Harness::new();
         let player = h.player();
         h.fund(1_000_000_000);
-
         let wager = DEFAULT_WAGER;
         let won = h.play_loss_round(&player, wager);
         assert!(!won, "seed 2 + Heads must lose");
-
-        // Game record must be gone
         let game_opt: Option<GameState> = h.env.as_contract(&h.contract_id, || {
             CoinflipContract::load_player_game(&h.env, &player)
         });
         assert!(game_opt.is_none(), "game state must be deleted on loss");
-
-        // Reserves increase by the forfeited wager
         let stats = h.stats();
         assert_eq!(stats.reserve_balance, 1_000_000_000 + wager);
     }
 
-    // ── Win → continue → win → cash_out (streak 2) ───────────────────────
-
-    /// Two consecutive wins build a streak and yield the streak-2 multiplier.
-    ///
-    /// Verifies:
-    /// - streak increments correctly after each win
-    /// - `continue_streak` resets phase to `Committed`
-    /// - final `cash_out` uses the streak-2 multiplier
     #[test]
     fn test_win_continue_win_cash_out_streak_2() {
         let h = Harness::new();
         let player = h.player();
         h.fund(1_000_000_000);
-
         let wager = DEFAULT_WAGER;
-
-        // Round 1 — win
         let won1 = h.play_win_round(&player, wager);
         assert!(won1, "round 1 must win");
         assert_eq!(h.game_state(&player).streak, 1);
         assert_eq!(h.game_state(&player).phase, GamePhase::Revealed);
-
-        // Continue to round 2
         let new_commitment = h.make_commitment(1);
         h.client.continue_streak(&player, &new_commitment);
         assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
-
-        // Round 2 — win again
         let secret2 = h.make_secret(1);
         let won2 = h.client.reveal(&player, &secret2);
         assert!(won2, "round 2 must win");
         assert_eq!(h.game_state(&player).streak, 2);
-
-        // Cash out at streak 2
         let expected_net = calculate_payout(wager, 2, DEFAULT_FEE_BPS).unwrap();
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
         assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
     }
 
-    // ── Streak 4+ cap ─────────────────────────────────────────────────────
-
-    /// Four consecutive wins hit the 10x multiplier cap.
-    ///
-    /// Verifies:
-    /// - streak reaches 4
-    /// - payout uses `MULTIPLIER_STREAK_4_PLUS` (100_000 bps)
     #[test]
     fn test_streak_4_uses_max_multiplier() {
         let h = Harness::new();
         let player = h.player();
         h.fund(1_000_000_000);
-
         let wager = DEFAULT_WAGER;
-
-        // Build streak to 4 via inject + reveal loop
         for expected_streak in 1u32..=4 {
-            // Inject a Revealed state at the previous streak so continue_streak
-            // or cash_out can be called, then re-enter Committed for the next round.
             if expected_streak == 1 {
-                // First round: go through start_game normally
                 let won = h.play_win_round(&player, wager);
                 assert!(won);
             } else {
-                // Subsequent rounds: continue then reveal
                 let commitment = h.make_commitment(1);
                 h.client.continue_streak(&player, &commitment);
                 let secret = h.make_secret(1);
@@ -4779,37 +4826,23 @@ mod integration_tests {
             }
             assert_eq!(h.game_state(&player).streak, expected_streak);
         }
-
-        // At streak 4 the multiplier is capped at 10x
         let expected_net = calculate_payout(wager, 4, DEFAULT_FEE_BPS).unwrap();
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
-
-        // Verify 10x gross
         let gross = wager.checked_mul(MULTIPLIER_STREAK_4_PLUS as i128).unwrap() / 10_000;
         let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128).unwrap() / 10_000;
         assert_eq!(expected_net, gross - fee);
     }
 
-    // ── Paused contract rejects new games ─────────────────────────────────
-
-    /// When the contract is paused, `start_game` must be rejected.
-    ///
-    /// Verifies:
-    /// - `ContractPaused` error is returned
-    /// - no game state is written
     #[test]
     fn test_paused_contract_rejects_start_game() {
         let h = Harness::new();
         h.fund(1_000_000_000);
-
-        // Pause the contract
         h.env.as_contract(&h.contract_id, || {
             let mut cfg = CoinflipContract::load_config(&h.env);
             cfg.paused = true;
             CoinflipContract::save_config(&h.env, &cfg);
         });
-
         let player = h.player();
         let result = h.client.try_start_game(
             &player,
@@ -4818,28 +4851,18 @@ mod integration_tests {
             &h.make_commitment(1),
         );
         assert_eq!(result, Err(Ok(Error::ContractPaused)));
-
         let game_opt: Option<GameState> = h.env.as_contract(&h.contract_id, || {
             CoinflipContract::load_player_game(&h.env, &player)
         });
         assert!(game_opt.is_none());
     }
 
-    // ── Double-start guard ────────────────────────────────────────────────
-
-    /// A player cannot start a second game while one is already active.
-    ///
-    /// Verifies:
-    /// - `ActiveGameExists` is returned on the second call
-    /// - the original game state is unchanged
     #[test]
     fn test_double_start_rejected_while_game_active() {
         let h = Harness::new();
         let player = h.player();
         h.fund(1_000_000_000);
-
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
-
         let result = h.client.try_start_game(
             &player,
             &Side::Tails,
@@ -4847,44 +4870,26 @@ mod integration_tests {
             &h.make_commitment(2),
         );
         assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
-
-        // Original game state must be intact
         let game = h.game_state(&player);
         assert_eq!(game.phase, GamePhase::Committed);
         assert_eq!(game.side, Side::Heads);
     }
 
-    // ── Commitment mismatch guard ─────────────────────────────────────────
-
-    /// Revealing with the wrong secret must be rejected.
-    ///
-    /// Verifies:
-    /// - `CommitmentMismatch` is returned
-    /// - game remains in `Committed` phase (no state mutation)
     #[test]
     fn test_reveal_wrong_secret_rejected() {
         let h = Harness::new();
         let player = h.player();
         h.fund(1_000_000_000);
-
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
-
-        // Reveal with a different seed
         let wrong_secret = h.make_secret(99);
         let result = h.client.try_reveal(&player, &wrong_secret);
         assert_eq!(result, Err(Ok(Error::CommitmentMismatch)));
-
-        // Phase must still be Committed
         assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
     }
 
-    // ── Insufficient reserves guard ───────────────────────────────────────
-
-    /// `start_game` must be rejected when reserves cannot cover worst-case payout.
     #[test]
     fn test_start_game_rejected_when_reserves_insufficient() {
         let h = Harness::new();
-        // Do NOT fund reserves — they start at 0 after initialize.
         let player = h.player();
         let result = h.client.try_start_game(
             &player,
@@ -4895,25 +4900,14 @@ mod integration_tests {
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
-    // ── Post-completion: player can start a new game ──────────────────────
-
-    /// After a completed game (win + cash_out), the player can start fresh.
-    ///
-    /// Verifies:
-    /// - `start_game` succeeds after `Completed` phase
-    /// - new game starts with streak 0
     #[test]
     fn test_new_game_allowed_after_completion() {
         let h = Harness::new();
         let player = h.player();
         h.fund(1_000_000_000);
-
-        // Win and cash out
         h.play_win_round(&player, DEFAULT_WAGER);
         h.client.cash_out(&player);
         assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
-
-        // Start a new game
         let result = h.client.try_start_game(
             &player,
             &Side::Tails,
@@ -4925,102 +4919,68 @@ mod integration_tests {
         assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
     }
 
-    // ── Stats accumulate correctly across multiple games ──────────────────
-
-    /// Two independent players each play a game; aggregate stats must reflect both.
-    ///
-    /// Verifies:
-    /// - `total_games` increments per game started
-    /// - `total_volume` accumulates wagers
     #[test]
     fn test_stats_accumulate_across_multiple_players() {
         let h = Harness::new();
         h.fund(1_000_000_000);
-
         let p1 = h.player();
         let p2 = h.player();
         let wager1 = 10_000_000i128;
         let wager2 = 20_000_000i128;
-
         h.client.start_game(&p1, &Side::Heads, &wager1, &h.make_commitment(1));
         h.client.start_game(&p2, &Side::Heads, &wager2, &h.make_commitment(1));
-
         let stats = h.stats();
         assert_eq!(stats.total_games, 2);
         assert_eq!(stats.total_volume, wager1 + wager2);
     }
 
-    // ── Wager boundary: min and max are inclusive ─────────────────────────
-
-    /// Wagers at exactly `min_wager` and `max_wager` must be accepted.
     #[test]
     fn test_wager_boundary_inclusive() {
         let h = Harness::new();
         h.fund(1_000_000_000);
-
         let p_min = h.player();
         let p_max = h.player();
-
         assert!(
-            h.client
-                .try_start_game(&p_min, &Side::Heads, &DEFAULT_MIN_WAGER, &h.make_commitment(1))
-                .is_ok(),
+            h.client.try_start_game(&p_min, &Side::Heads, &DEFAULT_MIN_WAGER, &h.make_commitment(1)).is_ok(),
             "min_wager must be accepted"
         );
         assert!(
-            h.client
-                .try_start_game(&p_max, &Side::Heads, &DEFAULT_MAX_WAGER, &h.make_commitment(1))
-                .is_ok(),
+            h.client.try_start_game(&p_max, &Side::Heads, &DEFAULT_MAX_WAGER, &h.make_commitment(1)).is_ok(),
             "max_wager must be accepted"
         );
     }
 
-    // ── cash_out on loss state (streak 0) is rejected ─────────────────────
-
-    /// `cash_out` must reject a `Revealed` game where streak == 0.
     #[test]
     fn test_cash_out_rejects_zero_streak_revealed() {
         let h = Harness::new();
         let player = h.player();
         h.inject_game(&player, GamePhase::Revealed, 0, DEFAULT_WAGER, 1);
-
         let result = h.client.try_cash_out(&player);
         assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
     }
 
-    // ── continue_streak rejects wrong phase ───────────────────────────────
-
-    /// `continue_streak` must reject a game not in `Revealed` phase.
     #[test]
     fn test_continue_streak_rejects_committed_phase() {
         let h = Harness::new();
         let player = h.player();
         h.inject_game(&player, GamePhase::Committed, 1, DEFAULT_WAGER, 1);
-
         let result = h.client.try_continue_streak(&player, &h.make_commitment(1));
         assert_eq!(result, Err(Ok(Error::InvalidPhase)));
     }
 
-    // ── probe_outcome helper is consistent with reveal ────────────────────
-
-    /// `probe_outcome` must agree with the actual `reveal` result.
-    ///
-    /// This validates the harness itself: if probe_outcome says Heads wins,
-    /// then a Heads player using that seed must win on reveal.
     #[test]
     fn test_probe_outcome_matches_reveal() {
         let h = Harness::new();
         let player = h.player();
         h.fund(1_000_000_000);
-
-        // Probe before starting the game (same ledger sequence will be used)
         let predicted = h.probe_outcome(1);
-
         let commitment = h.make_commitment(1);
         h.client.start_game(&player, &predicted, &DEFAULT_WAGER, &commitment);
-
         let secret = h.make_secret(1);
         let won = h.client.reveal(&player, &secret);
         assert!(won, "probe_outcome prediction must match actual reveal outcome");
+    }
+}
+ master
     }
 }
