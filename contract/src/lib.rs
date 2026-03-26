@@ -345,6 +345,25 @@ const MULTIPLIER_STREAK_2: u32 = 35_000; // 3.5x
 const MULTIPLIER_STREAK_3: u32 = 60_000; // 6.0x
 const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
 
+/// TTL constants for persistent storage entries.
+///
+/// Soroban persistent storage entries expire after `ledger_ttl` ledgers without
+/// a TTL extension.  We extend on every read/write to keep active data live.
+///
+/// Ledger cadence: ~5 seconds per ledger on Stellar mainnet.
+///
+/// | Constant              | Ledgers   | Approx duration |
+/// |-----------------------|-----------|-----------------|
+/// | `TTL_THRESHOLD`       | 100_000   | ~5.8 days       |
+/// | `TTL_EXTEND_TO`       | 500_000   | ~29 days        |
+///
+/// Tradeoff: extending on every access costs a small amount of additional
+/// compute budget per call, but prevents data loss for active games and
+/// config/stats entries.  The threshold avoids redundant extend calls when
+/// the TTL is already healthy.
+const TTL_THRESHOLD: u32 = 100_000;
+const TTL_EXTEND_TO: u32 = 500_000;
+
 /// Returns the gross payout multiplier (in basis points, 10_000 = 1x)
 /// for the given win `streak` level.
 ///
@@ -361,7 +380,9 @@ pub fn get_multiplier(streak: u32) -> u32 {
     }
 }
 
-/// Calculates the net payout for a winning streak.
+/// Calculates the full payout breakdown for a winning streak.
+///
+/// Returns `(gross, fee, net)` in stroops, or `None` on arithmetic overflow.
 ///
 /// Formulas (all in stroops):
 /// - gross = wager × multiplier_bps / 10_000
@@ -374,6 +395,29 @@ pub fn get_multiplier(streak: u32) -> u32 {
 /// 3. `fee_bps` <= 10_000 is mathematically required to avoid net < 0, enforced by config guards.
 /// 4. Subtractions are safe as `fee` is derived as a proportion of `gross` (<= `gross`).
 ///
+/// # Storage optimization note
+/// Callers that need gross, fee, and net should call this once rather than
+/// calling `calculate_payout` and then recomputing gross/fee separately.
+/// This eliminates two redundant multiplier lookups and two checked_div operations
+/// per settlement call.
+///
+/// # Arguments
+/// - `wager`   – original wager in stroops (must be > 0)
+/// - `streak`  – current win streak (passed to `get_multiplier`)
+/// - `fee_bps` – protocol fee in basis points (200–500)
+pub fn calculate_payout_breakdown(wager: i128, streak: u32, fee_bps: u32) -> Option<(i128, i128, i128)> {
+    let multiplier = get_multiplier(streak) as i128;
+    let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
+    let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
+    let net   = gross.checked_sub(fee)?;
+    Some((gross, fee, net))
+}
+
+/// Calculates the net payout for a winning streak.
+///
+/// Convenience wrapper around [`calculate_payout_breakdown`] for callers that
+/// only need the net amount (e.g. read-only queries).
+///
 /// Returns `None` if any intermediate multiplication overflows `i128`.
 ///
 /// # Arguments
@@ -381,10 +425,7 @@ pub fn get_multiplier(streak: u32) -> u32 {
 /// - `streak`  – current win streak (passed to `get_multiplier`)
 /// - `fee_bps` – protocol fee in basis points (200–500)
 pub fn calculate_payout(wager: i128, streak: u32, fee_bps: u32) -> Option<i128> {
-    let multiplier = get_multiplier(streak) as i128;
-    let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
-    let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
-    gross.checked_sub(fee)
+    calculate_payout_breakdown(wager, streak, fee_bps).map(|(_, _, net)| net)
 }
 
 /// Helper to verify a player's commitment hash.
@@ -494,7 +535,9 @@ impl CoinflipContract {
         };
         
         env.storage().persistent().set(&StorageKey::Config, &config);
+        env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
         env.storage().persistent().set(&StorageKey::Stats, &stats);
+        env.storage().persistent().extend_ttl(&StorageKey::Stats, TTL_THRESHOLD, TTL_EXTEND_TO);
         
         Ok(())
     }
@@ -504,41 +547,43 @@ impl CoinflipContract {
     /// Persist `config` to permanent storage.
     fn save_config(env: &Env, config: &ContractConfig) {
         env.storage().persistent().set(&StorageKey::Config, config);
+        env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Load the contract configuration. Panics if the contract is not initialized.
     fn load_config(env: &Env) -> ContractConfig {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::Config)
-            .unwrap()
+        let key = StorageKey::Config;
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().get(&key).unwrap()
     }
 
     /// Persist `stats` to permanent storage.
     fn save_stats(env: &Env, stats: &ContractStats) {
         env.storage().persistent().set(&StorageKey::Stats, stats);
+        env.storage().persistent().extend_ttl(&StorageKey::Stats, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Load aggregate contract statistics. Panics if the contract is not initialized.
     fn load_stats(env: &Env) -> ContractStats {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::Stats)
-            .unwrap()
+        let key = StorageKey::Stats;
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().get(&key).unwrap()
     }
 
     /// Persist a player's game state to permanent storage.
     fn save_player_game(env: &Env, player: &Address, game: &GameState) {
-        env.storage()
-            .persistent()
-            .set(&StorageKey::PlayerGame(player.clone()), game);
+        let key = StorageKey::PlayerGame(player.clone());
+        env.storage().persistent().set(&key, game);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Load a player's game state. Returns `None` if no game exists for `player`.
     fn load_player_game(env: &Env, player: &Address) -> Option<GameState> {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::PlayerGame(player.clone()))
+        let key = StorageKey::PlayerGame(player.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.storage().persistent().get(&key)
     }
 
     /// Remove a player's game state from storage (called on loss or after settlement).
@@ -784,19 +829,12 @@ impl CoinflipContract {
         let config = Self::load_config(&env);
         let token_client = token::Client::new(&env, &config.token);
 
-        // Calculate payout
-        let net_payout = calculate_payout(game.wager, game.streak, game.fee_bps)
-            .ok_or(Error::InsufficientReserves)?;
-
-        // Calculate gross payout and fee separately for accounting
-        let gross_payout = game.wager
-            .checked_mul(get_multiplier(game.streak) as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
-        let fee_amount = gross_payout
-            .checked_mul(game.fee_bps as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
+        // Single-pass payout breakdown: gross, fee, and net computed together to
+        // avoid the duplicate multiplier lookup + two checked_div calls that would
+        // result from calling calculate_payout and then recomputing gross/fee.
+        let (gross_payout, fee_amount, net_payout) =
+            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+                .ok_or(Error::InsufficientReserves)?;
 
         // Check sufficient reserves
         let stats = Self::load_stats(&env);
@@ -864,21 +902,16 @@ impl CoinflipContract {
             return Err(Error::NoWinningsToClaimOrContinue);
         }
 
-        let net_payout = calculate_payout(game.wager, game.streak, game.fee_bps)
-            .ok_or(Error::InsufficientReserves)?;
-
-        let gross = game.wager
-            .checked_mul(get_multiplier(game.streak) as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
-        let fee = gross
-            .checked_mul(game.fee_bps as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
+        // Single-pass payout breakdown: gross, fee, and net computed together to
+        // avoid the duplicate multiplier lookup + two checked_div calls that would
+        // result from calling calculate_payout and then recomputing gross/fee.
+        let (gross, fee, net_payout) =
+            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+                .ok_or(Error::InsufficientReserves)?;
 
         let mut stats = Self::load_stats(&env);
         stats.reserve_balance = stats.reserve_balance
-            .checked_sub(net_payout)
+            .checked_sub(gross)
             .ok_or(Error::InsufficientReserves)?;
         stats.total_fees = stats.total_fees
             .checked_add(fee)
@@ -955,8 +988,8 @@ impl CoinflipContract {
             return Err(Error::InvalidCommitment);
         }
 
-        // Guard 5: reserves must cover the next streak's worst-case payout
-        let config = Self::load_config(&env);
+        // Guard 5: reserves must cover the next streak's worst-case payout.
+        // Config is not needed here — all required data (wager, streak) is in GameState.
         let stats = Self::load_stats(&env);
 
         let next_streak = game.streak.saturating_add(1);
@@ -981,9 +1014,6 @@ impl CoinflipContract {
         game.contract_random = contract_random.into();
 
         Self::save_player_game(&env, &player, &game);
-
-        // suppress unused-variable warning for config (loaded for future use)
-        let _ = config;
 
         Ok(())
     }
@@ -1219,6 +1249,39 @@ mod tests {
     #[test]
     fn test_calculate_payout_zero_wager() {
         assert_eq!(calculate_payout(0, 1, 300), Some(0));
+    }
+
+    #[test]
+    fn test_calculate_payout_breakdown_streak_1() {
+        // wager=10_000_000, streak=1 (1.9x), fee=300bps (3%)
+        // gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
+        // fee   = 19_000_000 * 300  / 10_000 =    570_000
+        // net   = 18_430_000
+        assert_eq!(
+            calculate_payout_breakdown(10_000_000, 1, 300),
+            Some((19_000_000, 570_000, 18_430_000))
+        );
+    }
+
+    #[test]
+    fn test_calculate_payout_breakdown_net_equals_calculate_payout() {
+        // calculate_payout must return the same net as the breakdown helper
+        for (wager, streak, fee_bps) in [(10_000_000, 1, 300), (5_000_000, 2, 500), (1_000_000, 4, 200)] {
+            let (_, _, net) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap();
+            assert_eq!(calculate_payout(wager, streak, fee_bps), Some(net));
+        }
+    }
+
+    #[test]
+    fn test_calculate_payout_breakdown_gross_minus_fee_equals_net() {
+        // Invariant: gross - fee == net for all valid inputs
+        let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 3, 400).unwrap();
+        assert_eq!(gross - fee, net);
+    }
+
+    #[test]
+    fn test_calculate_payout_breakdown_overflow_returns_none() {
+        assert_eq!(calculate_payout_breakdown(i128::MAX, 1, 300), None);
     }
 
     #[test]
