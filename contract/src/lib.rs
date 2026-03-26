@@ -447,7 +447,10 @@ impl CoinflipContract {
     /// 2. `WagerBelowMinimum`     – rejected when `wager < config.min_wager`
     /// 3. `WagerAboveMaximum`     – rejected when `wager > config.max_wager`
     /// 4. `ActiveGameExists`      – rejected when the player already has an
-    ///                              in-progress game (phase != Completed)
+    ///                              in-progress game (phase != Completed).
+    ///                              This ensures strict per-player game isolation
+    ///                              and prevents concurrent game starts that could
+    ///                              exploit race conditions.
     /// 5. `InsufficientReserves`  – rejected when the contract cannot cover the
     ///                              maximum possible payout at the highest streak
     ///
@@ -561,7 +564,7 @@ impl CoinflipContract {
     ///
     /// Errors:
     /// - NoActiveGame: player has no game in Committed phase
-    /// - InvalidPhase: game not in Committed phase  
+    /// - InvalidPhase: game not in Committed phase (preventing double-reveal)
     /// - CommitmentMismatch: revealed secret doesn't match stored commitment
     pub fn reveal(
         env: Env,
@@ -630,7 +633,7 @@ impl CoinflipContract {
     ///
     /// Errors:
     /// - NoActiveGame: player has no game
-    /// - InvalidPhase: game not in Revealed phase
+    /// - InvalidPhase: game not in Revealed phase (preventing double-claim)
     /// - TransferFailed: token transfer fails
     pub fn claim_winnings(
         env: Env,
@@ -3832,5 +3835,120 @@ mod loss_forfeiture_tests {
         // Balance must be >= near_max (saturated, not wrapped to negative)
         assert!(stats.reserve_balance >= near_max,
             "reserve_balance must not wrap below near_max on overflow");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: Concurrency & Sequential Order Guards
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod concurrency_edge_case_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_rapid_sequential_start_attempts() {
+        let env = Env::default();
+        let min_wager = 1_000_000;
+        let max_wager = 100_000_000;
+        let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let player = Address::generate(&env);
+        let commitment = dummy_commitment_prop(&env);
+
+        // First attempt succeeds
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+
+        // Second attempt immediately fails with ActiveGameExists
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment);
+        assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
+    }
+
+    #[test]
+    fn test_start_game_allowed_after_claim() {
+        let env = Env::default();
+        let min_wager = 1_000_000;
+        let max_wager = 100_000_000;
+        let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]); // Win for Heads in test env
+        let commitment = env.crypto().sha256(&secret).into();
+
+        // Game 1: start -> reveal (win) -> claim
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+        client.reveal(&player, &secret);
+        client.claim_winnings(&player);
+
+        // Game 2 must be allowed immediately after claim
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment);
+        assert!(result.is_ok(), "Expected Game 2 to be accepted after Game 1 claim");
+    }
+
+    #[test]
+    fn test_start_game_allowed_after_cash_out() {
+        let env = Env::default();
+        let min_wager = 1_000_000;
+        let max_wager = 100_000_000;
+        let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]); // Win for Heads in test env
+        let commitment = env.crypto().sha256(&secret).into();
+
+        // Game 1: start -> reveal (win) -> cash_out
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+        client.reveal(&player, &secret);
+        let payout = client.try_cash_out(&player);
+        assert!(payout.is_ok());
+
+        // Game 2 must be allowed immediately after cash_out
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment);
+        assert!(result.is_ok(), "Expected Game 2 to be accepted after Game 1 cash_out");
+    }
+
+    #[test]
+    fn test_rapid_sequential_reveal_attempts() {
+        let env = Env::default();
+        let min_wager = 1_000_000;
+        let max_wager = 100_000_000;
+        let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]);
+        let commitment = env.crypto().sha256(&secret).into();
+
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+        
+        // First reveal succeeds
+        client.reveal(&player, &secret);
+
+        // Second reveal fails with InvalidPhase because game moved to Revealed phase
+        let result = client.try_reveal(&player, &secret);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(50))]
+        
+        #[test]
+        fn prop_start_game_idempotency_guard(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            let commitment = dummy_commitment_prop(&env);
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
+        }
     }
 }
