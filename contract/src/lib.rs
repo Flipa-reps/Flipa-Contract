@@ -798,6 +798,47 @@ impl CoinflipContract {
         Self::save_player_game(&env, &player, &game);
         Ok(())
     }
+
+    /// Update the protocol fee charged on winning payouts.
+    ///
+    /// Only the configured `admin` address may call this function.
+    /// The new fee must remain within the permitted range of 200–500 bps (2–5%).
+    ///
+    /// # Arguments
+    /// - `admin`   – must match `config.admin`; authorization is required
+    /// - `fee_bps` – new fee in basis points; must satisfy `200 <= fee_bps <= 500`
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`]        – caller is not the configured admin
+    /// - [`Error::InvalidFeePercentage`]– `fee_bps` is outside `[200, 500]`
+    ///
+    /// # Security
+    /// - `admin.require_auth()` is called before any state is read or written,
+    ///   ensuring the Soroban auth engine rejects unsigned invocations.
+    /// - The fee range guard fires before the storage write, so an invalid fee
+    ///   never reaches persistent state.
+    /// - No player game state is touched; only `ContractConfig.fee_bps` changes.
+    pub fn set_fee(env: Env, admin: Address, fee_bps: u32) -> Result<(), Error> {
+        // Guard 1: require admin authorization before touching any state.
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+
+        // Guard 2: caller must be the configured admin.
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard 3: fee must stay within the permitted protocol range (2–5%).
+        if fee_bps < 200 || fee_bps > 500 {
+            return Err(Error::InvalidFeePercentage);
+        }
+
+        config.fee_bps = fee_bps;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1390,6 +1431,125 @@ mod tests {
         // Stats must be unchanged — no fee or reserve mutation on error.
         assert_eq!(before_stats.total_fees, after_stats.total_fees);
         assert_eq!(before_stats.reserve_balance, after_stats.reserve_balance);
+    }
+
+    // ── set_fee tests ────────────────────────────────────────────────────────
+
+    /// Helper: returns the admin address stored in config.
+    fn get_admin(env: &Env, contract_id: &Address) -> Address {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_config(env).admin
+        })
+    }
+
+    #[test]
+    fn test_set_fee_succeeds_for_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        client.set_fee(&admin, &400);
+
+        let stored: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(stored.fee_bps, 400);
+    }
+
+    #[test]
+    fn test_set_fee_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let stranger = Address::generate(&env);
+
+        let result = client.try_set_fee(&stranger, &400);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_fee_rejects_fee_below_minimum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_fee(&admin, &199);
+        assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
+    }
+
+    #[test]
+    fn test_set_fee_rejects_fee_above_maximum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_fee(&admin, &501);
+        assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
+    }
+
+    #[test]
+    fn test_set_fee_accepts_boundary_values() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        // Lower bound (200 bps = 2%)
+        assert!(client.try_set_fee(&admin, &200).is_ok());
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.fee_bps, 200);
+
+        // Upper bound (500 bps = 5%)
+        assert!(client.try_set_fee(&admin, &500).is_ok());
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.fee_bps, 500);
+    }
+
+    #[test]
+    fn test_set_fee_no_state_mutation_on_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let stranger = Address::generate(&env);
+        let _ = client.try_set_fee(&stranger, &400);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before.fee_bps, after.fee_bps);
+    }
+
+    #[test]
+    fn test_set_fee_no_state_mutation_on_invalid_fee() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let _ = client.try_set_fee(&admin, &999);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before.fee_bps, after.fee_bps);
     }
 }
 
