@@ -798,6 +798,55 @@ impl CoinflipContract {
         Self::save_player_game(&env, &player, &game);
         Ok(())
     }
+
+    /// Update the minimum and maximum wager limits enforced by `start_game`.
+    ///
+    /// Only the configured `admin` address may call this function.
+    /// The new limits must preserve the invariant `min_wager < max_wager`,
+    /// and both values must be strictly positive.
+    ///
+    /// # Arguments
+    /// - `admin`     – must match `config.admin`; authorization is required
+    /// - `min_wager` – new minimum wager in stroops; must be > 0
+    /// - `max_wager` – new maximum wager in stroops; must be > `min_wager`
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`]      – caller is not the configured admin
+    /// - [`Error::InvalidWagerLimits`]– `min_wager >= max_wager` or either value <= 0
+    ///
+    /// # Security
+    /// - `admin.require_auth()` is called before any state is read or written.
+    /// - The ordering guard fires before the storage write, so invalid limits
+    ///   never reach persistent state.
+    /// - No player game state is touched; only `ContractConfig.min_wager` and
+    ///   `ContractConfig.max_wager` are updated.
+    pub fn set_wager_limits(
+        env: Env,
+        admin: Address,
+        min_wager: i128,
+        max_wager: i128,
+    ) -> Result<(), Error> {
+        // Guard 1: require admin authorization before touching any state.
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+
+        // Guard 2: caller must be the configured admin.
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard 3: limits must be positive and correctly ordered (min < max).
+        if min_wager <= 0 || max_wager <= 0 || min_wager >= max_wager {
+            return Err(Error::InvalidWagerLimits);
+        }
+
+        config.min_wager = min_wager;
+        config.max_wager = max_wager;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1390,6 +1439,127 @@ mod tests {
         // Stats must be unchanged — no fee or reserve mutation on error.
         assert_eq!(before_stats.total_fees, after_stats.total_fees);
         assert_eq!(before_stats.reserve_balance, after_stats.reserve_balance);
+    }
+
+    // ── set_wager_limits tests ───────────────────────────────────────────────
+
+    fn get_admin(env: &Env, contract_id: &Address) -> Address {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_config(env).admin
+        })
+    }
+
+    #[test]
+    fn test_set_wager_limits_succeeds_for_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        client.set_wager_limits(&admin, &2_000_000, &200_000_000);
+
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.min_wager, 2_000_000);
+        assert_eq!(cfg.max_wager, 200_000_000);
+    }
+
+    #[test]
+    fn test_set_wager_limits_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let stranger = Address::generate(&env);
+
+        let result = client.try_set_wager_limits(&stranger, &2_000_000, &200_000_000);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_wager_limits_rejects_min_equal_to_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_wager_limits(&admin, &10_000_000, &10_000_000);
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+    }
+
+    #[test]
+    fn test_set_wager_limits_rejects_min_greater_than_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_wager_limits(&admin, &50_000_000, &10_000_000);
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+    }
+
+    #[test]
+    fn test_set_wager_limits_rejects_zero_min() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_wager_limits(&admin, &0, &100_000_000);
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+    }
+
+    #[test]
+    fn test_set_wager_limits_rejects_zero_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_wager_limits(&admin, &1_000_000, &0);
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+    }
+
+    #[test]
+    fn test_set_wager_limits_no_state_mutation_on_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let stranger = Address::generate(&env);
+        let _ = client.try_set_wager_limits(&stranger, &2_000_000, &200_000_000);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before.min_wager, after.min_wager);
+        assert_eq!(before.max_wager, after.max_wager);
+    }
+
+    #[test]
+    fn test_set_wager_limits_no_state_mutation_on_invalid_limits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let _ = client.try_set_wager_limits(&admin, &100_000_000, &1_000_000);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before.min_wager, after.min_wager);
+        assert_eq!(before.max_wager, after.max_wager);
     }
 }
 
