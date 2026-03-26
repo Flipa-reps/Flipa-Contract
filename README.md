@@ -88,41 +88,127 @@ cargo test -- --nocapture
 ### Build for Production
 
 ```bash
-# Optimize the WASM binary
 cargo build --target wasm32-unknown-unknown --release
-
-# The optimized WASM will be at:
-# target/wasm32-unknown-unknown/release/coinflip_contract.wasm
+# Output: target/wasm32-unknown-unknown/release/coinflip_contract.wasm
 ```
 
-### Deploy to Stellar
+### Automated Deployment Script
+
+A deployment script is provided at `contract/deploy.sh`. It builds the WASM,
+deploys the contract, and calls `initialize` in one step.
 
 ```bash
-# Deploy using Stellar CLI
+# Set credentials — never commit these
+export ADMIN_SECRET="S..."          # admin Stellar secret key
+export TREASURY_ADDRESS="G..."      # treasury public key (must differ from admin)
+
+# Optional overrides (defaults shown)
+export FEE_BPS=300                  # 3% rake
+export MIN_WAGER=1000000            # 0.1 XLM
+export MAX_WAGER=100000000          # 10 XLM
+
+# Deploy to testnet
+./contract/deploy.sh testnet
+
+# Deploy to mainnet
+./contract/deploy.sh mainnet
+```
+
+The script prints the contract ID and a reserve-funding reminder on success.
+
+### Manual Deployment (step-by-step)
+
+```bash
+# 1. Deploy WASM
 stellar contract deploy \
   --wasm target/wasm32-unknown-unknown/release/coinflip_contract.wasm \
-  --source <YOUR_SECRET_KEY> \
-  --network testnet
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet
 
-# Initialize the contract
+# 2. Initialize
 stellar contract invoke \
   --id <CONTRACT_ID> \
   --source <ADMIN_SECRET_KEY> \
-  --network testnet \
+  --network mainnet \
   -- initialize \
   --admin <ADMIN_ADDRESS> \
   --treasury <TREASURY_ADDRESS> \
   --fee_bps 300 \
   --min_wager 1000000 \
   --max_wager 100000000
+
+# 3. Fund reserves (minimum: MAX_WAGER × 10 = 1,000,000,000 stroops for defaults)
+# Transfer XLM to the contract address via the Stellar network before opening to players.
 ```
 
 ### Recommended Mainnet Parameters
 
-- **Fee**: 300-500 basis points (3-5%)
-- **Min Wager**: 1,000,000 stroops (0.1 XLM)
-- **Max Wager**: 100,000,000 stroops (10 XLM)
-- **Initial Reserves**: 10x max wager × max multiplier
+| Parameter      | Recommended Value          | Notes                                      |
+| -------------- | -------------------------- | ------------------------------------------ |
+| `fee_bps`      | 300–500 (3–5%)             | Must be in range enforced by contract      |
+| `min_wager`    | 1,000,000 stroops (0.1 XLM)| Prevents dust spam                         |
+| `max_wager`    | 100,000,000 stroops (10 XLM)| Cap exposure per game                     |
+| Initial reserve| ≥ max_wager × 10           | Covers worst-case 10x streak-4+ payout     |
+
+### Mainnet Rollout Checklist
+
+Pre-deploy:
+- [ ] Run full test suite: `cargo test` → `132 passed; 0 failed; 4 ignored`
+- [ ] Build succeeds with zero errors and zero new warnings
+- [ ] Admin and treasury keys are separate accounts (contract rejects same address)
+- [ ] Admin key is a hardware wallet or multisig — never a hot key
+- [ ] Treasury address is a cold wallet or protocol-controlled account
+- [ ] `ADMIN_SECRET` is stored in a secrets manager, not in shell history or `.env` files
+
+Deploy:
+- [ ] Deploy to testnet first and run a full game flow end-to-end
+- [ ] Verify contract ID matches expected WASM hash
+- [ ] Confirm `initialize` parameters match intended values via `get_stats()`
+- [ ] Fund contract reserve to at least `max_wager × 10` before opening to players
+- [ ] Verify `reserve_balance` via `get_stats()` after funding
+
+Post-deploy:
+- [ ] Monitor `reserve_balance` — top up before it falls below `max_wager × 10`
+- [ ] Set up alerting on `ContractPaused` / `InsufficientReserves` errors
+- [ ] Document the deployed contract ID and block height in your ops runbook
+- [ ] Test `set_paused(true)` and `set_paused(false)` from the admin key
+
+### Security Assumptions for Mainnet
+
+1. Commit-reveal integrity — The contract cannot manipulate outcomes because the
+   player's secret is unknown until `reveal`. The player cannot manipulate outcomes
+   because the commitment is locked in `start_game`. Neither party can bias the
+   XOR-based outcome without controlling both secrets simultaneously.
+
+2. Admin key compromise — A compromised admin key can pause new games and change
+   fee/wager parameters, but cannot steal player funds or alter in-flight game
+   state. Rotate the admin key immediately if compromise is suspected using
+   `set_treasury` / `set_wager_limits` / `set_fee` from a new admin address
+   (requires re-initialization if the admin address itself must change).
+
+3. Treasury key compromise — A compromised treasury key exposes accumulated fees
+   only. Player wagers and reserves are held by the contract, not the treasury.
+   Update the treasury address via `set_treasury` from the admin key.
+
+4. Reserve solvency — The contract enforces a solvency check before every
+   `start_game` and `continue_streak`. If reserves fall below the worst-case
+   payout for the current `max_wager` at streak 4+ (10x multiplier), new games
+   are rejected with `InsufficientReserves`. This is a protocol-level guarantee,
+   not an operational one — keep reserves funded.
+
+5. Fee snapshot isolation — The `fee_bps` stored in each `GameState` at
+   `start_game` time is immutable for that game. Admin fee changes via `set_fee`
+   only affect games started after the change. In-flight games settle at the
+   fee rate they were opened with.
+
+6. Overflow safety — All arithmetic uses `checked_*` operations. `calculate_payout`
+   returns `None` for wagers above `i128::MAX / 100_000`, which the wager
+   validation guards prevent from ever reaching settlement.
+
+7. Timeout recovery — If a player abandons a game after `start_game` without
+   calling `reveal`, the `RevealTimeout` path allows the wager to be reclaimed
+   after the timeout window. Ensure the timeout window is appropriate for your
+   expected block times.
 
 ## 🧪 Testing Strategy
 
