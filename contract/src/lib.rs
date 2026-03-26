@@ -209,6 +209,9 @@ pub enum GamePhase {
 /// - `contract_random`– SHA-256 of the ledger sequence at game-start time;
 ///                      combined with the player's revealed secret to produce
 ///                      the final, unpredictable outcome
+/// - `fee_bps`        – fee snapshot captured at game creation time;
+///                      used for all subsequent settlement calculations so
+///                      later admin fee changes do not alter in-flight games
 /// - `phase`          – lifecycle position: `Committed` → `Revealed` → `Completed`
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +221,7 @@ pub struct GameState {
     pub streak: u32,
     pub commitment: BytesN<32>,
     pub contract_random: BytesN<32>,
+    pub fee_bps: u32,
     pub phase: GamePhase,
 }
 
@@ -442,6 +446,8 @@ impl CoinflipContract {
     /// - the player must not already have an active game (only `Completed` games can be replaced).
     /// - contract reserves must cover worst-case payout (`streak 4+` multiplier) to avoid insolvency.
     /// - on success, the game state is persisted and global stats are updated (`total_games += 1`, `total_volume += wager`).
+    /// - on success, `config.fee_bps` is snapshotted into the game so future
+    ///   `set_fee` calls cannot retroactively change this game's payout terms.
     /// - player balance/transfer checks are assumed to be performed by the caller or higher-level token transfer semantics.
     ///
     /// Validation guards (in order):
@@ -535,6 +541,7 @@ impl CoinflipContract {
             streak: 0,
             commitment,
             contract_random,
+            fee_bps: config.fee_bps,
             phase: GamePhase::Committed,
         };
 
@@ -649,7 +656,7 @@ impl CoinflipContract {
         let token_client = token::Client::new(&env, &config.token);
 
         // Calculate payout
-        let net_payout = calculate_payout(game.wager, game.streak, config.fee_bps)
+        let net_payout = calculate_payout(game.wager, game.streak, game.fee_bps)
             .ok_or(Error::InsufficientReserves)?;
 
         // Calculate gross payout and fee separately for accounting
@@ -658,7 +665,7 @@ impl CoinflipContract {
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
         let fee_amount = gross_payout
-            .checked_mul(config.fee_bps as i128)
+            .checked_mul(game.fee_bps as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
 
@@ -715,8 +722,7 @@ impl CoinflipContract {
             return Err(Error::NoWinningsToClaimOrContinue);
         }
 
-        let config = Self::load_config(&env);
-        let net_payout = calculate_payout(game.wager, game.streak, config.fee_bps)
+        let net_payout = calculate_payout(game.wager, game.streak, game.fee_bps)
             .ok_or(Error::InsufficientReserves)?;
 
         let gross = game.wager
@@ -724,7 +730,7 @@ impl CoinflipContract {
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
         let fee = gross
-            .checked_mul(config.fee_bps as i128)
+            .checked_mul(game.fee_bps as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
 
@@ -965,6 +971,8 @@ impl CoinflipContract {
     /// - The fee range guard fires before the storage write, so an invalid fee
     ///   never reaches persistent state.
     /// - No player game state is touched; only `ContractConfig.fee_bps` changes.
+    /// - Fee changes are forward-only: in-flight games settle using their
+    ///   snapshotted `GameState.fee_bps` value.
     /// - Unauthorized callers leave the entire [`ContractConfig`] unchanged.
     pub fn set_fee(env: Env, admin: Address, fee_bps: u32) -> Result<(), Error> {
         // Guard 1: require admin authorization before touching any state.
@@ -1249,6 +1257,7 @@ mod tests {
                     streak: 1,
                     commitment,
                     contract_random: env.crypto().sha256(&Bytes::from_slice(env, &[2u8; 32])).into(),
+                    fee_bps,
                     phase: GamePhase::Revealed,
                 };
                 CoinflipContract::save_player_game(env, &player, &game);
@@ -1398,6 +1407,7 @@ mod tests {
             streak,
             commitment: dummy.clone(),
             contract_random: dummy,
+            fee_bps: 300,
             phase,
         };
         env.as_contract(contract_id, || {
@@ -1931,6 +1941,51 @@ mod tests {
         });
 
         assert_eq!(before.fee_bps, after.fee_bps);
+    }
+
+    #[test]
+    fn test_set_fee_does_not_reprice_existing_revealed_game() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+        assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+
+        // Fee changes after reveal must not alter this game's payout terms.
+        client.set_fee(&admin, &500);
+
+        let expected = calculate_payout(10_000_000, 1, 300).unwrap();
+        let payout = client.try_cash_out(&player);
+        assert_eq!(payout, Ok(Ok(expected)));
+    }
+
+    #[test]
+    fn test_set_fee_applies_to_new_game_after_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        client.set_fee(&admin, &500);
+
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+        assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+
+        let expected = calculate_payout(10_000_000, 1, 500).unwrap();
+        let payout = client.try_cash_out(&player);
+        assert_eq!(payout, Ok(Ok(expected)));
     }
 }
 
@@ -2650,6 +2705,160 @@ mod property_tests {
         }
     }
 
+    // Feature: fee isolation, Property: fee changes are forward-only
+    // Validates: in-flight games settle with their snapshotted fee, while
+    // games created after `set_fee` use the new fee.
+
+    fn setup_fee_isolation_env(
+        env: &Env,
+        fee_bps: u32,
+        min_wager: i128,
+        max_wager: i128,
+    ) -> (Address, CoinflipContractClient<'_>, Address) {
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = env.register_stellar_asset_contract(admin.clone());
+
+        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = i128::MAX / 4;
+            CoinflipContract::save_stats(env, &stats);
+        });
+
+        (contract_id, client, admin)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        #[test]
+        fn test_fee_change_does_not_reprice_revealed_inflight_game(
+            initial_fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            wager_offset in 0i128..=50_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let max_wager = min_wager + 100_000_000;
+            let wager = (min_wager + wager_offset).min(max_wager);
+            let new_fee_bps = if initial_fee_bps < 500 { initial_fee_bps + 1 } else { 499 };
+
+            let (contract_id, client, admin) = setup_fee_isolation_env(&env, initial_fee_bps, min_wager, max_wager);
+            let player = Address::generate(&env);
+            let secret = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+
+            let revealed: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(revealed.fee_bps, initial_fee_bps);
+
+            client.set_fee(&admin, &new_fee_bps);
+
+            let expected_net = calculate_payout(wager, 1, initial_fee_bps).unwrap();
+            let expected_fee = (wager
+                .checked_mul(get_multiplier(1) as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap())
+                .checked_mul(initial_fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+
+            let payout = client.try_cash_out(&player);
+            prop_assert_eq!(payout, Ok(Ok(expected_net)));
+
+            let cfg: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+            prop_assert_eq!(cfg.fee_bps, new_fee_bps);
+
+            let stats: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+            prop_assert_eq!(stats.total_fees, expected_fee);
+        }
+
+        #[test]
+        fn test_fee_change_applies_to_future_games_only(
+            initial_fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            wager_offset in 0i128..=50_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let max_wager = min_wager + 100_000_000;
+            let wager = (min_wager + wager_offset).min(max_wager);
+            let new_fee_bps = if initial_fee_bps < 500 { initial_fee_bps + 1 } else { 499 };
+
+            let (_contract_id, client, admin) = setup_fee_isolation_env(&env, initial_fee_bps, min_wager, max_wager);
+
+            // Player 1 starts before fee update and should keep old fee terms.
+            let player_one = Address::generate(&env);
+            let secret_one = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment_one: BytesN<32> = env.crypto().sha256(&secret_one).into();
+            client.start_game(&player_one, &Side::Heads, &wager, &commitment_one);
+            prop_assert_eq!(client.try_reveal(&player_one, &secret_one), Ok(Ok(true)));
+
+            // Admin updates fee; this must only affect newly created games.
+            client.set_fee(&admin, &new_fee_bps);
+
+            // Player 2 starts after fee update and should settle with new fee.
+            let player_two = Address::generate(&env);
+            let secret_two = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment_two: BytesN<32> = env.crypto().sha256(&secret_two).into();
+            client.start_game(&player_two, &Side::Heads, &wager, &commitment_two);
+            prop_assert_eq!(client.try_reveal(&player_two, &secret_two), Ok(Ok(true)));
+
+            let payout_one = client.try_cash_out(&player_one);
+            let payout_two = client.try_cash_out(&player_two);
+
+            prop_assert_eq!(payout_one, Ok(Ok(calculate_payout(wager, 1, initial_fee_bps).unwrap())));
+            prop_assert_eq!(payout_two, Ok(Ok(calculate_payout(wager, 1, new_fee_bps).unwrap())));
+        }
+
+        #[test]
+        fn test_fee_change_does_not_reprice_continued_inflight_streak(
+            initial_fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            wager_offset in 0i128..=50_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let max_wager = min_wager + 100_000_000;
+            let wager = (min_wager + wager_offset).min(max_wager);
+            let new_fee_bps = if initial_fee_bps < 500 { initial_fee_bps + 1 } else { 499 };
+
+            let (_contract_id, client, admin) = setup_fee_isolation_env(&env, initial_fee_bps, min_wager, max_wager);
+            let player = Address::generate(&env);
+            let secret = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+
+            client.set_fee(&admin, &new_fee_bps);
+
+            // Continue after fee change; payout terms must remain on the original snapshot.
+            let next_secret = Bytes::from_slice(&env, &[1u8; 32]);
+            let next_commitment: BytesN<32> = env.crypto().sha256(&next_secret).into();
+            prop_assert_eq!(client.try_continue_streak(&player, &next_commitment), Ok(Ok(())));
+            prop_assert_eq!(client.try_reveal(&player, &next_secret), Ok(Ok(true)));
+
+            let payout = client.try_cash_out(&player);
+            prop_assert_eq!(payout, Ok(Ok(calculate_payout(wager, 2, initial_fee_bps).unwrap())));
+        }
+    }
+
     // Feature: pause behavior, Property: pause blocks new starts but not active-game settlement
     // Validates: `start_game` rejects while paused and in-flight games can still reveal,
     // continue, and cash out to completion.
@@ -3204,6 +3413,7 @@ mod property_tests {
             streak,
             commitment: dummy.clone(),
             contract_random: dummy,
+            fee_bps: 300,
             phase,
         };
         env.as_contract(contract_id, || {
@@ -3919,6 +4129,7 @@ mod cumulative_fee_tests {
             streak,
             commitment: dummy.clone(),
             contract_random: dummy,
+            fee_bps,
             phase: GamePhase::Revealed,
         };
         env.as_contract(contract_id, || {
@@ -5393,6 +5604,7 @@ mod integration_tests {
                 streak,
                 commitment: commitment.clone(),
                 contract_random: commitment, // deterministic stand-in
+                fee_bps: DEFAULT_FEE_BPS,
                 phase,
             };
             self.env.as_contract(&self.contract_id, || {
