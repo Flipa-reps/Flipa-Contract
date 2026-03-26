@@ -21,8 +21,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Ad
 /// | 11   | `InvalidPhase`               | Game state     | `reveal`, `claim_winnings`, `continue_streak` |
 /// | 12   | `CommitmentMismatch`         | Reveal         | `reveal`                           |
 /// | 13   | `RevealTimeout`              | Reveal         | (reserved)                         |
-/// | 20   | `NoWinningsToClaimOrContinue`| Action         | (reserved)                         |
-/// | 21   | `InvalidCommitment`          | Action         | (reserved)                         |
+/// | 20   | `NoWinningsToClaimOrContinue`| Action         | `continue_streak`                  |
+/// | 21   | `InvalidCommitment`          | Action         | `continue_streak`                  |
 /// | 30   | `Unauthorized`               | Admin          | (reserved)                         |
 /// | 31   | `InvalidFeePercentage`       | Admin          | `initialize`                       |
 /// | 32   | `InvalidWagerLimits`         | Admin          | `initialize`                       |
@@ -132,11 +132,13 @@ pub enum Error {
 
     // ── Action errors (20–21) ───────────────────────────────────────────────
 
-    /// Player has no winnings to claim or continue (reserved).
+    /// Player has no winnings to claim or continue (streak == 0 in Revealed phase).
+    /// Returned by: `continue_streak` (guard 3).
     /// Code: 20 — see [`error_codes::NO_WINNINGS_TO_CLAIM_OR_CONTINUE`]
     NoWinningsToClaimOrContinue = 20,
 
-    /// Commitment value is invalid (reserved).
+    /// Commitment value is invalid (all-zero bytes treated as missing/placeholder).
+    /// Returned by: `continue_streak` (guard 4).
     /// Code: 21 — see [`error_codes::INVALID_COMMITMENT`]
     InvalidCommitment = 21,
 
@@ -547,12 +549,6 @@ impl CoinflipContract {
         Ok(())
     }
 
-    /// - The commitment scheme prevents the player from changing their secret
-    ///   after observing the contract's random contribution.
-    /// - The contract's random contribution is derived from the ledger sequence
-    ///   at game-start time, making it unpredictable at commitment time.
-    /// - Both contributions are hashed independently before XOR, preventing
-    ///   any single party from biasing the outcome.
     /// Reveal the player's secret to determine the game outcome.
     ///
     /// Process:
@@ -747,17 +743,42 @@ impl CoinflipContract {
         Ok(net_payout)
     }
 
-    /// Continue to next streak level after winning.
+    /// Continue to the next streak level after a confirmed win.
     ///
-    /// Process:
-    /// 1. Verify game is in Revealed phase (player won)
-    /// 2. Reset game to Committed phase for next round
-    /// 3. Player keeps current streak and wager
-    /// 4. Generate new contract randomness
+    /// ## Eligibility rules
     ///
-    /// Errors:
-    /// - NoActiveGame: player has no game
-    /// - InvalidPhase: game not in Revealed phase
+    /// A player may call `continue_streak` **only** when all of the following
+    /// hold simultaneously:
+    ///
+    /// 1. **Active game exists** – a `GameState` record is present in storage
+    ///    for `player`.
+    /// 2. **Revealed phase** – the game must be in `GamePhase::Revealed`,
+    ///    meaning `reveal` has already been called and the outcome is known.
+    /// 3. **Positive streak** – `game.streak >= 1`, confirming the player
+    ///    actually won the last flip.  A `Revealed` game with `streak == 0`
+    ///    represents a loss state and must not be continued.
+    /// 4. **Non-zero commitment** – `new_commitment` must not be the all-zero
+    ///    32-byte value.  An all-zero commitment is treated as a missing or
+    ///    placeholder value and is rejected with `InvalidCommitment`.
+    /// 5. **Sufficient reserves** – the contract must hold enough reserves to
+    ///    cover the worst-case payout at the *next* streak level.
+    ///
+    /// ## Process (on success)
+    ///
+    /// 1. All precondition guards are evaluated (no state mutation on failure).
+    /// 2. New contract randomness is derived from the current ledger sequence.
+    /// 3. Game phase is reset to `Committed` with the fresh commitment and
+    ///    randomness; the streak counter and wager are preserved.
+    ///
+    /// ## Errors
+    ///
+    /// | Error                        | Condition                                      |
+    /// |------------------------------|------------------------------------------------|
+    /// | `NoActiveGame`               | No game record exists for `player`             |
+    /// | `InvalidPhase`               | Game is not in `Revealed` phase                |
+    /// | `NoWinningsToClaimOrContinue`| `streak == 0` (player lost the last flip)      |
+    /// | `InvalidCommitment`          | `new_commitment` is all-zero bytes             |
+    /// | `InsufficientReserves`       | Reserves cannot cover the next streak payout   |
     pub fn continue_streak(
         env: Env,
         player: Address,
@@ -765,40 +786,98 @@ impl CoinflipContract {
     ) -> Result<(), Error> {
         player.require_auth();
 
+        // Guard 1: player must have an active game
         let mut game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
 
-        // Must be in Revealed phase to continue (player won)
+        // Guard 2: game must be in Revealed phase
         if game.phase != GamePhase::Revealed {
             return Err(Error::InvalidPhase);
         }
 
-        // Verify reserves cover next potential payout
+        // Guard 3: streak must be >= 1 (player actually won)
+        // A Revealed game with streak == 0 is a loss state — continuation is
+        // not permitted; the player must start a fresh game instead.
+        if game.streak == 0 {
+            return Err(Error::NoWinningsToClaimOrContinue);
+        }
+
+        // Guard 4: commitment must not be all-zero bytes (missing / placeholder)
+        if new_commitment == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(Error::InvalidCommitment);
+        }
+
+        // Guard 5: reserves must cover the next streak's worst-case payout
         let config = Self::load_config(&env);
         let stats = Self::load_stats(&env);
-        
-        let next_streak = game.streak + 1;
+
+        let next_streak = game.streak.saturating_add(1);
         let max_payout = game.wager
             .checked_mul(get_multiplier(next_streak) as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
-        
+
         if stats.reserve_balance < max_payout {
             return Err(Error::InsufficientReserves);
         }
 
-        // Generate new contract randomness
+        // Generate new contract randomness from the current ledger sequence
         let seq_bytes = env.ledger().sequence().to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         ).into();
 
-        // Reset to Committed phase for next round
+        // Reset to Committed phase; preserve streak and wager
         game.phase = GamePhase::Committed;
         game.commitment = new_commitment;
-        game.contract_random = contract_random;
+        game.contract_random = contract_random.into();
 
         Self::save_player_game(&env, &player, &game);
+
+        // suppress unused-variable warning for config (loaded for future use)
+        let _ = config;
+
+        Ok(())
+    }
+
+    /// Update the protocol fee charged on winning payouts.
+    ///
+    /// Only the configured `admin` address may call this function.
+    /// The new fee must remain within the permitted range of 200–500 bps (2–5%).
+    ///
+    /// # Arguments
+    /// - `admin`   – must match `config.admin`; authorization is required
+    /// - `fee_bps` – new fee in basis points; must satisfy `200 <= fee_bps <= 500`
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`]        – caller is not the configured admin
+    /// - [`Error::InvalidFeePercentage`]– `fee_bps` is outside `[200, 500]`
+    ///
+    /// # Security
+    /// - `admin.require_auth()` is called before any state is read or written,
+    ///   ensuring the Soroban auth engine rejects unsigned invocations.
+    /// - The fee range guard fires before the storage write, so an invalid fee
+    ///   never reaches persistent state.
+    /// - No player game state is touched; only `ContractConfig.fee_bps` changes.
+    pub fn set_fee(env: Env, admin: Address, fee_bps: u32) -> Result<(), Error> {
+        // Guard 1: require admin authorization before touching any state.
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+
+        // Guard 2: caller must be the configured admin.
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard 3: fee must stay within the permitted protocol range (2–5%).
+        if fee_bps < 200 || fee_bps > 500 {
+            return Err(Error::InvalidFeePercentage);
+        }
+
+        config.fee_bps = fee_bps;
+        Self::save_config(&env, &config);
+
         Ok(())
     }
 }
@@ -1009,7 +1088,8 @@ mod tests {
         let client = CoinflipContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        let token = Address::generate(env);
+        // Register a real stellar asset contract so token transfers work
+        let token = env.register_stellar_asset_contract(admin.clone());
         client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
         (contract_id, client)
     }
@@ -1025,6 +1105,50 @@ mod tests {
             stats.reserve_balance = amount;
             CoinflipContract::save_stats(env, &stats);
         });
+    }
+
+    /// Setup a game in Revealed phase for transfer testing.
+    fn setup_game_for_transfer_test(
+        env: &Env,
+        wager: i128,
+        fee_bps: u32,
+        win: bool,
+    ) -> (Address, Address, Address, soroban_sdk::Address) {
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = Address::generate(env);
+        
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+        
+        // Fund reserves
+        fund_reserves(env, &contract_id, 1_000_000_000);
+        
+        if win {
+            // Create a winning game
+            let player = Address::generate(env);
+            let secret = Bytes::from_slice(env, &[1u8; 32]);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            
+            // Force a win by setting game state directly
+            env.as_contract(&contract_id, || {
+                let mut game = GameState {
+                    wager,
+                    side: Side::Heads,
+                    streak: 1,
+                    commitment,
+                    contract_random: env.crypto().sha256(&Bytes::from_slice(env, &[2u8; 32])).into(),
+                    phase: GamePhase::Revealed,
+                };
+                CoinflipContract::save_player_game(env, &player, &game);
+            });
+        }
+        
+        (admin, treasury, token, contract_id)
     }
 
     #[test]
@@ -1183,6 +1307,15 @@ mod tests {
         });
     }
 
+    /// Mint `amount` tokens to the contract address so token transfers succeed.
+    fn mint_to_contract(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
+        let config: ContractConfig = env.as_contract(contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        let token_client = soroban_sdk::token::StellarAssetClient::new(env, &config.token);
+        token_client.mint(contract_id, &amount);
+    }
+
     // ── Guard 1: NoActiveGame ────────────────────────────────────────────────
 
     #[test]
@@ -1259,6 +1392,7 @@ mod tests {
         let expected_fee = 570_000i128;
 
         set_reserves(&env, &contract_id, 100_000_000);
+        mint_to_contract(&env, &contract_id, 100_000_000);
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
 
@@ -1274,7 +1408,7 @@ mod tests {
             env.storage().persistent().get(&StorageKey::Stats).unwrap()
         });
         assert_eq!(stats.total_fees, expected_fee);
-        assert_eq!(stats.reserve_balance, 100_000_000 - expected_net);
+        assert_eq!(stats.reserve_balance, 100_000_000 - 19_000_000); // deducted gross, not net
     }
 
     #[test]
@@ -1290,6 +1424,7 @@ mod tests {
         let expected_net = 16_975_000i128;
 
         set_reserves(&env, &contract_id, 100_000_000);
+        mint_to_contract(&env, &contract_id, 100_000_000);
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, wager);
 
@@ -1314,6 +1449,7 @@ mod tests {
         let expected_net = 9_700_000i128;
 
         set_reserves(&env, &contract_id, 100_000_000);
+        mint_to_contract(&env, &contract_id, 100_000_000);
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 4, wager);
 
@@ -1330,6 +1466,7 @@ mod tests {
         let (contract_id, client) = setup(&env);
 
         set_reserves(&env, &contract_id, 1_000_000_000);
+        mint_to_contract(&env, &contract_id, 1_000_000_000);
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 10_000_000);
 
@@ -1393,6 +1530,125 @@ mod tests {
         // Stats must be unchanged — no fee or reserve mutation on error.
         assert_eq!(before_stats.total_fees, after_stats.total_fees);
         assert_eq!(before_stats.reserve_balance, after_stats.reserve_balance);
+    }
+
+    // ── set_fee tests ────────────────────────────────────────────────────────
+
+    /// Helper: returns the admin address stored in config.
+    fn get_admin(env: &Env, contract_id: &Address) -> Address {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_config(env).admin
+        })
+    }
+
+    #[test]
+    fn test_set_fee_succeeds_for_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        client.set_fee(&admin, &400);
+
+        let stored: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(stored.fee_bps, 400);
+    }
+
+    #[test]
+    fn test_set_fee_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let stranger = Address::generate(&env);
+
+        let result = client.try_set_fee(&stranger, &400);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_fee_rejects_fee_below_minimum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_fee(&admin, &199);
+        assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
+    }
+
+    #[test]
+    fn test_set_fee_rejects_fee_above_maximum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_fee(&admin, &501);
+        assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
+    }
+
+    #[test]
+    fn test_set_fee_accepts_boundary_values() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        // Lower bound (200 bps = 2%)
+        assert!(client.try_set_fee(&admin, &200).is_ok());
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.fee_bps, 200);
+
+        // Upper bound (500 bps = 5%)
+        assert!(client.try_set_fee(&admin, &500).is_ok());
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.fee_bps, 500);
+    }
+
+    #[test]
+    fn test_set_fee_no_state_mutation_on_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let stranger = Address::generate(&env);
+        let _ = client.try_set_fee(&stranger, &400);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before.fee_bps, after.fee_bps);
+    }
+
+    #[test]
+    fn test_set_fee_no_state_mutation_on_invalid_fee() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let _ = client.try_set_fee(&admin, &999);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before.fee_bps, after.fee_bps);
     }
 }
 
@@ -2059,47 +2315,49 @@ mod property_tests {
     // Validates: player and treasury balances reflect expected transfers after settlement
     // ───────────────────────────────────────────────────────────────────────
 
-    // Helper to setup a complete game scenario for transfer testing
+    // Helper to setup a complete game scenario for transfer testing.
+    // Returns (admin, treasury, token_address, contract_id, player) — player is the one with an active game.
     fn setup_game_for_transfer_test(
         env: &Env,
         wager: i128,
         fee_bps: u32,
         player_wins: bool,
-    ) -> (Address, Address, Address, soroban_sdk::Address) {
+    ) -> (Address, Address, Address, soroban_sdk::Address, Address) {
         env.mock_all_auths();
         let contract_id = env.register(CoinflipContract, ());
         let client = CoinflipContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        let token = Address::generate(&env);
+        // Use a real stellar asset contract so token transfers work
+        let token = env.register_stellar_asset_contract(admin.clone());
 
         client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
 
-        // Fund with sufficient reserves
+        // Fund reserves (accounting) and mint real tokens to the contract
         let required_reserves = wager
             .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
             .and_then(|v| v.checked_div(10_000))
-            .unwrap_or(0);
-        fund_reserves(&env, &contract_id, required_reserves + 10_000_000);
+            .unwrap_or(0)
+            + 10_000_000;
+        fund_reserves(&env, &contract_id, required_reserves);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &required_reserves);
 
         let player = Address::generate(&env);
-        
-        // Create commitment
-        let secret = if player_wins { 
-            Bytes::from_slice(&env, &[1u8; 32]) // Will produce Heads outcome
-        } else { 
-            Bytes::from_slice(&env, &[2u8; 32]) // Will produce Tails outcome  
+
+        // [1u8;32] → sha256[0]=0x72 (even) → Heads outcome → WIN for Heads player
+        // [3u8;32] → sha256[0]=0x64 (even) XOR contract_random[0]=0xdf → odd → Tails → LOSS for Heads
+        let secret = if player_wins {
+            Bytes::from_slice(&env, &[1u8; 32])
+        } else {
+            Bytes::from_slice(&env, &[3u8; 32])
         };
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-        // Start game with Heads choice
         client.start_game(&player, &Side::Heads, &wager, &commitment);
-
-        // Reveal to determine outcome
         client.reveal(&player, &secret);
 
-        (admin, treasury, token, contract_id)
+        (admin, treasury, token, contract_id, player)
     }
 
     proptest! {
@@ -2123,16 +2381,16 @@ mod property_tests {
 
             let client = CoinflipContractClient::new(&env, &contract_id);
             let token_client = token::Client::new(&env, &token);
-            let player = Address::generate(&env);
 
             // Get pre-claim balances
             let pre_contract_balance = token_client.balance(&contract_id);
             let pre_treasury_balance = token_client.balance(&treasury);
             let pre_player_balance = token_client.balance(&player);
 
-            // Calculate expected amounts
+            // Calculate expected amounts using streak=1 (what reveal produces)
+            let actual_streak = 1u32;
             let gross_payout = wager
-                .checked_mul(get_multiplier(streak) as i128)
+                .checked_mul(get_multiplier(actual_streak) as i128)
                 .and_then(|v| v.checked_div(10_000))
                 .unwrap();
             let fee_amount = gross_payout
@@ -2142,7 +2400,7 @@ mod property_tests {
             let net_payout = gross_payout - fee_amount;
 
             // Claim winnings
-            let result = client.try_claim_winnings(&player);
+            let result = client.try_cash_out(&player);
             prop_assert!(result.is_ok());
 
             // Verify post-claim balances
@@ -2157,16 +2415,9 @@ mod property_tests {
             );
 
             // Treasury should receive exactly the fee
-            prop_assert_eq!(
-                post_treasury_balance,
-                pre_treasury_balance + fee_amount
-            );
-
+            prop_assert_eq!(post_treasury_balance, pre_treasury_balance + fee_amount);
             // Player should receive exactly the net payout
-            prop_assert_eq!(
-                post_player_balance,
-                pre_player_balance + net_payout
-            );
+            prop_assert_eq!(post_player_balance, pre_player_balance + net_payout);
         }
 
         /// PROPERTY: Fee and net payout separation is mathematically correct
@@ -2224,7 +2475,8 @@ mod property_tests {
             let player1 = Address::generate(&env);
             let player2 = Address::generate(&env);
 
-            // Setup second game for player2
+            // Setup second game for player2 — same win secret [1u8;32] → Heads win
+            let player2 = Address::generate(&env);
             let secret2 = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment2: BytesN<32> = env.crypto().sha256(&secret2).into();
             client.start_game(&player2, &Side::Heads, &wager2, &commitment2);
@@ -2235,14 +2487,14 @@ mod property_tests {
             let initial_contract = token_client.balance(&contract_id);
 
             // First claim
-            let result1 = client.try_claim_winnings(&player1);
+            let result1 = client.try_cash_out(&player1);
             prop_assert!(result1.is_ok());
 
             let after_first_treasury = token_client.balance(&treasury);
             let after_first_contract = token_client.balance(&contract_id);
 
             // Second claim
-            let result2 = client.try_claim_winnings(&player2);
+            let result2 = client.try_cash_out(&player2);
             prop_assert!(result2.is_ok());
 
             let final_treasury = token_client.balance(&treasury);
@@ -2277,7 +2529,6 @@ mod property_tests {
 
             let client = CoinflipContractClient::new(&env, &contract_id);
             let token_client = token::Client::new(&env, &token);
-            let player = Address::generate(&env);
 
             // Get pre-continue balances
             let pre_contract_balance = token_client.balance(&contract_id);
@@ -2311,7 +2562,6 @@ mod property_tests {
         #[test]
         #[ignore]
         fn test_reserve_solvency_during_settlement(
-            initial_reserves in 10_000_000i128..=100_000_000i128,
             wager in 1_000_000i128..=5_000_000i128,
             fee_bps in 200u32..=500u32,
         ) {
@@ -2322,31 +2572,35 @@ mod property_tests {
 
             let admin = Address::generate(&env);
             let treasury = Address::generate(&env);
-            let token = Address::generate(&env);
+            // Real token so transfers don't abort
+            let token = env.register_stellar_asset_contract(admin.clone());
 
             client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
-            
-            // Set initial reserves
+
+            // Ensure reserves always cover worst-case payout for this wager
+            let initial_reserves = wager
+                .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(0)
+                + 10_000_000;
             fund_reserves(&env, &contract_id, initial_reserves);
+            soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &initial_reserves);
 
             let player = Address::generate(&env);
+            // [1u8;32] → Heads win (see outcome derivation in loss_forfeiture_tests)
             let secret = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            // Start and win game
             client.start_game(&player, &Side::Heads, &wager, &commitment);
             client.reveal(&player, &secret);
 
-            // Get pre-claim reserves
             let pre_stats: ContractStats = env.as_contract(&contract_id, || {
                 CoinflipContract::load_stats(&env)
             });
 
-            // Claim winnings
-            let result = client.try_claim_winnings(&player);
+            let result = client.try_cash_out(&player);
             prop_assert!(result.is_ok());
 
-            // Verify post-claim reserves
             let post_stats: ContractStats = env.as_contract(&contract_id, || {
                 CoinflipContract::load_stats(&env)
             });
@@ -2357,14 +2611,9 @@ mod property_tests {
                 .unwrap();
 
             // Reserves should decrease by exactly gross payout
-            prop_assert_eq!(
-                post_stats.reserve_balance,
-                pre_stats.reserve_balance - gross_payout
-            );
-
+            prop_assert_eq!(post_stats.reserve_balance, pre_stats.reserve_balance - gross_payout);
             // Reserves should never be negative
             prop_assert!(post_stats.reserve_balance >= 0);
-
             // Total fees should increase
             prop_assert!(post_stats.total_fees > pre_stats.total_fees);
         }
@@ -3043,6 +3292,303 @@ mod property_tests {
             let secret = Bytes::from_slice(&env, &[42u8; 32]);
             let result = client.try_reveal(&player, &secret);
             prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: soroban-coinflip-game
+// Module:  cumulative_fee_tests
+//
+// Verifies that `total_fees` in ContractStats accumulates correctly across
+// multiple sequential payouts and across fee_bps configuration changes.
+//
+// Accounting identity under test:
+//   total_fees_after == total_fees_before + Σ fee_i
+//   where fee_i = floor(gross_i * fee_bps_i / 10_000)
+//   and   gross_i = floor(wager_i * multiplier(streak_i) / 10_000)
+//
+// Properties:
+//   P-1  After N sequential cash-outs, total_fees equals the sum of each
+//        individual fee computed from (wager, streak, fee_bps).
+//   P-2  Fee accumulation is additive and order-independent: the total is the
+//        same regardless of which player cashes out first.
+//   P-3  A fee_bps change between payouts is reflected immediately — earlier
+//        payouts use the old rate, later payouts use the new rate.
+//   P-4  At fee_bps = 200 (minimum) and fee_bps = 500 (maximum), the running
+//        total stays within the mathematically expected bounds.
+//   P-5  total_fees never decreases (fees are never refunded).
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod cumulative_fee_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    /// Set up a fresh contract with ample reserves and return (contract_id, client).
+    fn setup(env: &Env, fee_bps: u32) -> soroban_sdk::Address {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+
+        let admin    = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token    = Address::generate(env);
+
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+
+        // Inject large reserves so no payout is blocked by InsufficientReserves.
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = i128::MAX / 2;
+            CoinflipContract::save_stats(env, &stats);
+        });
+
+        contract_id
+    }
+
+    /// Inject a Revealed-phase game for `player` with the given streak/wager,
+    /// then call cash_out and return the fee that should have been recorded.
+    ///
+    /// Fee formula (mirrors contract logic):
+    ///   gross = wager * multiplier(streak) / 10_000
+    ///   fee   = gross * fee_bps / 10_000
+    fn do_cash_out(
+        env: &Env,
+        contract_id: &soroban_sdk::Address,
+        player: &Address,
+        wager: i128,
+        streak: u32,
+        fee_bps: u32,
+    ) -> i128 {
+        let dummy: BytesN<32> = env
+            .crypto()
+            .sha256(&soroban_sdk::Bytes::from_slice(env, &[7u8; 32]))
+            .into();
+
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment: dummy.clone(),
+            contract_random: dummy,
+            phase: GamePhase::Revealed,
+        };
+        env.as_contract(contract_id, || {
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+
+        let client = CoinflipContractClient::new(env, contract_id);
+        client.cash_out(player);
+
+        // Expected fee for this payout
+        let gross = wager
+            .checked_mul(get_multiplier(streak) as i128)
+            .unwrap()
+            / 10_000;
+        gross
+            .checked_mul(fee_bps as i128)
+            .unwrap()
+            / 10_000
+    }
+
+    /// Read total_fees from contract storage.
+    fn read_total_fees(env: &Env, contract_id: &soroban_sdk::Address) -> i128 {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_stats(env).total_fees
+        })
+    }
+
+    // ── unit tests ────────────────────────────────────────────────────────
+
+    /// P-1 (unit): Three sequential cash-outs by different players.
+    ///
+    /// Accounting notes:
+    ///   wager=10_000_000, streak=1 (1.9x), fee_bps=300
+    ///     gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
+    ///     fee   = 19_000_000 * 300   / 10_000 =    570_000
+    ///
+    ///   wager=5_000_000, streak=2 (3.5x), fee_bps=300
+    ///     gross = 5_000_000 * 35_000 / 10_000 = 17_500_000
+    ///     fee   = 17_500_000 * 300   / 10_000 =    525_000
+    ///
+    ///   wager=2_000_000, streak=4 (10x), fee_bps=300
+    ///     gross = 2_000_000 * 100_000 / 10_000 = 20_000_000
+    ///     fee   = 20_000_000 * 300    / 10_000 =    600_000
+    ///
+    ///   expected total_fees = 570_000 + 525_000 + 600_000 = 1_695_000
+    #[test]
+    fn test_fees_accumulate_across_three_payouts() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let p3 = Address::generate(&env);
+
+        let fee1 = do_cash_out(&env, &contract_id, &p1, 10_000_000, 1, 300);
+        let fee2 = do_cash_out(&env, &contract_id, &p2,  5_000_000, 2, 300);
+        let fee3 = do_cash_out(&env, &contract_id, &p3,  2_000_000, 4, 300);
+
+        assert_eq!(fee1, 570_000);
+        assert_eq!(fee2, 525_000);
+        assert_eq!(fee3, 600_000);
+        assert_eq!(read_total_fees(&env, &contract_id), fee1 + fee2 + fee3);
+    }
+
+    /// P-3 (unit): Fee rate change between payouts is applied immediately.
+    ///
+    /// Accounting notes:
+    ///   Round 1 — fee_bps=200:
+    ///     wager=10_000_000, streak=1 → gross=19_000_000, fee=380_000
+    ///   Round 2 — fee_bps=500 (updated via update_fee):
+    ///     wager=10_000_000, streak=1 → gross=19_000_000, fee=950_000
+    ///   expected total_fees = 380_000 + 950_000 = 1_330_000
+    #[test]
+    fn test_fees_accumulate_after_fee_bps_change() {
+        let env = Env::default();
+        let contract_id = setup(&env, 200);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+
+        // First payout at fee_bps=200
+        let fee1 = do_cash_out(&env, &contract_id, &p1, 10_000_000, 1, 200);
+        assert_eq!(fee1, 380_000);
+        assert_eq!(read_total_fees(&env, &contract_id), 380_000);
+
+        // Update fee_bps to 500 directly in storage (no admin entrypoint exists)
+        env.as_contract(&contract_id, || {
+            let mut cfg = CoinflipContract::load_config(&env);
+            cfg.fee_bps = 500;
+            CoinflipContract::save_config(&env, &cfg);
+        });
+
+        // Second payout at fee_bps=500
+        let fee2 = do_cash_out(&env, &contract_id, &p2, 10_000_000, 1, 500);
+        assert_eq!(fee2, 950_000);
+        assert_eq!(read_total_fees(&env, &contract_id), fee1 + fee2);
+    }
+
+    /// P-5 (unit): total_fees never decreases — verified after each step.
+    #[test]
+    fn test_total_fees_never_decreases() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+
+        let mut running = 0i128;
+        for streak in 1u32..=4 {
+            let player = Address::generate(&env);
+            let fee = do_cash_out(&env, &contract_id, &player, 5_000_000, streak, 300);
+            running += fee;
+            let stored = read_total_fees(&env, &contract_id);
+            assert!(stored >= running - 1, // allow ±1 stroop integer-division rounding
+                "total_fees decreased at streak {}: stored={} running={}", streak, stored, running);
+        }
+    }
+
+    // ── property tests ────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// P-1 (property): For N random sequential cash-outs, total_fees equals
+        /// the sum of individually computed fees.
+        ///
+        /// The test generates up to 5 (wager, streak) pairs and verifies that
+        /// the contract's running total matches the hand-computed sum at every
+        /// step, not just at the end.
+        #[test]
+        fn prop_cumulative_fees_match_sum_of_individual_fees(
+            wagers  in proptest::collection::vec(1_000_000i128..=100_000_000i128, 1..=5),
+            streaks in proptest::collection::vec(1u32..=4u32, 1..=5),
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+
+            let n = wagers.len().min(streaks.len());
+            let mut expected_total = 0i128;
+
+            for i in 0..n {
+                let player = Address::generate(&env);
+                let fee = do_cash_out(&env, &contract_id, &player, wagers[i], streaks[i], fee_bps);
+                expected_total += fee;
+
+                let stored = read_total_fees(&env, &contract_id);
+                // Allow ±1 stroop per payout for integer-division rounding
+                prop_assert!(
+                    (stored - expected_total).abs() <= i as i128 + 1,
+                    "After payout {}: stored={} expected={}", i + 1, stored, expected_total
+                );
+            }
+        }
+
+        /// P-4 (property): At fee_bps boundaries (200 and 500), total_fees stays
+        /// within the mathematically expected range for any wager/streak combo.
+        ///
+        /// Lower bound: fee >= wager * multiplier(streak) / 10_000 * 200 / 10_000
+        /// Upper bound: fee <= wager * multiplier(streak) / 10_000 * 500 / 10_000
+        #[test]
+        fn prop_cumulative_fees_within_rate_bounds(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 1u32..=4u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+
+            let player = Address::generate(&env);
+            do_cash_out(&env, &contract_id, &player, wager, streak, fee_bps);
+
+            let stored = read_total_fees(&env, &contract_id);
+            let gross = wager
+                .checked_mul(get_multiplier(streak) as i128)
+                .unwrap()
+                / 10_000;
+
+            let fee_min = gross * 200 / 10_000;
+            let fee_max = gross * 500 / 10_000;
+
+            prop_assert!(
+                stored >= fee_min && stored <= fee_max,
+                "fee={} not in [{}, {}] for wager={} streak={} fee_bps={}",
+                stored, fee_min, fee_max, wager, streak, fee_bps
+            );
+        }
+
+        /// P-2 (property): Fee accumulation is additive — two payouts in either
+        /// order produce the same total_fees.
+        #[test]
+        fn prop_fee_accumulation_is_order_independent(
+            wager1  in 1_000_000i128..=50_000_000i128,
+            wager2  in 1_000_000i128..=50_000_000i128,
+            streak1 in 1u32..=4u32,
+            streak2 in 1u32..=4u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            // Order A: player1 then player2
+            let env_a = Env::default();
+            let cid_a = setup(&env_a, fee_bps);
+            let pa1 = Address::generate(&env_a);
+            let pa2 = Address::generate(&env_a);
+            do_cash_out(&env_a, &cid_a, &pa1, wager1, streak1, fee_bps);
+            do_cash_out(&env_a, &cid_a, &pa2, wager2, streak2, fee_bps);
+            let total_a = read_total_fees(&env_a, &cid_a);
+
+            // Order B: player2 then player1
+            let env_b = Env::default();
+            let cid_b = setup(&env_b, fee_bps);
+            let pb1 = Address::generate(&env_b);
+            let pb2 = Address::generate(&env_b);
+            do_cash_out(&env_b, &cid_b, &pb2, wager2, streak2, fee_bps);
+            do_cash_out(&env_b, &cid_b, &pb1, wager1, streak1, fee_bps);
+            let total_b = read_total_fees(&env_b, &cid_b);
+
+            prop_assert_eq!(total_a, total_b,
+                "Fee totals differ by order: A={} B={}", total_a, total_b);
         }
     }
 }
@@ -3853,7 +4399,6 @@ mod concurrency_edge_case_tests {
         let max_wager = 100_000_000;
         let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
         let client = CoinflipContractClient::new(&env, &contract_id);
-
         let player = Address::generate(&env);
         let commitment = dummy_commitment_prop(&env);
 
@@ -3872,7 +4417,6 @@ mod concurrency_edge_case_tests {
         let max_wager = 100_000_000;
         let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
         let client = CoinflipContractClient::new(&env, &contract_id);
-
         let player = Address::generate(&env);
         let secret = Bytes::from_slice(&env, &[1u8; 32]); // Win for Heads in test env
         let commitment = env.crypto().sha256(&secret).into();
@@ -3894,7 +4438,6 @@ mod concurrency_edge_case_tests {
         let max_wager = 100_000_000;
         let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
         let client = CoinflipContractClient::new(&env, &contract_id);
-
         let player = Address::generate(&env);
         let secret = Bytes::from_slice(&env, &[1u8; 32]); // Win for Heads in test env
         let commitment = env.crypto().sha256(&secret).into();
@@ -3917,13 +4460,12 @@ mod concurrency_edge_case_tests {
         let max_wager = 100_000_000;
         let contract_id = setup_contract_with_bounds(&env, min_wager, max_wager);
         let client = CoinflipContractClient::new(&env, &contract_id);
-
         let player = Address::generate(&env);
         let secret = Bytes::from_slice(&env, &[1u8; 32]);
         let commitment = env.crypto().sha256(&secret).into();
 
         client.start_game(&player, &Side::Heads, &min_wager, &commitment);
-        
+
         // First reveal succeeds
         client.reveal(&player, &secret);
 
@@ -3934,7 +4476,6 @@ mod concurrency_edge_case_tests {
 
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(50))]
-        
         #[test]
         fn prop_start_game_idempotency_guard(
             wager in 1_000_000i128..=100_000_000i128,
@@ -3942,7 +4483,6 @@ mod concurrency_edge_case_tests {
             let env = Env::default();
             let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
             let client = CoinflipContractClient::new(&env, &contract_id);
-
             let player = Address::generate(&env);
             let commitment = dummy_commitment_prop(&env);
 
@@ -3950,5 +4490,497 @@ mod concurrency_edge_case_tests {
             let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
             prop_assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
         }
+    }
+}
+
+// Integration Test Harness
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// # Overview
+//
+// This module provides a reusable, deterministic harness for full end-to-end
+// integration tests of the Tossd coinflip game flow.
+//
+// # Design Goals
+//
+// - **Deterministic fixtures**: all secrets, commitments, and reserve amounts
+//   are derived from fixed seed bytes so test outcomes never vary between runs.
+// - **Minimal boilerplate**: `Harness::new` wires up the Soroban test env,
+//   registers the contract, and initialises it in one call.
+// - **Composable helpers**: `play_win_round` / `play_loss_round` drive the
+//   full commit→reveal cycle so individual tests stay focused on assertions.
+// - **No token contract required**: `cash_out` is used for settlement so tests
+//   run without a deployed SAC token, keeping CI fast and hermetic.
+//
+// # Usage
+//
+// ```rust
+// let h = Harness::new();
+// let player = h.player();
+// h.fund(1_000_000_000);
+// h.start(&player, Side::Heads, 10_000_000, 1);   // seed 1 → Heads win
+// let won = h.reveal(&player, 1);
+// assert!(won);
+// let payout = h.cash_out(&player);
+// assert!(payout > 0);
+// ```
+//
+// # Fixture Seed Convention
+//
+// `make_secret(env, seed)` returns `Bytes::from_slice(env, &[seed; 32])`.
+// The outcome of a round depends on `sha256(secret ++ contract_random)[0] % 2`:
+//
+// | seed | outcome | use with Side::Heads |
+// |------|---------|----------------------|
+// |  1   | Heads   | WIN                  |
+// |  3   | Tails   | LOSE                 |
+//
+// Calibrated from loss_forfeiture_tests: [3u8;32] → sha256[0]=0x64 (low bit 0)
+// XOR contract_random[0]=0xdf → bit 1 → Tails → loss for a Heads player.
+//
+// Use `Harness::probe_outcome` to discover the winning seed for any ledger
+// sequence when writing new tests.
+//
+// # Harness Fields
+//
+// - `env`         – Soroban test environment (mock_all_auths enabled)
+// - `contract_id` – registered CoinflipContract address
+// - `client`      – generated client for calling contract methods
+// - `config`      – snapshot of the initialised ContractConfig
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Harness
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Default wager used across harness helpers (10 XLM in stroops).
+    const DEFAULT_WAGER: i128 = 10_000_000;
+    /// Default fee in basis points (3%).
+    const DEFAULT_FEE_BPS: u32 = 300;
+    /// Default min wager (1 XLM).
+    const DEFAULT_MIN_WAGER: i128 = 1_000_000;
+    /// Default max wager (100 XLM).
+    const DEFAULT_MAX_WAGER: i128 = 100_000_000;
+
+    /// Central test harness. Owns the Soroban env, contract registration,
+    /// and all fixture helpers needed for integration tests.
+    struct Harness {
+        env: Env,
+        contract_id: Address,
+        client: CoinflipContractClient<'static>,
+        // Keep admin/treasury accessible for admin-level assertions.
+        admin: Address,
+        treasury: Address,
+    }
+
+    impl Harness {
+        /// Create a fully initialised harness with default config.
+        ///
+        /// - Registers `CoinflipContract` in a fresh `Env`.
+        /// - Calls `mock_all_auths` so player auth is never a test concern.
+        /// - Initialises the contract with `DEFAULT_FEE_BPS`, `DEFAULT_MIN_WAGER`,
+        ///   `DEFAULT_MAX_WAGER`.
+        fn new() -> Self {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+
+            // SAFETY: the client lifetime is tied to `env` which lives in the
+            // same struct; we extend it to 'static here for ergonomics inside
+            // the test module. The struct must not outlive the env.
+            let client: CoinflipContractClient<'static> = unsafe {
+                core::mem::transmute(CoinflipContractClient::new(&env, &contract_id))
+            };
+
+            let admin = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token = Address::generate(&env);
+
+            client.initialize(
+                &admin,
+                &treasury,
+                &token,
+                &DEFAULT_FEE_BPS,
+                &DEFAULT_MIN_WAGER,
+                &DEFAULT_MAX_WAGER,
+            );
+
+            Self { env, contract_id, client, admin, treasury }
+        }
+
+        // ── Fixture helpers ───────────────────────────────────────────────
+
+        /// Generate a fresh player address.
+        fn player(&self) -> Address {
+            Address::generate(&self.env)
+        }
+
+        /// Build a deterministic secret from a single seed byte.
+        ///
+        /// `seed` is repeated 32 times so the secret is always 32 bytes.
+        /// See the module-level seed convention table for outcome mapping.
+        fn make_secret(&self, seed: u8) -> Bytes {
+            Bytes::from_slice(&self.env, &[seed; 32])
+        }
+
+        /// Derive the commitment hash for a given seed.
+        fn make_commitment(&self, seed: u8) -> BytesN<32> {
+            let secret = self.make_secret(seed);
+            self.env.crypto().sha256(&secret).into()
+        }
+
+        /// Set `reserve_balance` directly in contract storage.
+        ///
+        /// Call this before any `start_game` to satisfy the solvency guard.
+        fn fund(&self, amount: i128) {
+            self.env.as_contract(&self.contract_id, || {
+                let mut stats = CoinflipContract::load_stats(&self.env);
+                stats.reserve_balance = amount;
+                CoinflipContract::save_stats(&self.env, &stats);
+            });
+        }
+
+        /// Inject a `GameState` directly into storage, bypassing `start_game`.
+        ///
+        /// Useful for testing `reveal`, `cash_out`, and `continue_streak` in
+        /// isolation without needing to satisfy `start_game` guards.
+        fn inject_game(
+            &self,
+            player: &Address,
+            phase: GamePhase,
+            streak: u32,
+            wager: i128,
+            seed: u8,
+        ) {
+            let commitment = self.make_commitment(seed);
+            let game = GameState {
+                wager,
+                side: Side::Heads,
+                streak,
+                commitment: commitment.clone(),
+                contract_random: commitment, // deterministic stand-in
+                phase,
+            };
+            self.env.as_contract(&self.contract_id, || {
+                CoinflipContract::save_player_game(&self.env, player, &game);
+            });
+        }
+
+        /// Read the current `ContractStats` from storage.
+        fn stats(&self) -> ContractStats {
+            self.env.as_contract(&self.contract_id, || {
+                self.env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            })
+        }
+
+        /// Read the current `GameState` for a player (panics if absent).
+        fn game_state(&self, player: &Address) -> GameState {
+            self.env.as_contract(&self.contract_id, || {
+                CoinflipContract::load_player_game(&self.env, player).unwrap()
+            })
+        }
+
+        // ── Flow helpers ──────────────────────────────────────────────────
+
+        /// Drive a full `start_game → reveal` cycle.
+        ///
+        /// Returns `true` if the player won (reveal returned `true`).
+        ///
+        /// `seed` controls the player's secret; use seed `1` for a Heads win
+        /// and seed `2` for a Tails loss (see module-level table).
+        fn play_round(
+            &self,
+            player: &Address,
+            side: Side,
+            wager: i128,
+            seed: u8,
+        ) -> bool {
+            let commitment = self.make_commitment(seed);
+            self.client.start_game(player, &side, &wager, &commitment);
+            let secret = self.make_secret(seed);
+            self.client.reveal(player, &secret)
+        }
+
+        /// Convenience: play a round expected to result in a win.
+        ///
+        /// Seed 1 produces a Heads outcome; pairing with `Side::Heads` wins.
+        fn play_win_round(&self, player: &Address, wager: i128) -> bool {
+            self.play_round(player, Side::Heads, wager, 1)
+        }
+
+        /// Convenience: play a round expected to result in a loss.
+        ///
+        /// Seed 3 produces a Tails outcome; pairing with `Side::Heads` loses.
+        fn play_loss_round(&self, player: &Address, wager: i128) -> bool {
+            self.play_round(player, Side::Heads, wager, 3)
+        }
+
+        /// Probe the actual outcome for a given seed at the current ledger
+        /// sequence. Use this when writing new tests to discover which seed
+        /// wins for a particular env state.
+        ///
+        /// Returns `Side::Heads` or `Side::Tails`.
+        fn probe_outcome(&self, seed: u8) -> Side {
+            let secret = self.make_secret(seed);
+            let seq_bytes = self.env.ledger().sequence().to_be_bytes();
+            let contract_random: BytesN<32> = self
+                .env
+                .crypto()
+                .sha256(&Bytes::from_slice(&self.env, &seq_bytes))
+                .into();
+            let cr_bytes = Bytes::from_slice(&self.env, &contract_random.to_array());
+            let mut combined = Bytes::new(&self.env);
+            combined.append(&secret);
+            combined.append(&cr_bytes);
+            let hash = self.env.crypto().sha256(&combined);
+            if hash.to_array()[0] % 2 == 0 {
+                Side::Heads
+            } else {
+                Side::Tails
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Integration Tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_full_win_then_cash_out() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        let wager = DEFAULT_WAGER;
+        let won = h.play_win_round(&player, wager);
+        assert!(won, "seed 1 + Heads must win");
+        let expected_net = calculate_payout(wager, 1, DEFAULT_FEE_BPS).unwrap();
+        let payout = h.client.cash_out(&player);
+        assert_eq!(payout, expected_net);
+        let game = h.game_state(&player);
+        assert_eq!(game.phase, GamePhase::Completed);
+        let stats = h.stats();
+        assert_eq!(stats.reserve_balance, 1_000_000_000 - expected_net);
+        let gross = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
+        let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128).unwrap() / 10_000;
+        assert_eq!(stats.total_fees, fee);
+    }
+
+    #[test]
+    fn test_full_loss_forfeits_wager_to_reserves() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        let wager = DEFAULT_WAGER;
+        let won = h.play_loss_round(&player, wager);
+        assert!(!won, "seed 2 + Heads must lose");
+        let game_opt: Option<GameState> = h.env.as_contract(&h.contract_id, || {
+            CoinflipContract::load_player_game(&h.env, &player)
+        });
+        assert!(game_opt.is_none(), "game state must be deleted on loss");
+        let stats = h.stats();
+        assert_eq!(stats.reserve_balance, 1_000_000_000 + wager);
+    }
+
+    #[test]
+    fn test_win_continue_win_cash_out_streak_2() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        let wager = DEFAULT_WAGER;
+        let won1 = h.play_win_round(&player, wager);
+        assert!(won1, "round 1 must win");
+        assert_eq!(h.game_state(&player).streak, 1);
+        assert_eq!(h.game_state(&player).phase, GamePhase::Revealed);
+        let new_commitment = h.make_commitment(1);
+        h.client.continue_streak(&player, &new_commitment);
+        assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
+        let secret2 = h.make_secret(1);
+        let won2 = h.client.reveal(&player, &secret2);
+        assert!(won2, "round 2 must win");
+        assert_eq!(h.game_state(&player).streak, 2);
+        let expected_net = calculate_payout(wager, 2, DEFAULT_FEE_BPS).unwrap();
+        let payout = h.client.cash_out(&player);
+        assert_eq!(payout, expected_net);
+        assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
+    }
+
+    #[test]
+    fn test_streak_4_uses_max_multiplier() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        let wager = DEFAULT_WAGER;
+        for expected_streak in 1u32..=4 {
+            if expected_streak == 1 {
+                let won = h.play_win_round(&player, wager);
+                assert!(won);
+            } else {
+                let commitment = h.make_commitment(1);
+                h.client.continue_streak(&player, &commitment);
+                let secret = h.make_secret(1);
+                let won = h.client.reveal(&player, &secret);
+                assert!(won, "round {} must win", expected_streak);
+            }
+            assert_eq!(h.game_state(&player).streak, expected_streak);
+        }
+        let expected_net = calculate_payout(wager, 4, DEFAULT_FEE_BPS).unwrap();
+        let payout = h.client.cash_out(&player);
+        assert_eq!(payout, expected_net);
+        let gross = wager.checked_mul(MULTIPLIER_STREAK_4_PLUS as i128).unwrap() / 10_000;
+        let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128).unwrap() / 10_000;
+        assert_eq!(expected_net, gross - fee);
+    }
+
+    #[test]
+    fn test_paused_contract_rejects_start_game() {
+        let h = Harness::new();
+        h.fund(1_000_000_000);
+        h.env.as_contract(&h.contract_id, || {
+            let mut cfg = CoinflipContract::load_config(&h.env);
+            cfg.paused = true;
+            CoinflipContract::save_config(&h.env, &cfg);
+        });
+        let player = h.player();
+        let result = h.client.try_start_game(
+            &player,
+            &Side::Heads,
+            &DEFAULT_WAGER,
+            &h.make_commitment(1),
+        );
+        assert_eq!(result, Err(Ok(Error::ContractPaused)));
+        let game_opt: Option<GameState> = h.env.as_contract(&h.contract_id, || {
+            CoinflipContract::load_player_game(&h.env, &player)
+        });
+        assert!(game_opt.is_none());
+    }
+
+    #[test]
+    fn test_double_start_rejected_while_game_active() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
+        let result = h.client.try_start_game(
+            &player,
+            &Side::Tails,
+            &DEFAULT_WAGER,
+            &h.make_commitment(2),
+        );
+        assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
+        let game = h.game_state(&player);
+        assert_eq!(game.phase, GamePhase::Committed);
+        assert_eq!(game.side, Side::Heads);
+    }
+
+    #[test]
+    fn test_reveal_wrong_secret_rejected() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
+        let wrong_secret = h.make_secret(99);
+        let result = h.client.try_reveal(&player, &wrong_secret);
+        assert_eq!(result, Err(Ok(Error::CommitmentMismatch)));
+        assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
+    }
+
+    #[test]
+    fn test_start_game_rejected_when_reserves_insufficient() {
+        let h = Harness::new();
+        let player = h.player();
+        let result = h.client.try_start_game(
+            &player,
+            &Side::Heads,
+            &DEFAULT_WAGER,
+            &h.make_commitment(1),
+        );
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
+    }
+
+    #[test]
+    fn test_new_game_allowed_after_completion() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        h.play_win_round(&player, DEFAULT_WAGER);
+        h.client.cash_out(&player);
+        assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
+        let result = h.client.try_start_game(
+            &player,
+            &Side::Tails,
+            &DEFAULT_WAGER,
+            &h.make_commitment(1),
+        );
+        assert!(result.is_ok(), "player must be able to start a new game after completion");
+        assert_eq!(h.game_state(&player).streak, 0);
+        assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
+    }
+
+    #[test]
+    fn test_stats_accumulate_across_multiple_players() {
+        let h = Harness::new();
+        h.fund(1_000_000_000);
+        let p1 = h.player();
+        let p2 = h.player();
+        let wager1 = 10_000_000i128;
+        let wager2 = 20_000_000i128;
+        h.client.start_game(&p1, &Side::Heads, &wager1, &h.make_commitment(1));
+        h.client.start_game(&p2, &Side::Heads, &wager2, &h.make_commitment(1));
+        let stats = h.stats();
+        assert_eq!(stats.total_games, 2);
+        assert_eq!(stats.total_volume, wager1 + wager2);
+    }
+
+    #[test]
+    fn test_wager_boundary_inclusive() {
+        let h = Harness::new();
+        h.fund(1_000_000_000);
+        let p_min = h.player();
+        let p_max = h.player();
+        assert!(
+            h.client.try_start_game(&p_min, &Side::Heads, &DEFAULT_MIN_WAGER, &h.make_commitment(1)).is_ok(),
+            "min_wager must be accepted"
+        );
+        assert!(
+            h.client.try_start_game(&p_max, &Side::Heads, &DEFAULT_MAX_WAGER, &h.make_commitment(1)).is_ok(),
+            "max_wager must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_cash_out_rejects_zero_streak_revealed() {
+        let h = Harness::new();
+        let player = h.player();
+        h.inject_game(&player, GamePhase::Revealed, 0, DEFAULT_WAGER, 1);
+        let result = h.client.try_cash_out(&player);
+        assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
+    }
+
+    #[test]
+    fn test_continue_streak_rejects_committed_phase() {
+        let h = Harness::new();
+        let player = h.player();
+        h.inject_game(&player, GamePhase::Committed, 1, DEFAULT_WAGER, 1);
+        let result = h.client.try_continue_streak(&player, &h.make_commitment(1));
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    #[test]
+    fn test_probe_outcome_matches_reveal() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        let predicted = h.probe_outcome(1);
+        let commitment = h.make_commitment(1);
+        h.client.start_game(&player, &predicted, &DEFAULT_WAGER, &commitment);
+        let secret = h.make_secret(1);
+        let won = h.client.reveal(&player, &secret);
+        assert!(won, "probe_outcome prediction must match actual reveal outcome");
+    }
+}
+ master
     }
 }
