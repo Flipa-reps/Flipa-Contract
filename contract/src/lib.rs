@@ -3868,6 +3868,303 @@ mod property_tests {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Feature: Continued Game Randomness
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // ## Randomness Refresh Assumptions
+    //
+    // Every call to `continue_streak` MUST derive a fresh `contract_random`
+    // value from the current ledger sequence number.  This is a security
+    // requirement, not an optimisation.
+    //
+    // ### Why prior entropy must never be reused
+    //
+    // The outcome of each flip is determined by:
+    //
+    //   sha256(player_secret ++ contract_random)[0] % 2
+    //
+    // `contract_random` is the contract's contribution to the entropy pool.
+    // Its purpose is to prevent a player from choosing a secret *after*
+    // knowing the contract's value, which would let them guarantee a win.
+    //
+    // If `contract_random` were reused across rounds:
+    //
+    //   1. After the first reveal the player knows `contract_random`.
+    //   2. They can compute offline which secret produces a winning outcome.
+    //   3. They supply that secret in the next reveal, guaranteeing a win.
+    //
+    // Refreshing from the ledger sequence on every `continue_streak` call
+    // closes this window: the new value is not known until the transaction
+    // is included in a ledger, which happens *after* the player has already
+    // committed to their next secret.
+    //
+    // ### Ledger sequence as entropy source
+    //
+    // `contract_random = sha256(ledger_sequence.to_be_bytes())`
+    //
+    // The ledger sequence advances monotonically and is determined by the
+    // network, not by the player or the contract.  Two calls at different
+    // ledger sequences therefore produce different `contract_random` values
+    // (collision probability is negligible for SHA-256).
+    //
+    // ### Properties covered
+    //
+    // | ID    | Description                                                        |
+    // |-------|--------------------------------------------------------------------|
+    // | CR-1  | contract_random changes when ledger sequence advances              |
+    // | CR-2  | contract_random is deterministic for the same ledger sequence      |
+    // | CR-3  | contract_random differs across consecutive continues               |
+    // | CR-4  | contract_random is a valid SHA-256 output (non-zero, 32 bytes)     |
+    // | CR-5  | prior contract_random is not reused after a successful continue    |
+    // ═══════════════════════════════════════════════════════════════════════
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // ── CR-1: randomness changes when ledger sequence advances ────────────
+        //
+        // This is the foundational property: two continues at different ledger
+        // sequences must produce different contract_random values.  A regression
+        // here (e.g. using a cached sequence) would silently reuse entropy.
+
+        /// PROPERTY CR-1: contract_random after continue_streak differs from the
+        /// value produced at a different ledger sequence, for any wager/streak.
+        #[test]
+        fn prop_randomness_changes_with_ledger_sequence(
+            wager       in 1_000_000i128..=10_000_000i128,
+            streak      in 1u32..=4u32,
+            seq_advance in 1u32..=1_000u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            // First continue at the initial ledger sequence.
+            let player_a = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player_a, GamePhase::Revealed, streak, wager);
+            client.continue_streak(&player_a, &dummy_commitment_prop(&env));
+            let random_a: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player_a).unwrap().contract_random
+            });
+
+            // Advance the ledger sequence, then do a second continue.
+            env.ledger().with_mut(|l| l.sequence_number += seq_advance);
+
+            let player_b = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player_b, GamePhase::Revealed, streak, wager);
+            client.continue_streak(&player_b, &dummy_commitment_prop(&env));
+            let random_b: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player_b).unwrap().contract_random
+            });
+
+            prop_assert_ne!(random_a, random_b,
+                "contract_random must differ when ledger sequence advances by {} \
+                 (wager={}, streak={})", seq_advance, wager, streak);
+        }
+
+        // ── CR-2: randomness is deterministic for the same ledger sequence ────
+        //
+        // Two continues at the *same* ledger sequence must produce the same
+        // contract_random.  This confirms the derivation is a pure function of
+        // the sequence number and not influenced by any mutable contract state
+        // that could be manipulated by the player.
+
+        /// PROPERTY CR-2: two continues at the same ledger sequence produce
+        /// identical contract_random values.
+        #[test]
+        fn prop_randomness_deterministic_for_same_sequence(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            // Two players continue at the same ledger sequence.
+            let player_a = Address::generate(&env);
+            let player_b = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player_a, GamePhase::Revealed, streak, wager);
+            inject_game_prop(&env, &contract_id, &player_b, GamePhase::Revealed, streak, wager);
+
+            client.continue_streak(&player_a, &dummy_commitment_prop(&env));
+            client.continue_streak(&player_b, &dummy_commitment_prop(&env));
+
+            let random_a: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player_a).unwrap().contract_random
+            });
+            let random_b: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player_b).unwrap().contract_random
+            });
+
+            prop_assert_eq!(random_a, random_b,
+                "contract_random must be identical for two continues at the same \
+                 ledger sequence (wager={}, streak={})", wager, streak);
+        }
+
+        // ── CR-3: consecutive continues produce different randomness ──────────
+        //
+        // A single player continuing multiple times must receive a different
+        // contract_random on each round (assuming the ledger advances between
+        // calls, which it does in production).  This is the direct anti-reuse
+        // property: it proves the contract reads the *current* sequence on
+        // every call rather than caching the value from a previous round.
+
+        /// PROPERTY CR-3: a player's contract_random differs between two
+        /// consecutive continues when the ledger sequence advances between them.
+        #[test]
+        fn prop_consecutive_continues_produce_distinct_randomness(
+            wager       in 1_000_000i128..=10_000_000i128,
+            seq_advance in 1u32..=100u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+
+            // Round 1: Revealed (streak=1) → continue → Committed.
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
+            client.continue_streak(&player, &dummy_commitment_prop(&env));
+            let random_round_1: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+            });
+
+            // Advance ledger, then simulate a win to get back to Revealed.
+            env.ledger().with_mut(|l| l.sequence_number += seq_advance);
+            env.as_contract(&contract_id, || {
+                let mut game = CoinflipContract::load_player_game(&env, &player).unwrap();
+                game.phase = GamePhase::Revealed;
+                game.streak = 2;
+                CoinflipContract::save_player_game(&env, &player, &game);
+            });
+
+            // Round 2: continue again.
+            client.continue_streak(&player, &dummy_commitment_prop(&env));
+            let random_round_2: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+            });
+
+            prop_assert_ne!(random_round_1, random_round_2,
+                "contract_random must differ between consecutive continues when \
+                 ledger advances by {} (wager={})", seq_advance, wager);
+        }
+
+        // ── CR-4: contract_random is a valid non-zero SHA-256 output ─────────
+        //
+        // The derived value must never be the all-zero sentinel.  An all-zero
+        // contract_random would be indistinguishable from an uninitialised
+        // field and could be exploited if any downstream code treats zero as
+        // a special case.  SHA-256 collision with the zero digest is
+        // computationally infeasible, but we verify it explicitly.
+
+        /// PROPERTY CR-4: contract_random stored after continue_streak is never
+        /// all-zero bytes, for any wager, streak, or ledger sequence offset.
+        #[test]
+        fn prop_randomness_is_never_zero(
+            wager       in 1_000_000i128..=10_000_000i128,
+            streak      in 1u32..=4u32,
+            seq_offset  in 0u32..=10_000u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            env.ledger().with_mut(|l| l.sequence_number += seq_offset);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+            client.continue_streak(&player, &dummy_commitment_prop(&env));
+
+            let random: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+            });
+
+            let zero = BytesN::from_array(&env, &[0u8; 32]);
+            prop_assert_ne!(random, zero,
+                "contract_random must never be all-zero bytes \
+                 (wager={}, streak={}, seq_offset={})", wager, streak, seq_offset);
+        }
+
+        // ── CR-5: prior contract_random is not reused after a successful continue
+        //
+        // After a successful continue, the stored contract_random must differ
+        // from the value that was present before the call.  This is the direct
+        // anti-reuse check: it fails if the implementation accidentally skips
+        // the refresh step (e.g. due to a missing assignment or early return).
+
+        /// PROPERTY CR-5: contract_random stored after continue_streak differs
+        /// from the value that was stored before the call, when the ledger
+        /// sequence has advanced.
+        #[test]
+        fn prop_prior_randomness_not_reused(
+            wager       in 1_000_000i128..=10_000_000i128,
+            streak      in 1u32..=4u32,
+            seq_advance in 1u32..=1_000u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            // Capture the contract_random that was injected (stand-in for the
+            // value produced by the previous reveal).
+            let random_before: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+            });
+
+            // Advance the ledger so the new sequence produces a different hash.
+            env.ledger().with_mut(|l| l.sequence_number += seq_advance);
+
+            client.continue_streak(&player, &dummy_commitment_prop(&env));
+
+            let random_after: BytesN<32> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+            });
+
+            prop_assert_ne!(random_before, random_after,
+                "contract_random must be refreshed and must not equal the prior \
+                 value (wager={}, streak={}, seq_advance={})", wager, streak, seq_advance);
+        }
+    }
+
     // Feature: Error Code Descriptiveness, Property: error_codes module constants ↔ enum discriminants
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
