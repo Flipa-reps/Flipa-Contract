@@ -3868,6 +3868,254 @@ mod property_tests {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Feature: Continue Commitment Requirement
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // ## Commitment Requirement
+    //
+    // Before a winning player can re-enter the commit-reveal cycle via
+    // `continue_streak`, they MUST supply a fresh, non-zero commitment.
+    //
+    // ### Why a new commitment is mandatory
+    //
+    // The commit-reveal scheme is the core fairness mechanism of the game:
+    //
+    //   1. The player commits to a secret *before* the contract's randomness
+    //      is fixed, preventing the contract from biasing the outcome.
+    //   2. The contract derives its randomness from the ledger sequence at
+    //      game-start time, preventing the player from choosing a secret
+    //      after seeing the contract's contribution.
+    //
+    // Allowing a player to continue with an all-zero (placeholder) commitment
+    // would break step 1: the player could observe the new `contract_random`
+    // (derived from the current ledger sequence) and then submit a secret
+    // chosen to produce a favourable outcome, defeating the fairness guarantee.
+    //
+    // ### The all-zero sentinel
+    //
+    // `BytesN<32>` of all zero bytes is treated as a missing or placeholder
+    // value and is rejected with `InvalidCommitment` (code 21).  Any other
+    // 32-byte value — including the hash of a zero-byte secret — is accepted.
+    //
+    // ### Properties covered
+    //
+    // | ID    | Description                                                   |
+    // |-------|---------------------------------------------------------------|
+    // | CC-1  | All-zero commitment rejected for any winning Revealed game    |
+    // | CC-2  | Any non-zero commitment accepted when all other guards pass   |
+    // | CC-3  | Game state unchanged after InvalidCommitment rejection        |
+    // | CC-4  | Stats unchanged after InvalidCommitment rejection             |
+    // | CC-5  | Commitment is persisted exactly as supplied on success        |
+    // ═══════════════════════════════════════════════════════════════════════
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // ── CC-1: all-zero commitment → InvalidCommitment ────────────────────
+        //
+        // The all-zero sentinel must be rejected regardless of wager or streak.
+        // This is the primary guard against a player deferring their secret
+        // choice until after the new contract_random is visible on-chain.
+
+        /// PROPERTY CC-1: continue_streak rejects the all-zero commitment for
+        /// any winning Revealed game, across all wager and streak values.
+        #[test]
+        fn prop_continue_rejects_zero_commitment(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 1u32..=10u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let zero = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_continue_streak(&player, &zero);
+            prop_assert_eq!(result, Err(Ok(Error::InvalidCommitment)),
+                "all-zero commitment must be rejected (wager={}, streak={})", wager, streak);
+            prop_assert_eq!(Error::InvalidCommitment as u32, error_codes::INVALID_COMMITMENT);
+        }
+
+        // ── CC-2: any non-zero commitment accepted ───────────────────────────
+        //
+        // Every non-zero 32-byte value is a valid commitment.  This confirms
+        // the guard is a precise sentinel check and does not accidentally
+        // reject legitimate commitments that happen to contain zero bytes in
+        // some positions.
+
+        /// PROPERTY CC-2: continue_streak accepts any non-zero commitment when
+        /// the game is in a valid winning Revealed state with sufficient reserves.
+        #[test]
+        fn prop_continue_accepts_any_nonzero_commitment(
+            wager            in 1_000_000i128..=10_000_000i128,
+            streak           in 1u32..=4u32,
+            commitment_bytes in prop::array::uniform32(0u8..=255u8),
+        ) {
+            // Ensure at least one byte is non-zero so the commitment is valid.
+            prop_assume!(commitment_bytes.iter().any(|&b| b != 0));
+
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert!(result.is_ok(),
+                "any non-zero commitment must be accepted (wager={}, streak={})", wager, streak);
+        }
+
+        // ── CC-3: game state unchanged after InvalidCommitment rejection ─────
+        //
+        // A rejected continue must not partially mutate the game.  If the
+        // phase, commitment, or contract_random were altered before the guard
+        // fired, a player could exploit the partial write to advance state
+        // without supplying a valid commitment.
+
+        /// PROPERTY CC-3: game state is byte-for-byte unchanged after an
+        /// InvalidCommitment rejection, for any wager and streak.
+        #[test]
+        fn prop_continue_no_game_mutation_on_invalid_commitment(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 1u32..=10u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            let zero = BytesN::from_array(&env, &[0u8; 32]);
+            let _ = client.try_continue_streak(&player, &zero);
+
+            let after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(before, after,
+                "game state must be unchanged after InvalidCommitment rejection");
+        }
+
+        // ── CC-4: stats unchanged after InvalidCommitment rejection ──────────
+        //
+        // Reserve balance and fee totals must not change on a failed continue.
+        // Any mutation here would represent an accounting error that could
+        // drain reserves or misreport fees.
+
+        /// PROPERTY CC-4: contract stats are unchanged after an InvalidCommitment
+        /// rejection, for any wager and streak.
+        #[test]
+        fn prop_continue_no_stats_mutation_on_invalid_commitment(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 1u32..=10u32,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let before: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+
+            let zero = BytesN::from_array(&env, &[0u8; 32]);
+            let _ = client.try_continue_streak(&player, &zero);
+
+            let after: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+
+            prop_assert_eq!(before.reserve_balance, after.reserve_balance,
+                "reserve_balance must be unchanged after InvalidCommitment rejection");
+            prop_assert_eq!(before.total_fees, after.total_fees,
+                "total_fees must be unchanged after InvalidCommitment rejection");
+        }
+
+        // ── CC-5: commitment persisted exactly as supplied ───────────────────
+        //
+        // On a successful continue, the stored commitment must be exactly the
+        // value the player supplied — no truncation, padding, or transformation.
+        // Any deviation would cause the subsequent reveal to fail with
+        // CommitmentMismatch, locking the player out of their own game.
+
+        /// PROPERTY CC-5: the commitment stored after a successful continue_streak
+        /// is byte-for-byte identical to the value supplied by the caller.
+        #[test]
+        fn prop_continue_commitment_persisted_exactly(
+            wager            in 1_000_000i128..=10_000_000i128,
+            streak           in 1u32..=4u32,
+            commitment_bytes in prop::array::uniform32(0u8..=255u8),
+        ) {
+            prop_assume!(commitment_bytes.iter().any(|&b| b != 0));
+
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+            client.continue_streak(&player, &commitment);
+
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(game.commitment, commitment,
+                "stored commitment must be identical to the supplied value");
+            prop_assert_eq!(game.phase, GamePhase::Committed,
+                "phase must be Committed after a successful continue");
+        }
+    }
+
     // Feature: Error Code Descriptiveness, Property: error_codes module constants ↔ enum discriminants
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
