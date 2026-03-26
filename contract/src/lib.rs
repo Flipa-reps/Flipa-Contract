@@ -871,6 +871,76 @@ impl CoinflipContract {
         Ok(())
     }
 
+    /// Update the treasury address that receives protocol fees.
+    ///
+    /// Only the configured `admin` may call this function.
+    ///
+    /// # Arguments
+    /// - `admin`    – caller address; must authorize and match `config.admin`
+    /// - `treasury` – new treasury destination for future fee transfers
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
+    ///
+    /// # Authorization invariants
+    /// - Unauthorized callers must not be able to redirect fees.
+    /// - On rejection, the entire [`ContractConfig`] remains byte-for-byte unchanged.
+    /// - Successful calls mutate only `config.treasury`.
+    pub fn set_treasury(env: Env, admin: Address, treasury: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        config.treasury = treasury;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
+
+    /// Update the inclusive wager bounds for new game creation.
+    ///
+    /// Only the configured `admin` may call this function.
+    ///
+    /// # Arguments
+    /// - `admin`     – caller address; must authorize and match `config.admin`
+    /// - `min_wager` – new inclusive lower bound in stroops
+    /// - `max_wager` – new inclusive upper bound in stroops
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`]      – caller is not the configured admin
+    /// - [`Error::InvalidWagerLimits`]– `min_wager >= max_wager`
+    ///
+    /// # Authorization invariants
+    /// - Unauthorized callers must never be able to loosen or tighten wager bounds.
+    /// - The bounds validation executes before storage writes, so invalid inputs never persist.
+    /// - On rejection, every field of [`ContractConfig`] remains unchanged.
+    pub fn set_wager_limits(
+        env: Env,
+        admin: Address,
+        min_wager: i128,
+        max_wager: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        if min_wager >= max_wager {
+            return Err(Error::InvalidWagerLimits);
+        }
+
+        config.min_wager = min_wager;
+        config.max_wager = max_wager;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
+
     /// Update the protocol fee charged on winning payouts.
     ///
     /// Only the configured `admin` address may call this function.
@@ -890,6 +960,7 @@ impl CoinflipContract {
     /// - The fee range guard fires before the storage write, so an invalid fee
     ///   never reaches persistent state.
     /// - No player game state is touched; only `ContractConfig.fee_bps` changes.
+    /// - Unauthorized callers leave the entire [`ContractConfig`] unchanged.
     pub fn set_fee(env: Env, admin: Address, fee_bps: u32) -> Result<(), Error> {
         // Guard 1: require admin authorization before touching any state.
         admin.require_auth();
@@ -1643,6 +1714,111 @@ mod tests {
     }
 
     #[test]
+    fn test_set_treasury_succeeds_for_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+        let new_treasury = Address::generate(&env);
+
+        assert!(client.try_set_treasury(&admin, &new_treasury).is_ok());
+
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.treasury, new_treasury);
+    }
+
+    #[test]
+    fn test_set_treasury_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let stranger = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        let result = client.try_set_treasury(&stranger, &new_treasury);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_treasury_no_state_mutation_on_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let stranger = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+        let _ = client.try_set_treasury(&stranger, &new_treasury);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_set_wager_limits_succeeds_for_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        assert!(client.try_set_wager_limits(&admin, &2_000_000, &200_000_000).is_ok());
+
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.min_wager, 2_000_000);
+        assert_eq!(cfg.max_wager, 200_000_000);
+    }
+
+    #[test]
+    fn test_set_wager_limits_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let stranger = Address::generate(&env);
+
+        let result = client.try_set_wager_limits(&stranger, &2_000_000, &200_000_000);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_wager_limits_rejects_invalid_bounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        let result = client.try_set_wager_limits(&admin, &10_000_000, &10_000_000);
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+    }
+
+    #[test]
+    fn test_set_wager_limits_no_state_mutation_on_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let stranger = Address::generate(&env);
+        let _ = client.try_set_wager_limits(&stranger, &2_000_000, &200_000_000);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn test_set_fee_succeeds_for_admin() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2341,6 +2517,131 @@ mod property_tests {
             prop_assert_eq!(stored_stats.total_volume, 0);
             prop_assert_eq!(stored_stats.total_fees, 0);
             prop_assert_eq!(stored_stats.reserve_balance, 0);
+        }
+    }
+
+    // Feature: admin access control, Property: unauthorized admin calls cannot mutate config
+    // Validates: fee, treasury, wager-limit, and pause settings remain unchanged on rejection.
+
+    fn setup_admin_access_env(
+        env: &Env,
+        fee_bps: u32,
+        min_wager: i128,
+        max_wager: i128,
+    ) -> (Address, CoinflipContractClient<'_>, Address) {
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = env.register_stellar_asset_contract(admin.clone());
+        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+        (contract_id, client, treasury)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        #[test]
+        fn test_unauthorized_set_fee_preserves_config(
+            fee_bps in 200u32..=500u32,
+            new_fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let max_wager = min_wager + 100_000_000;
+            let (contract_id, client, _) = setup_admin_access_env(&env, fee_bps, min_wager, max_wager);
+            let attacker = Address::generate(&env);
+
+            let before: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+
+            let result = client.try_set_fee(&attacker, &new_fee_bps);
+            prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+            let after: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+            prop_assert_eq!(before, after);
+        }
+
+        #[test]
+        fn test_unauthorized_set_paused_preserves_config(
+            fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            pause_target in any::<bool>(),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let max_wager = min_wager + 100_000_000;
+            let (contract_id, client, _) = setup_admin_access_env(&env, fee_bps, min_wager, max_wager);
+            let attacker = Address::generate(&env);
+
+            let before: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+
+            let result = client.try_set_paused(&attacker, &pause_target);
+            prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+            let after: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+            prop_assert_eq!(before, after);
+        }
+
+        #[test]
+        fn test_unauthorized_set_treasury_preserves_config(
+            fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let max_wager = min_wager + 100_000_000;
+            let (contract_id, client, _) = setup_admin_access_env(&env, fee_bps, min_wager, max_wager);
+            let attacker = Address::generate(&env);
+            let new_treasury = Address::generate(&env);
+
+            let before: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+
+            let result = client.try_set_treasury(&attacker, &new_treasury);
+            prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+            let after: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+            prop_assert_eq!(before, after);
+        }
+
+        #[test]
+        fn test_unauthorized_set_wager_limits_preserves_config(
+            fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            min_offset in 1i128..=5_000_000i128,
+            max_offset in 5_000_001i128..=50_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let max_wager = min_wager + 100_000_000;
+            let (contract_id, client, _) = setup_admin_access_env(&env, fee_bps, min_wager, max_wager);
+            let attacker = Address::generate(&env);
+            let attempted_min_wager = min_wager + min_offset;
+            let attempted_max_wager = attempted_min_wager + max_offset;
+
+            let before: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+
+            let result = client.try_set_wager_limits(&attacker, &attempted_min_wager, &attempted_max_wager);
+            prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+            let after: ContractConfig = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Config).unwrap()
+            });
+            prop_assert_eq!(before, after);
         }
     }
 
