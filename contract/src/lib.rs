@@ -3834,3 +3834,184 @@ mod loss_forfeiture_tests {
             "reserve_balance must not wrap below near_max on overflow");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── RESERVE SOLVENCY TESTS ──────────────────────────────────────────────────
+//
+// These tests verify that the contract enforces its reserve solvency guards:
+//   1. start_game rejections (Error::InsufficientReserves)
+//   2. continue_streak rejections (Error::InsufficientReserves)
+//   3. Exact-threshold acceptance (reserves == wager * 10)
+//   4. State integrity on rejection (no side effects)
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod reserve_solvency_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    /// Setup a fresh environment with specific initial reserves.
+    fn setup_solvency_env(env: &Env, initial_reserves: i128) -> (soroban_sdk::Address, CoinflipContractClient) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+
+        let admin    = soroban_sdk::Address::generate(env);
+        let treasury = soroban_sdk::Address::generate(env);
+        let token    = soroban_sdk::Address::generate(env);
+
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000);
+
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = initial_reserves;
+            CoinflipContract::save_stats(env, &stats);
+        });
+
+        (contract_id, client)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// PROPERTY: start_game is atomic with respect to reserves.
+        /// It MUST accept the wager if reserves >= wager * 10 and reject otherwise.
+        #[test]
+        fn prop_start_game_solvency_guard(
+            wager in 1_000_000i128..=1_000_000_000i128,
+            reserve_factor in 0f64..20f64,
+        ) {
+            let env = Env::default();
+            // Calculate reserves based on the factor: Factor 10.0 is the threshold.
+            let reserves = (wager as f64 * reserve_factor) as i128;
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+
+            let max_payout = wager * 10;
+            if reserves >= max_payout {
+                prop_assert!(result.is_ok(), "Game should start when reserves ({}) >= max_payout ({})", reserves, max_payout);
+            } else {
+                prop_assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into(), 
+                    "Game should be rejected with InsufficientReserves when reserves ({}) < max_payout ({})", reserves, max_payout);
+            }
+        }
+    }
+
+    #[test]
+    fn test_exact_threshold_acceptance() {
+        let env = Env::default();
+        let wager = 1_000_000i128;
+        let reserves = wager * 10; // Exactly 10x
+        let (_id, client) = setup_solvency_env(&env, reserves);
+        let player = soroban_sdk::Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0u8; 32]);
+
+        let result = client.start_game(&player, &Side::Heads, &wager, &commitment);
+        assert!(result.is_ok(), "Game MUST start at exact threshold");
+    }
+
+    #[test]
+    fn test_just_below_threshold_rejection() {
+        let env = Env::default();
+        let wager = 1_000_000i128;
+        let reserves = wager * 10 - 1; // 1 stroop below
+        let (_id, client) = setup_solvency_env(&env, reserves);
+        let player = soroban_sdk::Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0u8; 32]);
+
+        let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into());
+    }
+
+    #[test]
+    fn test_zero_reserve_rejection() {
+        let env = Env::default();
+        let wager = 1_000_000i128;
+        let reserves = 0;
+        let (_id, client) = setup_solvency_env(&env, reserves);
+        let player = soroban_sdk::Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0u8; 32]);
+
+        let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into());
+    }
+
+    #[test]
+    fn test_rejection_no_state_mutation() {
+        let env = Env::default();
+        let wager = 1_000_000i128;
+        let reserves = 0;
+        let (id, client) = setup_solvency_env(&env, reserves);
+        let player = soroban_sdk::Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0u8; 32]);
+
+        // Before stats
+        let stats_before: ContractStats = env.as_contract(&id, || {
+            CoinflipContract::load_stats(&env)
+        });
+
+        let _ = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+
+        // After stats
+        let stats_after: ContractStats = env.as_contract(&id, || {
+            CoinflipContract::load_stats(&env)
+        });
+
+        assert_eq!(stats_before, stats_after, "Stats must not change on failed game start");
+        
+        // Ensure no game state was stored
+        let game_opt: Option<GameState> = env.as_contract(&id, || {
+            CoinflipContract::load_player_game(&env, &player)
+        });
+        assert!(game_opt.is_none(), "No game state should be persisted for player");
+    }
+
+    #[test]
+    fn test_max_wager_solvency() {
+        let env = Env::default();
+        let wager = 1_000_000_000i128; // max_wager
+        let reserves = wager * 10;
+        let (_id, client) = setup_solvency_env(&env, reserves);
+        let player = soroban_sdk::Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0u8; 32]);
+
+        let result = client.start_game(&player, &Side::Heads, &wager, &commitment);
+        assert!(result.is_ok(), "Max wager should be accepted if reserves cover it");
+    }
+
+    #[test]
+    fn test_continue_streak_solvency_enforcement() {
+        let env = Env::default();
+        let wager = 1_000_000i128;
+        
+        // Initial reserves covering 10x for start_game
+        let initial_reserves = wager * 10;
+        let (id, client) = setup_solvency_env(&env, initial_reserves);
+        let player = soroban_sdk::Address::generate(&env);
+        
+        // Setup a winning reveal to get to Revealed phase
+        // Heads win secret = [2u8; 32] (calibrated in loss_forfeiture_tests)
+        let secret = soroban_sdk::Bytes::from_slice(&env, &[2u8; 32]);
+        let commitment = env.crypto().sha256(&secret).into();
+        
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+        client.reveal(&player, &secret);
+        
+        // Now game is in Revealed (streak 1). Next streak is 2. Multiplier for 2 is 3.5x.
+        // Let's drain reserves so it cannot cover 3.5x.
+        env.as_contract(&id, || {
+            let mut stats = CoinflipContract::load_stats(&env);
+            stats.reserve_balance = wager * 3; // Below 3.5x
+            CoinflipContract::save_stats(&env, &stats);
+        });
+        
+        let new_commitment = BytesN::from_array(&env, &[1u8; 32]);
+        let result = client.try_continue_streak(&player, &new_commitment);
+        
+        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into(), 
+            "continue_streak must reject if reserves cannot cover next tier");
+    }
+}
