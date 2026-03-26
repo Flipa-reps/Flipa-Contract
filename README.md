@@ -14,17 +14,27 @@ Tossd is a decentralized gambling application that implements a provably fair co
 - **Transparent Protocol Fees**: 2-5% configurable rake on winnings
 - **Secure Fund Management**: All wagers held in contract custody with reserve solvency checks
 - **Property-Based Testing**: Comprehensive test coverage with 30+ correctness properties
+- **Emergency Pause Control**: Admin can pause only new game creation during incidents
+
+### Pause Behavior and Scope
+
+The contract includes an admin-only pause switch (`set_paused`) for emergency response.
+
+- `set_paused(true)` blocks only `start_game` calls.
+- In-flight games can still settle while paused (`reveal`, `continue_streak`, `cash_out`, `claim_winnings`).
+- `set_paused(false)` re-enables new game creation.
+- Unauthorized callers are rejected with `Unauthorized`.
 
 ## 🎮 Game Mechanics
 
 ### Multiplier Structure
 
-| Streak | Multiplier | House Edge |
-|--------|-----------|------------|
-| 1st win | 1.9x | ~5% |
-| 2nd win | 3.5x | ~6.25% |
-| 3rd win | 6.0x | ~6.25% |
-| 4+ wins | 10.0x | ~6.25% |
+| Streak  | Multiplier | House Edge |
+| ------- | ---------- | ---------- |
+| 1st win | 1.9x       | ~5%        |
+| 2nd win | 3.5x       | ~6.25%     |
+| 3rd win | 6.0x       | ~6.25%     |
+| 4+ wins | 10.0x      | ~6.25%     |
 
 ### How to Play
 
@@ -119,12 +129,14 @@ stellar contract invoke \
 The project employs a dual testing approach:
 
 ### Unit Tests
+
 - Specific examples and edge cases
 - Error condition validation
 - State transition verification
 - Boundary value testing
 
 ### Property-Based Tests
+
 - 100+ iterations per property
 - Randomized input generation
 - Universal correctness validation
@@ -142,13 +154,13 @@ cargo test --lib outcome_determinism_tests::    # determinism tests (6)
 cargo test --lib randomness_regression_tests::  # randomness regression tests (5)
 ```
 
-| Module | Count | What it covers |
-|---|---|---|
-| `tests` | 15 | Multipliers, payout arithmetic, initialization, error codes, enums |
-| `property_tests` | 13 | Payout correctness, multiplier monotonicity, commitment verification, config storage |
-| `outcome_determinism_tests` | 6 | Identical inputs → identical outputs for all helpers |
-| `randomness_regression_tests` | 5 | Commit-reveal unilateral control paths |
-| **Total** | **43** | |
+| Module                        | Count  | What it covers                                                                       |
+| ----------------------------- | ------ | ------------------------------------------------------------------------------------ |
+| `tests`                       | 15     | Multipliers, payout arithmetic, initialization, error codes, enums                   |
+| `property_tests`              | 13     | Payout correctness, multiplier monotonicity, commitment verification, config storage |
+| `outcome_determinism_tests`   | 6      | Identical inputs → identical outputs for all helpers                                 |
+| `randomness_regression_tests` | 5      | Commit-reveal unilateral control paths                                               |
+| **Total**                     | **43** |                                                                                      |
 
 ### Expected output
 
@@ -170,6 +182,7 @@ Any failure at this checkpoint indicates a regression in core logic and must be 
 ## 📊 Contract Statistics
 
 The contract tracks:
+
 - Total games played
 - Total volume wagered
 - Total fees collected

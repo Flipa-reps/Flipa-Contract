@@ -840,6 +840,40 @@ impl CoinflipContract {
         Ok(())
     }
 
+    /// Pause or unpause acceptance of new games.
+    ///
+    /// Only the configured `admin` may call this function.
+    ///
+    /// Pause scope:
+    /// - When `paused == true`, `start_game` is rejected with [`Error::ContractPaused`].
+    /// - Existing game flows remain available (`reveal`, `cash_out`, `claim_winnings`,
+    ///   and `continue_streak`) so in-flight games can settle.
+    ///
+    /// # Arguments
+    /// - `admin`  – caller address; must authorize and match `config.admin`
+    /// - `paused` – target pause state
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
+    ///
+    /// # Security
+    /// - `admin.require_auth()` enforces signed authorization.
+    /// - Address equality check (`admin == config.admin`) prevents non-admin callers.
+    /// - Only the `paused` flag is mutated; all other config fields are preserved.
+    pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        config.paused = paused;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
+
     /// Update the protocol fee charged on winning payouts.
     ///
     /// Only the configured `admin` address may call this function.
@@ -1539,6 +1573,76 @@ mod tests {
         env.as_contract(contract_id, || {
             CoinflipContract::load_config(env).admin
         })
+    }
+
+    // ── set_paused tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_paused_succeeds_for_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        assert!(client.try_set_paused(&admin, &true).is_ok());
+
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert!(cfg.paused);
+    }
+
+    #[test]
+    fn test_set_paused_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let stranger = Address::generate(&env);
+
+        let result = client.try_set_paused(&stranger, &true);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_paused_can_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let admin = get_admin(&env, &contract_id);
+
+        client.set_paused(&admin, &true);
+        client.set_paused(&admin, &false);
+
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert!(!cfg.paused);
+    }
+
+    #[test]
+    fn test_set_paused_no_state_mutation_on_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        let stranger = Address::generate(&env);
+        let _ = client.try_set_paused(&stranger, &true);
+
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+
+        assert_eq!(before.paused, after.paused);
+        assert_eq!(before.admin, after.admin);
+        assert_eq!(before.treasury, after.treasury);
+        assert_eq!(before.token, after.token);
+        assert_eq!(before.fee_bps, after.fee_bps);
+        assert_eq!(before.min_wager, after.min_wager);
+        assert_eq!(before.max_wager, after.max_wager);
     }
 
     #[test]
@@ -2376,7 +2480,7 @@ mod property_tests {
             let env = Env::default();
             env.mock_all_auths();
 
-            let (admin, treasury, token, contract_id) =
+            let (_admin, treasury, token, contract_id, player) =
                 setup_game_for_transfer_test(&env, wager, fee_bps, true);
 
             let client = CoinflipContractClient::new(&env, &contract_id);
@@ -2466,14 +2570,11 @@ mod property_tests {
             let env = Env::default();
             env.mock_all_auths();
 
-            let (admin, treasury, token, contract_id) =
+            let (_admin, treasury, token, contract_id, player1) =
                 setup_game_for_transfer_test(&env, wager1, fee_bps, true);
 
             let client = CoinflipContractClient::new(&env, &contract_id);
             let token_client = token::Client::new(&env, &token);
-
-            let player1 = Address::generate(&env);
-            let player2 = Address::generate(&env);
 
             // Setup second game for player2 — same win secret [1u8;32] → Heads win
             let player2 = Address::generate(&env);
@@ -2524,7 +2625,7 @@ mod property_tests {
             let env = Env::default();
             env.mock_all_auths();
 
-            let (admin, treasury, token, contract_id) =
+            let (_admin, treasury, token, contract_id, player) =
                 setup_game_for_transfer_test(&env, wager, fee_bps, true);
 
             let client = CoinflipContractClient::new(&env, &contract_id);
