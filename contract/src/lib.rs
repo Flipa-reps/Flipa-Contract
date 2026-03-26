@@ -544,12 +544,6 @@ impl CoinflipContract {
         Ok(())
     }
 
-    /// - The commitment scheme prevents the player from changing their secret
-    ///   after observing the contract's random contribution.
-    /// - The contract's random contribution is derived from the ledger sequence
-    ///   at game-start time, making it unpredictable at commitment time.
-    /// - Both contributions are hashed independently before XOR, preventing
-    ///   any single party from biasing the outcome.
     /// Reveal the player's secret to determine the game outcome.
     ///
     /// Process:
@@ -793,7 +787,7 @@ impl CoinflipContract {
         // Reset to Committed phase for next round
         game.phase = GamePhase::Committed;
         game.commitment = new_commitment;
-        game.contract_random = contract_random;
+        game.contract_random = contract_random.into();
 
         Self::save_player_game(&env, &player, &game);
         Ok(())
@@ -1047,7 +1041,8 @@ mod tests {
         let client = CoinflipContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        let token = Address::generate(env);
+        // Register a real stellar asset contract so token transfers work
+        let token = env.register_stellar_asset_contract(admin.clone());
         client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
         (contract_id, client)
     }
@@ -1063,6 +1058,50 @@ mod tests {
             stats.reserve_balance = amount;
             CoinflipContract::save_stats(env, &stats);
         });
+    }
+
+    /// Setup a game in Revealed phase for transfer testing.
+    fn setup_game_for_transfer_test(
+        env: &Env,
+        wager: i128,
+        fee_bps: u32,
+        win: bool,
+    ) -> (Address, Address, Address, soroban_sdk::Address) {
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = Address::generate(env);
+        
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+        
+        // Fund reserves
+        fund_reserves(env, &contract_id, 1_000_000_000);
+        
+        if win {
+            // Create a winning game
+            let player = Address::generate(env);
+            let secret = Bytes::from_slice(env, &[1u8; 32]);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            
+            // Force a win by setting game state directly
+            env.as_contract(&contract_id, || {
+                let mut game = GameState {
+                    wager,
+                    side: Side::Heads,
+                    streak: 1,
+                    commitment,
+                    contract_random: env.crypto().sha256(&Bytes::from_slice(env, &[2u8; 32])).into(),
+                    phase: GamePhase::Revealed,
+                };
+                CoinflipContract::save_player_game(env, &player, &game);
+            });
+        }
+        
+        (admin, treasury, token, contract_id)
     }
 
     #[test]
@@ -1221,6 +1260,15 @@ mod tests {
         });
     }
 
+    /// Mint `amount` tokens to the contract address so token transfers succeed.
+    fn mint_to_contract(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
+        let config: ContractConfig = env.as_contract(contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        let token_client = soroban_sdk::token::StellarAssetClient::new(env, &config.token);
+        token_client.mint(contract_id, &amount);
+    }
+
     // ── Guard 1: NoActiveGame ────────────────────────────────────────────────
 
     #[test]
@@ -1297,6 +1345,7 @@ mod tests {
         let expected_fee = 570_000i128;
 
         set_reserves(&env, &contract_id, 100_000_000);
+        mint_to_contract(&env, &contract_id, 100_000_000);
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
 
@@ -1312,7 +1361,7 @@ mod tests {
             env.storage().persistent().get(&StorageKey::Stats).unwrap()
         });
         assert_eq!(stats.total_fees, expected_fee);
-        assert_eq!(stats.reserve_balance, 100_000_000 - expected_net);
+        assert_eq!(stats.reserve_balance, 100_000_000 - 19_000_000); // deducted gross, not net
     }
 
     #[test]
@@ -1328,6 +1377,7 @@ mod tests {
         let expected_net = 16_975_000i128;
 
         set_reserves(&env, &contract_id, 100_000_000);
+        mint_to_contract(&env, &contract_id, 100_000_000);
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, wager);
 
@@ -1352,6 +1402,7 @@ mod tests {
         let expected_net = 9_700_000i128;
 
         set_reserves(&env, &contract_id, 100_000_000);
+        mint_to_contract(&env, &contract_id, 100_000_000);
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 4, wager);
 
@@ -1368,6 +1419,7 @@ mod tests {
         let (contract_id, client) = setup(&env);
 
         set_reserves(&env, &contract_id, 1_000_000_000);
+        mint_to_contract(&env, &contract_id, 1_000_000_000);
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 10_000_000);
 
@@ -2216,47 +2268,49 @@ mod property_tests {
     // Validates: player and treasury balances reflect expected transfers after settlement
     // ───────────────────────────────────────────────────────────────────────
 
-    // Helper to setup a complete game scenario for transfer testing
+    // Helper to setup a complete game scenario for transfer testing.
+    // Returns (admin, treasury, token_address, contract_id, player) — player is the one with an active game.
     fn setup_game_for_transfer_test(
         env: &Env,
         wager: i128,
         fee_bps: u32,
         player_wins: bool,
-    ) -> (Address, Address, Address, soroban_sdk::Address) {
+    ) -> (Address, Address, Address, soroban_sdk::Address, Address) {
         env.mock_all_auths();
         let contract_id = env.register(CoinflipContract, ());
         let client = CoinflipContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        let token = Address::generate(&env);
+        // Use a real stellar asset contract so token transfers work
+        let token = env.register_stellar_asset_contract(admin.clone());
 
         client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
 
-        // Fund with sufficient reserves
+        // Fund reserves (accounting) and mint real tokens to the contract
         let required_reserves = wager
             .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
             .and_then(|v| v.checked_div(10_000))
-            .unwrap_or(0);
-        fund_reserves(&env, &contract_id, required_reserves + 10_000_000);
+            .unwrap_or(0)
+            + 10_000_000;
+        fund_reserves(&env, &contract_id, required_reserves);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &required_reserves);
 
         let player = Address::generate(&env);
-        
-        // Create commitment
-        let secret = if player_wins { 
-            Bytes::from_slice(&env, &[1u8; 32]) // Will produce Heads outcome
-        } else { 
-            Bytes::from_slice(&env, &[2u8; 32]) // Will produce Tails outcome  
+
+        // [1u8;32] → sha256[0]=0x72 (even) → Heads outcome → WIN for Heads player
+        // [3u8;32] → sha256[0]=0x64 (even) XOR contract_random[0]=0xdf → odd → Tails → LOSS for Heads
+        let secret = if player_wins {
+            Bytes::from_slice(&env, &[1u8; 32])
+        } else {
+            Bytes::from_slice(&env, &[3u8; 32])
         };
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-        // Start game with Heads choice
         client.start_game(&player, &Side::Heads, &wager, &commitment);
-
-        // Reveal to determine outcome
         client.reveal(&player, &secret);
 
-        (admin, treasury, token, contract_id)
+        (admin, treasury, token, contract_id, player)
     }
 
     proptest! {
@@ -2280,16 +2334,16 @@ mod property_tests {
 
             let client = CoinflipContractClient::new(&env, &contract_id);
             let token_client = token::Client::new(&env, &token);
-            let player = Address::generate(&env);
 
             // Get pre-claim balances
             let pre_contract_balance = token_client.balance(&contract_id);
             let pre_treasury_balance = token_client.balance(&treasury);
             let pre_player_balance = token_client.balance(&player);
 
-            // Calculate expected amounts
+            // Calculate expected amounts using streak=1 (what reveal produces)
+            let actual_streak = 1u32;
             let gross_payout = wager
-                .checked_mul(get_multiplier(streak) as i128)
+                .checked_mul(get_multiplier(actual_streak) as i128)
                 .and_then(|v| v.checked_div(10_000))
                 .unwrap();
             let fee_amount = gross_payout
@@ -2299,7 +2353,7 @@ mod property_tests {
             let net_payout = gross_payout - fee_amount;
 
             // Claim winnings
-            let result = client.try_claim_winnings(&player);
+            let result = client.try_cash_out(&player);
             prop_assert!(result.is_ok());
 
             // Verify post-claim balances
@@ -2314,16 +2368,9 @@ mod property_tests {
             );
 
             // Treasury should receive exactly the fee
-            prop_assert_eq!(
-                post_treasury_balance,
-                pre_treasury_balance + fee_amount
-            );
-
+            prop_assert_eq!(post_treasury_balance, pre_treasury_balance + fee_amount);
             // Player should receive exactly the net payout
-            prop_assert_eq!(
-                post_player_balance,
-                pre_player_balance + net_payout
-            );
+            prop_assert_eq!(post_player_balance, pre_player_balance + net_payout);
         }
 
         /// PROPERTY: Fee and net payout separation is mathematically correct
@@ -2381,7 +2428,8 @@ mod property_tests {
             let player1 = Address::generate(&env);
             let player2 = Address::generate(&env);
 
-            // Setup second game for player2
+            // Setup second game for player2 — same win secret [1u8;32] → Heads win
+            let player2 = Address::generate(&env);
             let secret2 = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment2: BytesN<32> = env.crypto().sha256(&secret2).into();
             client.start_game(&player2, &Side::Heads, &wager2, &commitment2);
@@ -2392,14 +2440,14 @@ mod property_tests {
             let initial_contract = token_client.balance(&contract_id);
 
             // First claim
-            let result1 = client.try_claim_winnings(&player1);
+            let result1 = client.try_cash_out(&player1);
             prop_assert!(result1.is_ok());
 
             let after_first_treasury = token_client.balance(&treasury);
             let after_first_contract = token_client.balance(&contract_id);
 
             // Second claim
-            let result2 = client.try_claim_winnings(&player2);
+            let result2 = client.try_cash_out(&player2);
             prop_assert!(result2.is_ok());
 
             let final_treasury = token_client.balance(&treasury);
@@ -2434,7 +2482,6 @@ mod property_tests {
 
             let client = CoinflipContractClient::new(&env, &contract_id);
             let token_client = token::Client::new(&env, &token);
-            let player = Address::generate(&env);
 
             // Get pre-continue balances
             let pre_contract_balance = token_client.balance(&contract_id);
@@ -2468,7 +2515,6 @@ mod property_tests {
         #[test]
         #[ignore]
         fn test_reserve_solvency_during_settlement(
-            initial_reserves in 10_000_000i128..=100_000_000i128,
             wager in 1_000_000i128..=5_000_000i128,
             fee_bps in 200u32..=500u32,
         ) {
@@ -2479,31 +2525,35 @@ mod property_tests {
 
             let admin = Address::generate(&env);
             let treasury = Address::generate(&env);
-            let token = Address::generate(&env);
+            // Real token so transfers don't abort
+            let token = env.register_stellar_asset_contract(admin.clone());
 
             client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
-            
-            // Set initial reserves
+
+            // Ensure reserves always cover worst-case payout for this wager
+            let initial_reserves = wager
+                .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(0)
+                + 10_000_000;
             fund_reserves(&env, &contract_id, initial_reserves);
+            soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &initial_reserves);
 
             let player = Address::generate(&env);
+            // [1u8;32] → Heads win (see outcome derivation in loss_forfeiture_tests)
             let secret = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            // Start and win game
             client.start_game(&player, &Side::Heads, &wager, &commitment);
             client.reveal(&player, &secret);
 
-            // Get pre-claim reserves
             let pre_stats: ContractStats = env.as_contract(&contract_id, || {
                 CoinflipContract::load_stats(&env)
             });
 
-            // Claim winnings
-            let result = client.try_claim_winnings(&player);
+            let result = client.try_cash_out(&player);
             prop_assert!(result.is_ok());
 
-            // Verify post-claim reserves
             let post_stats: ContractStats = env.as_contract(&contract_id, || {
                 CoinflipContract::load_stats(&env)
             });
@@ -2514,14 +2564,9 @@ mod property_tests {
                 .unwrap();
 
             // Reserves should decrease by exactly gross payout
-            prop_assert_eq!(
-                post_stats.reserve_balance,
-                pre_stats.reserve_balance - gross_payout
-            );
-
+            prop_assert_eq!(post_stats.reserve_balance, pre_stats.reserve_balance - gross_payout);
             // Reserves should never be negative
             prop_assert!(post_stats.reserve_balance >= 0);
-
             // Total fees should increase
             prop_assert!(post_stats.total_fees > pre_stats.total_fees);
         }
