@@ -845,6 +845,8 @@ impl CoinflipContract {
     /// - When `paused == true`, `start_game` is rejected with [`Error::ContractPaused`].
     /// - Existing game flows remain available (`reveal`, `cash_out`, `claim_winnings`,
     ///   and `continue_streak`) so in-flight games can settle.
+    /// - Pausing is not retroactive: a game that was already in `Committed` or
+    ///   `Revealed` phase before the pause must still be able to reach `Completed`.
     ///
     /// # Arguments
     /// - `admin`  – caller address; must authorize and match `config.admin`
@@ -2642,6 +2644,147 @@ mod property_tests {
                 env.storage().persistent().get(&StorageKey::Config).unwrap()
             });
             prop_assert_eq!(before, after);
+        }
+    }
+
+    // Feature: pause behavior, Property: pause blocks new starts but not active-game settlement
+    // Validates: `start_game` rejects while paused and in-flight games can still reveal,
+    // continue, and cash out to completion.
+
+    fn setup_pause_behavior_env(
+        env: &Env,
+        fee_bps: u32,
+        min_wager: i128,
+        max_wager: i128,
+    ) -> (Address, CoinflipContractClient<'_>, Address) {
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = env.register_stellar_asset_contract(admin.clone());
+
+        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = i128::MAX / 4;
+            CoinflipContract::save_stats(env, &stats);
+        });
+
+        (contract_id, client, admin)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        #[test]
+        fn test_paused_start_game_rejected_across_valid_wagers(
+            fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            wager_offset in 0i128..=50_000_000i128,
+            side_pick in any::<bool>(),
+            commitment_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let max_wager = min_wager + 100_000_000;
+            let (contract_id, client, admin) = setup_pause_behavior_env(&env, fee_bps, min_wager, max_wager);
+            let player = Address::generate(&env);
+            let side = if side_pick { Side::Heads } else { Side::Tails };
+            let wager = (min_wager + wager_offset).min(max_wager);
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+
+            client.set_paused(&admin, &true);
+
+            let before_stats: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+
+            let result = client.try_start_game(&player, &side, &wager, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::ContractPaused)));
+
+            let game: Option<GameState> = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player)
+            });
+            prop_assert!(game.is_none());
+
+            let after_stats: ContractStats = env.as_contract(&contract_id, || {
+                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            });
+            prop_assert_eq!(before_stats, after_stats);
+        }
+
+        #[test]
+        fn test_paused_reveal_still_progresses_active_game(
+            fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            wager_offset in 0i128..=50_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let max_wager = min_wager + 100_000_000;
+            let wager = (min_wager + wager_offset).min(max_wager);
+            let (contract_id, client, admin) = setup_pause_behavior_env(&env, fee_bps, min_wager, max_wager);
+            let player = Address::generate(&env);
+            let secret = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            client.set_paused(&admin, &true);
+
+            let result = client.try_reveal(&player, &secret);
+            prop_assert_eq!(result, Ok(Ok(true)));
+
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game.phase, GamePhase::Revealed);
+            prop_assert_eq!(game.streak, 1);
+        }
+
+        #[test]
+        fn test_paused_continue_and_cash_out_complete_active_game(
+            fee_bps in 200u32..=500u32,
+            min_wager in 1_000_000i128..10_000_000i128,
+            wager_offset in 0i128..=50_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let max_wager = min_wager + 100_000_000;
+            let wager = (min_wager + wager_offset).min(max_wager);
+            let (contract_id, client, admin) = setup_pause_behavior_env(&env, fee_bps, min_wager, max_wager);
+            let player = Address::generate(&env);
+            let secret = Bytes::from_slice(&env, &[1u8; 32]);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+
+            client.set_paused(&admin, &true);
+
+            let secret_round_two = Bytes::from_slice(&env, &[1u8; 32]);
+            let next_commitment: BytesN<32> = env.crypto().sha256(&secret_round_two).into();
+            prop_assert_eq!(client.try_continue_streak(&player, &next_commitment), Ok(Ok(())));
+
+            let continued: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(continued.phase, GamePhase::Committed);
+            prop_assert_eq!(continued.streak, 1);
+
+            prop_assert_eq!(client.try_reveal(&player, &secret_round_two), Ok(Ok(true)));
+
+            let expected_payout = calculate_payout(wager, 2, fee_bps).unwrap();
+            let payout = client.try_cash_out(&player);
+            prop_assert_eq!(payout, Ok(Ok(expected_payout)));
+
+            let finished: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(finished.phase, GamePhase::Completed);
         }
     }
 
@@ -4934,6 +5077,11 @@ mod integration_tests {
             });
         }
 
+        /// Toggle pause state through the public admin entrypoint.
+        fn set_paused(&self, paused: bool) {
+            self.client.set_paused(&self.admin, &paused);
+        }
+
         /// Inject a `GameState` directly into storage, bypassing `start_game`.
         ///
         /// Useful for testing `reveal`, `cash_out`, and `continue_streak` in
@@ -5205,12 +5353,8 @@ mod integration_tests {
         let h = Harness::new();
         h.fund(1_000_000_000);
 
-        // Pause the contract
-        h.env.as_contract(&h.contract_id, || {
-            let mut cfg = CoinflipContract::load_config(&h.env);
-            cfg.paused = true;
-            CoinflipContract::save_config(&h.env, &cfg);
-        });
+        // Pause through the public admin API.
+        h.set_paused(true);
 
         let player = h.player();
         let result = h.client.try_start_game(
@@ -5225,6 +5369,58 @@ mod integration_tests {
             CoinflipContract::load_player_game(&h.env, &player)
         });
         assert!(game_opt.is_none());
+    }
+
+    /// Pausing after game creation must not strand the player in `Committed`.
+    ///
+    /// Verifies:
+    /// - `reveal` still succeeds while paused
+    /// - the active game advances to `Revealed`
+    #[test]
+    fn test_paused_contract_allows_reveal_for_active_game() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
+        h.set_paused(true);
+
+        let won = h.client.reveal(&player, &h.make_secret(1));
+        assert!(won, "active game must still reveal successfully while paused");
+
+        let game = h.game_state(&player);
+        assert_eq!(game.phase, GamePhase::Revealed);
+        assert_eq!(game.streak, 1);
+    }
+
+    /// Pausing after a win must still allow the player to continue and settle.
+    ///
+    /// Verifies:
+    /// - `continue_streak` succeeds while paused
+    /// - subsequent `reveal` succeeds while paused
+    /// - final `cash_out` completes the active game
+    #[test]
+    fn test_paused_contract_allows_continue_and_cash_out_for_active_game() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+
+        let won = h.play_win_round(&player, DEFAULT_WAGER);
+        assert!(won, "round 1 must win before pausing");
+
+        h.set_paused(true);
+
+        let next_commitment = h.make_commitment(1);
+        h.client.continue_streak(&player, &next_commitment);
+        assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
+
+        let won_again = h.client.reveal(&player, &h.make_secret(1));
+        assert!(won_again, "round 2 must still reveal while paused");
+
+        let payout = h.client.cash_out(&player);
+        let expected = calculate_payout(DEFAULT_WAGER, 2, DEFAULT_FEE_BPS).unwrap();
+        assert_eq!(payout, expected);
+        assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
     }
 
     // ── Double-start guard ────────────────────────────────────────────────
