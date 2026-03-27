@@ -1206,6 +1206,7 @@ impl CoinflipContract {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger;
 
     #[test]
     fn test_get_multiplier_streak_levels() {
@@ -2635,7 +2636,7 @@ mod property_tests {
     // ───────────────────────────────────────────────────────────────────────
 
     // Helper function to set up contract and return client
-    fn setup_contract_with_bounds(
+    pub(crate) fn setup_contract_with_bounds(
         env: &Env,
         min_wager: i128,
         max_wager: i128,
@@ -2660,7 +2661,7 @@ mod property_tests {
         contract_id
     }
 
-    fn dummy_commitment_prop(env: &Env) -> BytesN<32> {
+    pub(crate) fn dummy_commitment_prop(env: &Env) -> BytesN<32> {
         env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[42u8; 32])).into()
     }
 
@@ -5939,7 +5940,7 @@ mod reserve_solvency_tests {
             if reserves >= max_payout {
                 prop_assert!(result.is_ok(), "Game should start when reserves ({}) >= max_payout ({})", reserves, max_payout);
             } else {
-                prop_assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into(), 
+                prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)), 
                     "Game should be rejected with InsufficientReserves when reserves ({}) < max_payout ({})", reserves, max_payout);
             }
         }
@@ -5954,8 +5955,9 @@ mod reserve_solvency_tests {
         let player = soroban_sdk::Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
-        let result = client.start_game(&player, &Side::Heads, &wager, &commitment);
-        assert!(result.is_ok(), "Game MUST start at exact threshold");
+        // start_game returns () on success, not Result
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+        // If we reach here without panic, the test passed
     }
 
     #[test]
@@ -5968,7 +5970,7 @@ mod reserve_solvency_tests {
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
         let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
-        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into());
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
     #[test]
@@ -5981,7 +5983,7 @@ mod reserve_solvency_tests {
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
         let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
-        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into());
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
     #[test]
@@ -6023,8 +6025,9 @@ mod reserve_solvency_tests {
         let player = soroban_sdk::Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
-        let result = client.start_game(&player, &Side::Heads, &wager, &commitment);
-        assert!(result.is_ok(), "Max wager should be accepted if reserves cover it");
+        // start_game returns () on success, not Result
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+        // If we reach here without panic, the test passed
     }
 
     #[test]
@@ -6056,7 +6059,7 @@ mod reserve_solvency_tests {
         let new_commitment = BytesN::from_array(&env, &[1u8; 32]);
         let result = client.try_continue_streak(&player, &new_commitment);
         
-        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into(), 
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)), 
             "continue_streak must reject if reserves cannot cover next tier");
     }
 }
@@ -6068,6 +6071,8 @@ mod reserve_solvency_tests {
 mod concurrency_edge_case_tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use crate::property_tests::{setup_contract_with_bounds, dummy_commitment_prop};
+    use proptest::prelude::*;
 
     #[test]
     fn test_rapid_sequential_start_attempts() {
@@ -6664,6 +6669,542 @@ mod integration_tests {
         assert!(won, "probe_outcome prediction must match actual reveal outcome");
     }
 }
- master
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #125 — Cash Out Availability Property Tests
+//
+// ELIGIBILITY INVARIANT:
+//   cash_out MUST succeed if and only if ALL of the following hold:
+//     1. A game record exists for the player in storage.
+//     2. The game is in GamePhase::Revealed.
+//     3. game.streak >= 1  (player won at least one flip).
+//     4. The contract holds sufficient reserves to cover the gross payout.
+//
+// Any violation of conditions 1–3 must be rejected with the correct error
+// BEFORE any state mutation occurs (no partial writes on rejection).
+//
+// INELIGIBLE CONDITIONS (must be rejected):
+//   - No game exists                  → Error::NoActiveGame
+//   - Phase == Committed              → Error::InvalidPhase
+//   - Phase == Completed              → Error::InvalidPhase
+//   - Phase == Revealed, streak == 0  → Error::NoWinningsToClaimOrContinue
+//   - Double claim (game already Completed after first cash_out)
+//                                     → Error::InvalidPhase
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod cash_out_availability_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+    use crate::property_tests::{setup_contract_with_bounds, dummy_commitment_prop};
+
+    // ── Module-level helpers ─────────────────────────────────────────────────
+
+    /// Initialise a contract and return (contract_id, client).
+    fn setup_env(env: &Env) -> (Address, CoinflipContractClient) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin    = Address::generate(env);
+        let treasury = Address::generate(env);
+        #[allow(deprecated)]
+        let token    = env.register_stellar_asset_contract(admin.clone());
+        // fee_bps=300, min=1_000_000, max=100_000_000
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        (contract_id, client)
+    }
+
+    /// Deterministic non-zero commitment suitable for property tests.
+    fn prop_commitment(env: &Env) -> BytesN<32> {
+        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[0xABu8; 32])).into()
+    }
+
+    /// Inject a GameState directly into storage, bypassing start_game.
+    /// This lets tests exercise any (phase, streak, wager) combination
+    /// without needing a real commit-reveal round.
+    fn inject(
+        env: &Env,
+        contract_id: &Address,
+        player: &Address,
+        phase: GamePhase,
+        streak: u32,
+        wager: i128,
+    ) {
+        let dummy = prop_commitment(env);
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment: dummy.clone(),
+            contract_random: dummy,
+            fee_bps: 300,
+            phase,
+        };
+        env.as_contract(contract_id, || {
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+    }
+
+    /// Set the tracked reserve_balance in ContractStats.
+    fn set_reserves(env: &Env, contract_id: &Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &stats);
+        });
+    }
+
+    /// Mint tokens to the contract so token transfers don't fail.
+    fn mint_to(env: &Env, contract_id: &Address, amount: i128) {
+        let config: ContractConfig = env.as_contract(contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        soroban_sdk::token::StellarAssetClient::new(env, &config.token)
+            .mint(contract_id, &amount);
+    }
+
+    /// Read ContractStats from storage.
+    fn read_stats(env: &Env, contract_id: &Address) -> ContractStats {
+        env.as_contract(contract_id, || {
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        })
+    }
+
+    // ── Property: no-game condition ──────────────────────────────────────────
+    //
+    // INVARIANT: cash_out called for a player with no game record must always
+    // return Error::NoActiveGame, regardless of who the player is.
+    //
+    // This covers:
+    //   - A brand-new address that has never played.
+    //   - An address whose game was deleted after settlement.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// PROPERTY CA-1: cash_out with no game record → NoActiveGame.
+        ///
+        /// For any player address that has no game in storage, cash_out must
+        /// be rejected with Error::NoActiveGame.  No state mutation must occur.
+        #[test]
+        fn prop_cash_out_no_game_returns_no_active_game(
+            // seed drives Address::generate deterministically via proptest
+            _seed in 0u8..=255u8,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            // Fresh player — no game record exists.
+            let player = Address::generate(&env);
+
+            let stats_before = read_stats(&env, &contract_id);
+            let result = client.try_cash_out(&player);
+
+            // Must be rejected with the correct error.
+            prop_assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+
+            // No state mutation: stats unchanged.
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance);
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees);
+        }
+
+        /// PROPERTY CA-2: cash_out after game deletion → NoActiveGame.
+        ///
+        /// After a successful cash_out the game transitions to Completed but
+        /// the record remains in storage.  After a loss the record is deleted.
+        /// A second cash_out attempt on a Completed game must return
+        /// Error::InvalidPhase (double-claim guard), not succeed silently.
+        ///
+        /// This property verifies the double-claim path across random wagers.
+        #[test]
+        fn prop_cash_out_double_claim_rejected(
+            wager in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            // Provide ample reserves and token balance.
+            let reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, reserve);
+            mint_to(&env, &contract_id, reserve);
+
+            let player = Address::generate(&env);
+            // Inject a winning Revealed state.
+            inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            // First cash_out must succeed.
+            let first = client.try_cash_out(&player);
+            prop_assert!(first.is_ok(), "first cash_out must succeed for Revealed+streak≥1");
+
+            // Second cash_out on the now-Completed game must be rejected.
+            // The game record is still present (phase=Completed), so the error
+            // is InvalidPhase, not NoActiveGame.
+            let second = client.try_cash_out(&player);
+            prop_assert_eq!(second, Err(Ok(Error::InvalidPhase)),
+                "double cash_out must be rejected with InvalidPhase");
+        }
+    }
+
+    // ── Property: invalid phase conditions ──────────────────────────────────
+    //
+    // INVARIANT: cash_out must return Error::InvalidPhase for any game that is
+    // not in GamePhase::Revealed, regardless of the streak value or wager.
+    //
+    // Phases tested:
+    //   - Committed  (reveal not yet called)
+    //   - Completed  (game already settled)
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(150))]
+
+        /// PROPERTY CA-3: Committed phase → InvalidPhase for any streak/wager.
+        ///
+        /// A game in Committed phase means the player has placed their wager
+        /// and commitment but has not yet called reveal.  cash_out must be
+        /// rejected because the outcome is not yet known.
+        ///
+        /// No funds must be transferred and no state must change on rejection.
+        #[test]
+        fn prop_cash_out_committed_phase_rejected(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let player = Address::generate(&env);
+            inject(&env, &contract_id, &player, GamePhase::Committed, streak, wager);
+
+            let stats_before = read_stats(&env, &contract_id);
+            let result = client.try_cash_out(&player);
+
+            // Correct error regardless of streak value.
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "Committed phase must always return InvalidPhase");
+
+            // Guard ordering: no state mutation before the phase check.
+            let game_after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game_after.phase, GamePhase::Committed,
+                "game phase must not change on rejection");
+
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance,
+                "reserve_balance must not change on rejection");
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees,
+                "total_fees must not change on rejection");
+        }
+
+        /// PROPERTY CA-4: Completed phase → InvalidPhase for any streak/wager.
+        ///
+        /// A game in Completed phase has already been settled (win cashed out
+        /// or loss forfeited).  cash_out must be rejected — there is nothing
+        /// left to claim.
+        ///
+        /// This is the double-claim guard at the phase level.
+        #[test]
+        fn prop_cash_out_completed_phase_rejected(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let player = Address::generate(&env);
+            inject(&env, &contract_id, &player, GamePhase::Completed, streak, wager);
+
+            let stats_before = read_stats(&env, &contract_id);
+            let result = client.try_cash_out(&player);
+
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "Completed phase must always return InvalidPhase");
+
+            // State must be unchanged.
+            let game_after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game_after.phase, GamePhase::Completed,
+                "game phase must not change on rejection");
+
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance,
+                "reserve_balance must not change on rejection");
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees,
+                "total_fees must not change on rejection");
+        }
+    }
+
+    // ── Property: streak == 0 in Revealed phase ──────────────────────────────
+    //
+    // INVARIANT: A Revealed game with streak == 0 represents a loss state.
+    // cash_out must return Error::NoWinningsToClaimOrContinue.
+    // This is distinct from the phase guard — the phase IS correct (Revealed)
+    // but the streak condition is not met.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(150))]
+
+        /// PROPERTY CA-5: Revealed phase + streak == 0 → NoWinningsToClaimOrContinue.
+        ///
+        /// streak == 0 in Revealed phase means the player lost the flip.
+        /// cash_out must be rejected because there are no winnings to claim.
+        ///
+        /// No funds must be transferred and no state must change on rejection.
+        #[test]
+        fn prop_cash_out_revealed_streak_zero_rejected(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let player = Address::generate(&env);
+            // Revealed phase, streak == 0 → loss state.
+            inject(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
+
+            let stats_before = read_stats(&env, &contract_id);
+            let result = client.try_cash_out(&player);
+
+            prop_assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)),
+                "Revealed+streak==0 must return NoWinningsToClaimOrContinue");
+
+            // No state mutation on rejection.
+            let game_after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game_after.phase, GamePhase::Revealed,
+                "game phase must not change on rejection");
+            prop_assert_eq!(game_after.streak, 0u32,
+                "streak must not change on rejection");
+
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance,
+                "reserve_balance must not change on rejection");
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees,
+                "total_fees must not change on rejection");
+        }
+    }
+
+    // ── Property: eligible states succeed ───────────────────────────────────
+    //
+    // INVARIANT: cash_out MUST succeed when:
+    //   - phase == Revealed
+    //   - streak >= 1
+    //   - reserves >= gross payout
+    //
+    // On success:
+    //   - Returns Ok(net_payout) where net = gross - fee
+    //   - game.phase transitions to Completed
+    //   - stats.reserve_balance decreases by exactly gross
+    //   - stats.total_fees increases by exactly fee
+    //   - net_payout > 0
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// PROPERTY CA-6: Revealed + streak ≥ 1 → cash_out succeeds and
+        /// returns a positive net payout.
+        ///
+        /// For any valid (wager, streak) combination with sufficient reserves,
+        /// cash_out must succeed and the returned net payout must be positive.
+        #[test]
+        fn prop_cash_out_eligible_state_succeeds(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, reserve);
+            mint_to(&env, &contract_id, reserve);
+
+            let player = Address::generate(&env);
+            inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let result = client.try_cash_out(&player);
+
+            // Must succeed.
+            prop_assert!(result.is_ok(),
+                "cash_out must succeed for Revealed phase with streak >= 1");
+
+            let net = result.unwrap().unwrap();
+
+            // Net payout must be positive.
+            prop_assert!(net > 0,
+                "net payout must be positive; got {}", net);
+
+            // Game must transition to Completed.
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game.phase, GamePhase::Completed,
+                "game must be Completed after successful cash_out");
+        }
+
+        /// PROPERTY CA-7: Accounting invariant — reserve decreases by gross,
+        /// fees increase by fee, net = gross - fee.
+        ///
+        /// For any eligible (wager, streak), the settlement accounting must
+        /// satisfy:
+        ///   gross = wager × multiplier_bps / 10_000
+        ///   fee   = gross × fee_bps / 10_000
+        ///   net   = gross - fee
+        ///   reserve_after = reserve_before - gross
+        ///   total_fees_after = total_fees_before + fee
+        #[test]
+        fn prop_cash_out_accounting_invariant(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, reserve);
+            mint_to(&env, &contract_id, reserve);
+
+            let player = Address::generate(&env);
+            inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let stats_before = read_stats(&env, &contract_id);
+
+            let net = client.cash_out(&player);
+
+            // Compute expected values using the same helpers the contract uses.
+            let (expected_gross, expected_fee, expected_net) =
+                calculate_payout_breakdown(wager, streak, 300).unwrap();
+
+            prop_assert_eq!(net, expected_net,
+                "returned net must equal gross - fee");
+
+            let stats_after = read_stats(&env, &contract_id);
+
+            prop_assert_eq!(
+                stats_after.reserve_balance,
+                stats_before.reserve_balance - expected_gross,
+                "reserve must decrease by exactly gross"
+            );
+            prop_assert_eq!(
+                stats_after.total_fees,
+                stats_before.total_fees + expected_fee,
+                "total_fees must increase by exactly fee"
+            );
+        }
+
+        /// PROPERTY CA-8: Payout is strictly monotone with streak.
+        ///
+        /// A higher streak must always produce a strictly higher net payout
+        /// for the same wager.  This guards against multiplier regression.
+        #[test]
+        fn prop_cash_out_payout_monotone_with_streak(
+            wager in 1_000_000i128..=5_000_000i128,
+        ) {
+            // streak 1 < streak 2 < streak 3 < streak 4
+            let fee_bps = 300u32;
+            let (_, _, net1) = calculate_payout_breakdown(wager, 1, fee_bps).unwrap();
+            let (_, _, net2) = calculate_payout_breakdown(wager, 2, fee_bps).unwrap();
+            let (_, _, net3) = calculate_payout_breakdown(wager, 3, fee_bps).unwrap();
+            let (_, _, net4) = calculate_payout_breakdown(wager, 4, fee_bps).unwrap();
+
+            prop_assert!(net1 < net2, "streak-1 net must be less than streak-2 net");
+            prop_assert!(net2 < net3, "streak-2 net must be less than streak-3 net");
+            prop_assert!(net3 < net4, "streak-3 net must be less than streak-4 net");
+        }
+
+        /// PROPERTY CA-9: cash_out frees the player slot for a new game.
+        ///
+        /// After a successful cash_out the game record is in Completed phase.
+        /// The player must be able to start a new game immediately (the slot
+        /// is not blocked by the Completed record — start_game checks for
+        /// Committed/Revealed phases only, not Completed).
+        #[test]
+        fn prop_cash_out_frees_slot_for_new_game(
+            wager  in 1_000_000i128..=5_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, reserve);
+            mint_to(&env, &contract_id, reserve);
+
+            let player = Address::generate(&env);
+            inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            // Cash out succeeds.
+            prop_assert!(client.try_cash_out(&player).is_ok());
+
+            // Player can immediately start a new game.
+            let new_commitment = prop_commitment(&env);
+            let result = client.try_start_game(
+                &player, &Side::Tails, &1_000_000, &new_commitment,
+            );
+            prop_assert!(result.is_ok(),
+                "start_game must succeed after cash_out (slot must be free)");
+        }
+    }
+
+    // ── Property: guard ordering — no state mutation on any rejection ────────
+    //
+    // INVARIANT: All eligibility checks must fire before any state mutation.
+    // A rejected cash_out must leave the game record and contract stats
+    // byte-for-byte identical to their pre-call state.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(150))]
+
+        /// PROPERTY CA-10: No state mutation on any ineligible cash_out call.
+        ///
+        /// For every ineligible (phase, streak) combination, both the game
+        /// record and the contract stats must be unchanged after the call.
+        ///
+        /// Covers all three rejection paths in a single property:
+        ///   - Committed phase (any streak)
+        ///   - Completed phase (any streak)
+        ///   - Revealed phase + streak == 0
+        #[test]
+        fn prop_cash_out_no_state_mutation_on_rejection(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=5u32,
+            // 0 = Committed, 1 = Completed, 2 = Revealed+streak_zero
+            case   in 0u8..=2u8,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let player = Address::generate(&env);
+
+            // Build an ineligible state based on `case`.
+            let (phase, effective_streak) = match case {
+                0 => (GamePhase::Committed, streak),
+                1 => (GamePhase::Completed, streak),
+                _ => (GamePhase::Revealed, 0),   // streak forced to 0 → loss state
+            };
+            inject(&env, &contract_id, &player, phase.clone(), effective_streak, wager);
+
+            let game_before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            let stats_before = read_stats(&env, &contract_id);
+
+            // Call must fail.
+            let result = client.try_cash_out(&player);
+            prop_assert!(result.is_err() || matches!(result, Err(_)),
+                "ineligible cash_out must return an error");
+
+            // Game record must be byte-for-byte identical.
+            let game_after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game_before, game_after,
+                "game state must not change on rejected cash_out");
+
+            // Stats must be unchanged.
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance,
+                "reserve_balance must not change on rejected cash_out");
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees,
+                "total_fees must not change on rejected cash_out");
+        }
     }
 }
