@@ -238,14 +238,23 @@ pub struct ContractConfig {
     pub paused: bool,            // Emergency pause flag
 }
 
-/// Contract statistics
+/// Global statistics tracking the overall economic activity and solvency of the contract.
+///
+/// Invariants and meaning:
+/// - `total_games`: The total number of games started. Strictly monotonically increasing.
+/// - `total_volume`: Total volume of wagers ever placed, denoted in stroops.
+/// - `total_fees`: Cumulative fee revenue collected by the protocol (never decreases).
+/// - `reserve_balance`: The contract's internal accounting of funds available to pay out winnings.
+///                      Must always be sufficient to cover the worst-case payout (10x wager)
+///                      to prevent insolvency. Decreases when players cash out or claim winnings,
+///                      increases when players lose and forfeit their wager.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractStats {
     pub total_games: u64,        // Total games played
     pub total_volume: i128,      // Total XLM wagered
-    pub total_fees: i128,        // Total fees collected
-    pub reserve_balance: i128,   // Current contract reserves
+    pub total_fees: i128,        // Cumulative fees collected in stroops
+    pub reserve_balance: i128,   // Available reserves to cover payouts
 }
 
 /// Storage keys for contract data
@@ -695,16 +704,29 @@ impl CoinflipContract {
         Ok(())
     }
 
-    /// Cash out winnings after a successful reveal (no token transfer).
+    /// Cash out winnings after a successful reveal (computes payout and cleans up state).
     ///
-    /// Guards:
-    /// 1. `NoActiveGame`               – player has no game
-    /// 2. `InvalidPhase`               – game not in Revealed phase
-    /// 3. `NoWinningsToClaimOrContinue` – streak == 0 (player lost)
+    /// # Pre-Execution Invariants & Guards
+    /// 1. `NoActiveGame`               – The player must have an active game in storage.
+    ///                                   If `cash_out` is called twice, the second call fails here
+    ///                                   because the first call completely deletes the game state.
+    /// 2. `InvalidPhase`               – The game phase must be `Revealed`.
+    /// 3. `NoWinningsToClaimOrContinue`– The player's streak must be > 0 (they must have won).
+    ///                                   A losing reveal resets the streak to 0.
+    /// 4. `InsufficientReserves`       – The contract must have enough `reserve_balance` to
+    ///                                   cover the `net_payout` calculation.
     ///
-    /// On success: calculates net payout, deducts it from reserves, records
-    /// the fee in stats, sets game phase to Completed, and returns the net
-    /// payout amount.
+    /// # Post-Execution Invariants & Accounting
+    /// - **Protocol Fee**: The `fee` portion is permanently added to `stats.total_fees`.
+    /// - **Reserve Deduction**: `stats.reserve_balance` is decremented by exactly `net_payout`.
+    /// - **State Cleanup**: The player's game state is completely DELETED from storage.
+    ///                      No residual state is left.
+    ///
+    /// # Edge Cases
+    /// - **Double Cash Out**: Prevented by `delete_player_game` causing subsequent calls
+    ///                        to fail with `NoActiveGame`.
+    /// - **Zero Payouts**: If the computed net payout ends up being zero (e.g., due to rounding
+    ///                     or zero wager), the state is still cleared and no reserves are deducted.
     pub fn cash_out(
         env: Env,
         player: Address,
@@ -743,8 +765,8 @@ impl CoinflipContract {
             .unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
 
-        game.phase = GamePhase::Completed;
-        Self::save_player_game(&env, &player, &game);
+        // Clear the player's game state completely after settlement
+        Self::delete_player_game(&env, &player);
 
         Ok(net_payout)
     }
@@ -1515,10 +1537,10 @@ mod tests {
 
         let result = client.try_cash_out(&player);
         assert_eq!(result, Ok(Ok(expected_net)));
-        let game: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+        let game_opt = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player)
         });
-        assert_eq!(game.phase, GamePhase::Completed);
+        assert!(game_opt.is_none(), "Player game state should be deleted after cash out");
 
         // Stats: fee credited, reserves debited.
         let stats: ContractStats = env.as_contract(&contract_id, || {
@@ -1547,10 +1569,10 @@ mod tests {
 
         let result = client.try_cash_out(&player);
         assert_eq!(result, Ok(Ok(expected_net)));
-        let game: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+        let game_opt = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player)
         });
-        assert_eq!(game.phase, GamePhase::Completed);
+        assert!(game_opt.is_none(), "Player game state should be deleted after cash out");
     }
 
     #[test]
