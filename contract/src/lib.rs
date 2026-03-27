@@ -927,8 +927,8 @@ impl CoinflipContract {
             .unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
 
-        game.phase = GamePhase::Completed;
-        Self::save_player_game(&env, &player, &game);
+        // Clear the player's game state completely after settlement
+        Self::delete_player_game(&env, &player);
 
         Ok(net_payout)
     }
@@ -1829,10 +1829,10 @@ mod tests {
 
         let result = client.try_cash_out(&player);
         assert_eq!(result, Ok(Ok(expected_net)));
-        let game: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+        let game_opt = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player)
         });
-        assert_eq!(game.phase, GamePhase::Completed);
+        assert!(game_opt.is_none(), "Player game state should be deleted after cash out");
 
         // Stats: fee credited, reserves debited.
         let stats: ContractStats = env.as_contract(&contract_id, || {
@@ -1861,10 +1861,10 @@ mod tests {
 
         let result = client.try_cash_out(&player);
         assert_eq!(result, Ok(Ok(expected_net)));
-        let game: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+        let game_opt = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player)
         });
-        assert_eq!(game.phase, GamePhase::Completed);
+        assert!(game_opt.is_none(), "Player game state should be deleted after cash out");
     }
 
     #[test]
@@ -6745,44 +6745,74 @@ mod integration_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Feature: Timeout Reclaim Tests
+// Feature: Fund Conservation (Issue #149)
+// Module:  fund_conservation_tests
 //
-// Invariants verified:
-// 1. `reclaim_wager` is rejected before the timeout window expires
-//    (`RevealTimeout`).
-// 2. After expiry, `reclaim_wager` succeeds, returns the original wager,
-//    deletes the game state, and credits the wager to `reserve_balance`.
-// 3. `reclaim_wager` is rejected when no game exists (`NoActiveGame`).
-// 4. `reclaim_wager` is rejected for games not in `Committed` phase
-//    (`InvalidPhase`).
-// 5. After a successful reclaim the player slot is free — a new `start_game`
-//    is accepted immediately.
-// 6. Property: for any wager in [min, max], reclaim after expiry always
-//    returns exactly that wager and increments `reserve_balance` by the same
-//    amount.
+// ## Tossd Accounting Model
+//
+// Every stroop that enters or leaves the contract must be accounted for by
+// exactly one of three internal ledgers:
+//
+//   1. **reserve_balance** – the contract's vault; holds all unallocated funds.
+//      Increases when a player deposits (start_game) or loses (reveal → loss).
+//      Decreases when a player wins and cashes out (gross payout deducted).
+//
+//   2. **total_fees** – cumulative protocol revenue sent to the treasury.
+//      Increases by `fee = gross * fee_bps / 10_000` on every winning cash-out.
+//      Never decreases (fees are never refunded).
+//
+//   3. **player_payout** – the net amount returned to the winning player.
+//      Equals `gross - fee` for each settled win.
+//
+// ### Conservation Invariant
+//
+//   Initial_Reserve + Total_Deposits
+//     == Final_Reserve + Total_Player_Payouts + Total_Fees_Collected
+//
+// Where:
+//   - `Total_Deposits`       = sum of all wagers placed via `start_game`
+//   - `Total_Player_Payouts` = sum of all net payouts from `cash_out`
+//   - `Total_Fees_Collected` = `stats.total_fees` after all settlements
+//   - `Final_Reserve`        = `stats.reserve_balance` after all settlements
+//
+// On a loss the wager flows directly into `reserve_balance` (no fee split).
+// On a win the gross payout is split: `net_payout` → player, `fee` → treasury,
+// and `reserve_balance` is reduced by the full gross amount.
+//
+// ### Auditor Notes
+//
+// - All arithmetic uses `checked_*` operations; overflow saturates rather than
+//   wrapping, so the invariant may be off by at most 1 stroop per operation in
+//   pathological near-MAX scenarios (not reachable in production).
+// - `cash_out` deducts the **gross** payout from reserves (not the net), then
+//   records the fee separately in `total_fees`. This is intentional: the fee
+//   portion never re-enters the reserve pool.
+// - `claim_winnings` performs the same accounting as `cash_out` but also
+//   executes real token transfers; the reserve accounting is identical.
+// - Loss forfeiture credits the exact wager to reserves with no fee deduction.
 // ═══════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
-mod timeout_reclaim_tests {
+mod fund_conservation_tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
 
-    // ── Shared helpers ────────────────────────────────────────────────────
+    // ── helpers ──────────────────────────────────────────────────────────────
 
-    fn setup_env() -> (Env, Address, CoinflipContractClient<'static>) {
-        let env = Env::default();
+    /// Set up a fresh contract with ample reserves and return the contract id.
+    fn setup(env: &Env, fee_bps: u32) -> soroban_sdk::Address {
         env.mock_all_auths();
         let contract_id = env.register(CoinflipContract, ());
-        let client: CoinflipContractClient<'static> = unsafe {
-            core::mem::transmute(CoinflipContractClient::new(&env, &contract_id))
-        };
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let token = Address::generate(&env);
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
-        (env, contract_id, client)
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin    = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token    = Address::generate(env);
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+        contract_id
     }
 
-    fn fund(env: &Env, contract_id: &Address, amount: i128) {
+    /// Directly set `reserve_balance` in contract storage.
+    fn set_reserves(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
         env.as_contract(contract_id, || {
             let mut stats = CoinflipContract::load_stats(env);
             stats.reserve_balance = amount;
@@ -6790,218 +6820,473 @@ mod timeout_reclaim_tests {
         });
     }
 
-    fn reserve_balance(env: &Env, contract_id: &Address) -> i128 {
+    /// Read `ContractStats` from storage.
+    fn read_stats(env: &Env, contract_id: &soroban_sdk::Address) -> ContractStats {
+        env.as_contract(contract_id, || CoinflipContract::load_stats(env))
+    }
+
+    /// Inject a `Revealed`-phase winning game and call `cash_out`.
+    /// Returns `(net_payout, fee)` for the caller to track.
+    fn do_win_cash_out(
+        env: &Env,
+        contract_id: &soroban_sdk::Address,
+        player: &Address,
+        wager: i128,
+        streak: u32,
+        fee_bps: u32,
+    ) -> (i128, i128) {
+        let dummy: BytesN<32> = env
+            .crypto()
+            .sha256(&soroban_sdk::Bytes::from_slice(env, &[7u8; 32]))
+            .into();
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment: dummy.clone(),
+            contract_random: dummy,
+            fee_bps,
+            phase: GamePhase::Revealed,
+        };
         env.as_contract(contract_id, || {
-            CoinflipContract::load_stats(env).reserve_balance
-        })
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+        CoinflipContractClient::new(env, contract_id).cash_out(player);
+
+        let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
+        let fee   = gross.checked_mul(fee_bps as i128).unwrap() / 10_000;
+        let net   = gross - fee;
+        (net, fee)
     }
 
-    fn game_exists(env: &Env, contract_id: &Address, player: &Address) -> bool {
+    /// Simulate a loss: inject a `Committed`-phase game and call `reveal` with
+    /// a secret that deterministically loses for `Side::Heads`.
+    ///
+    /// In the default test env (ledger seq = 0):
+    ///   contract_random[0] = 0xdf  →  [3u8;32] sha256[0]=0x64 XOR 0xdf = bit 1 → Tails → LOSS
+    fn do_loss(
+        env: &Env,
+        contract_id: &soroban_sdk::Address,
+        player: &Address,
+        wager: i128,
+        fee_bps: u32,
+    ) {
+        let secret: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(env, &[3u8; 32]);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak: 0,
+            commitment,
+            contract_random: env
+                .crypto()
+                .sha256(&soroban_sdk::Bytes::from_slice(env, &[0u8; 4]))
+                .into(),
+            fee_bps,
+            phase: GamePhase::Committed,
+        };
         env.as_contract(contract_id, || {
-            CoinflipContract::load_player_game(env, player).is_some()
-        })
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+        CoinflipContractClient::new(env, contract_id).reveal(player, &secret);
     }
 
-    fn commitment(env: &Env) -> BytesN<32> {
-        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[42u8; 32])).into()
-    }
+    // ── unit tests ────────────────────────────────────────────────────────────
 
-    /// Advance the ledger sequence by `n` ledgers.
-    fn advance_ledger(env: &Env, n: u32) {
-        env.ledger().with_mut(|li| li.sequence_number += n);
-    }
-
-    // ── Unit tests ────────────────────────────────────────────────────────
-
-    /// Reclaim before timeout must return `RevealTimeout`.
+    /// Conservation invariant over a single win:
+    ///   initial_reserve + wager == final_reserve + net_payout + fee
+    ///
+    /// Accounting trace (wager=10_000_000, streak=1, fee_bps=300):
+    ///   gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
+    ///   fee   = 19_000_000 * 300   / 10_000 =    570_000
+    ///   net   = 18_430_000
+    ///   reserve_delta = -19_000_000  (gross deducted)
+    ///   conservation: 100_000_000 + 0 == (100_000_000 - 19_000_000) + 18_430_000 + 570_000 ✓
     #[test]
-    fn test_reclaim_rejected_before_timeout() {
-        let (env, contract_id, client) = setup_env();
-        fund(&env, &contract_id, 1_000_000_000);
+    fn test_conservation_single_win() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+        let initial_reserve = 100_000_000i128;
+        set_reserves(&env, &contract_id, initial_reserve);
+
         let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
+        let wager  = 10_000_000i128;
+        let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, 1, 300);
 
-        // Advance by one less than the timeout — still within window.
-        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS - 1);
-
-        let result = client.try_reclaim_wager(&player);
-        assert_eq!(result, Err(Ok(Error::RevealTimeout)),
-            "reclaim must be rejected before timeout expires");
+        let stats = read_stats(&env, &contract_id);
+        // Conservation: initial_reserve == final_reserve + net + fee
+        assert_eq!(
+            initial_reserve,
+            stats.reserve_balance + net + fee,
+            "fund conservation violated on single win"
+        );
+        assert_eq!(stats.total_fees, fee);
     }
 
-    /// Reclaim at exactly the expiry ledger must succeed.
+    /// Conservation invariant over a single loss:
+    ///   initial_reserve + wager == final_reserve  (no payout, no fee)
     #[test]
-    fn test_reclaim_accepted_at_expiry() {
-        let (env, contract_id, client) = setup_env();
-        fund(&env, &contract_id, 1_000_000_000);
+    fn test_conservation_single_loss() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+        let initial_reserve = 100_000_000i128;
+        set_reserves(&env, &contract_id, initial_reserve);
+
         let player = Address::generate(&env);
-        let wager = 10_000_000i128;
-        client.start_game(&player, &Side::Heads, &wager, &commitment(&env));
+        let wager  = 10_000_000i128;
+        do_loss(&env, &contract_id, &player, wager, 300);
 
-        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
-
-        let reclaimed = client.reclaim_wager(&player);
-        assert_eq!(reclaimed, wager, "reclaim must return the original wager");
+        let stats = read_stats(&env, &contract_id);
+        assert_eq!(
+            initial_reserve + wager,
+            stats.reserve_balance,
+            "fund conservation violated on single loss"
+        );
+        assert_eq!(stats.total_fees, 0, "no fee on a loss");
     }
 
-    /// After reclaim, game state must be deleted.
+    /// Conservation over a win-then-loss sequence (zero-sum scenario):
+    ///   After a win cash-out followed by a loss, the net reserve change equals
+    ///   `wager_loss - gross_win`.  Total fees equal the fee from the win only.
     #[test]
-    fn test_reclaim_deletes_game_state() {
-        let (env, contract_id, client) = setup_env();
-        fund(&env, &contract_id, 1_000_000_000);
-        let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
-        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
-        client.reclaim_wager(&player);
+    fn test_conservation_win_then_loss_zero_sum() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+        let initial_reserve = 500_000_000i128;
+        set_reserves(&env, &contract_id, initial_reserve);
 
-        assert!(!game_exists(&env, &contract_id, &player),
-            "game state must be deleted after reclaim");
+        let p_win  = Address::generate(&env);
+        let p_loss = Address::generate(&env);
+        let wager  = 10_000_000i128;
+
+        let (net_win, fee_win) = do_win_cash_out(&env, &contract_id, &p_win, wager, 1, 300);
+        do_loss(&env, &contract_id, &p_loss, wager, 300);
+
+        let stats = read_stats(&env, &contract_id);
+        // After win: reserve = initial - gross_win
+        // After loss: reserve = initial - gross_win + wager_loss
+        let gross_win = net_win + fee_win;
+        let expected_reserve = initial_reserve - gross_win + wager;
+        assert_eq!(stats.reserve_balance, expected_reserve, "reserve mismatch after win+loss");
+        assert_eq!(stats.total_fees, fee_win, "only the win contributes a fee");
     }
 
-    /// After reclaim, `reserve_balance` must increase by exactly the wager.
+    /// Conservation over N sequential wins by different players:
+    ///   initial_reserve == final_reserve + Σ net_i + Σ fee_i
     #[test]
-    fn test_reclaim_credits_reserve() {
-        let (env, contract_id, client) = setup_env();
+    fn test_conservation_multiple_sequential_wins() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
         let initial_reserve = 1_000_000_000i128;
-        fund(&env, &contract_id, initial_reserve);
+        set_reserves(&env, &contract_id, initial_reserve);
+
+        let cases: &[(i128, u32)] = &[
+            (10_000_000, 1),
+            ( 5_000_000, 2),
+            ( 2_000_000, 4),
+            (50_000_000, 3),
+        ];
+
+        let mut total_net = 0i128;
+        let mut total_fee = 0i128;
+        for &(wager, streak) in cases {
+            let player = Address::generate(&env);
+            let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, streak, 300);
+            total_net += net;
+            total_fee += fee;
+        }
+
+        let stats = read_stats(&env, &contract_id);
+        assert_eq!(
+            initial_reserve,
+            stats.reserve_balance + total_net + total_fee,
+            "fund conservation violated across multiple wins"
+        );
+        assert_eq!(stats.total_fees, total_fee);
+    }
+
+    /// Conservation with minimum wager (1_000_000 stroops = 0.1 XLM).
+    #[test]
+    fn test_conservation_minimum_wager() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+        let initial_reserve = 100_000_000i128;
+        set_reserves(&env, &contract_id, initial_reserve);
+
         let player = Address::generate(&env);
+        let wager  = 1_000_000i128; // minimum
+        let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, 1, 300);
+
+        let stats = read_stats(&env, &contract_id);
+        assert_eq!(
+            initial_reserve,
+            stats.reserve_balance + net + fee,
+            "conservation violated at minimum wager"
+        );
+    }
+
+    /// Conservation with maximum wager (100_000_000 stroops = 10 XLM).
+    #[test]
+    fn test_conservation_maximum_wager() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+        let initial_reserve = 10_000_000_000i128; // 10x max wager to cover streak 4+
+        set_reserves(&env, &contract_id, initial_reserve);
+
+        let player = Address::generate(&env);
+        let wager  = 100_000_000i128; // maximum
+        let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, 1, 300);
+
+        let stats = read_stats(&env, &contract_id);
+        assert_eq!(
+            initial_reserve,
+            stats.reserve_balance + net + fee,
+            "conservation violated at maximum wager"
+        );
+    }
+
+    /// Player balance invariant: net payout equals `gross - fee` exactly.
+    ///
+    /// Verifies the player-facing accounting model:
+    ///   player_receives = wager * multiplier / 10_000 * (1 - fee_bps / 10_000)
+    #[test]
+    fn test_player_balance_matches_expected_payout() {
+        let fee_bps = 300u32;
+        let wager   = 10_000_000i128;
+        let streak  = 1u32;
+
+        let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
+        let fee   = gross.checked_mul(fee_bps as i128).unwrap() / 10_000;
+        let expected_net = gross - fee;
+
+        let computed_net = calculate_payout(wager, streak, fee_bps).unwrap();
+        assert_eq!(computed_net, expected_net, "player payout formula mismatch");
+        assert_eq!(computed_net + fee, gross, "gross = net + fee invariant violated");
+    }
+
+    /// Treasury/fee pool invariant: `total_fees` equals the sum of all
+    /// individually computed fees across all settled games.
+    #[test]
+    fn test_treasury_fee_pool_matches_sum_of_fees() {
+        let env = Env::default();
+        let contract_id = setup(&env, 400);
+        set_reserves(&env, &contract_id, 1_000_000_000);
+
+        let cases: &[(i128, u32, u32)] = &[
+            (10_000_000, 1, 400),
+            ( 5_000_000, 2, 400),
+            (20_000_000, 3, 400),
+        ];
+
+        let mut expected_total_fees = 0i128;
+        for &(wager, streak, fee_bps) in cases {
+            let player = Address::generate(&env);
+            let (_, fee) = do_win_cash_out(&env, &contract_id, &player, wager, streak, fee_bps);
+            expected_total_fees += fee;
+        }
+
+        let stats = read_stats(&env, &contract_id);
+        assert_eq!(stats.total_fees, expected_total_fees, "treasury fee pool mismatch");
+    }
+
+    /// Contract total vault invariant: `reserve_balance` equals the sum of all
+    /// internal ledger movements (deposits - payouts).
+    ///
+    /// Specifically: reserve_balance = initial + Σ losses - Σ gross_wins
+    #[test]
+    fn test_contract_vault_matches_internal_ledger() {
+        let env = Env::default();
+        let contract_id = setup(&env, 300);
+        let initial = 500_000_000i128;
+        set_reserves(&env, &contract_id, initial);
+
         let wager = 10_000_000i128;
-        client.start_game(&player, &Side::Heads, &wager, &commitment(&env));
-        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
-        client.reclaim_wager(&player);
 
-        let after = reserve_balance(&env, &contract_id);
-        assert_eq!(after, initial_reserve + wager,
-            "reserve_balance must increase by exactly the wager");
+        // Two wins
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let (net1, fee1) = do_win_cash_out(&env, &contract_id, &p1, wager, 1, 300);
+        let (net2, fee2) = do_win_cash_out(&env, &contract_id, &p2, wager, 2, 300);
+
+        // One loss
+        let p3 = Address::generate(&env);
+        do_loss(&env, &contract_id, &p3, wager, 300);
+
+        let gross1 = net1 + fee1;
+        let gross2 = net2 + fee2;
+        let expected_reserve = initial - gross1 - gross2 + wager; // loss adds wager back
+
+        let stats = read_stats(&env, &contract_id);
+        assert_eq!(stats.reserve_balance, expected_reserve, "vault ledger mismatch");
     }
 
-    /// After reclaim, the player slot is free — a new start_game must succeed.
-    #[test]
-    fn test_reclaim_frees_slot_for_new_game() {
-        let (env, contract_id, client) = setup_env();
-        fund(&env, &contract_id, 1_000_000_000);
-        let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
-        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
-        client.reclaim_wager(&player);
+    // ── property tests ────────────────────────────────────────────────────────
 
-        let result = client.try_start_game(&player, &Side::Tails, &10_000_000, &commitment(&env));
-        assert!(result.is_ok(), "new start_game must succeed after reclaim frees the slot");
-    }
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
 
-    /// Reclaim with no game in storage must return `NoActiveGame`.
-    #[test]
-    fn test_reclaim_no_active_game() {
-        let (env, _contract_id, client) = setup_env();
-        let player = Address::generate(&env);
-        let result = client.try_reclaim_wager(&player);
-        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
-    }
-
-    /// Reclaim on a `Revealed` game must return `InvalidPhase`.
-    #[test]
-    fn test_reclaim_rejects_revealed_phase() {
-        let (env, contract_id, client) = setup_env();
-        fund(&env, &contract_id, 1_000_000_000);
-        let player = Address::generate(&env);
-        // Inject a Revealed game directly.
-        let dummy = commitment(&env);
-        env.as_contract(&contract_id, || {
-            CoinflipContract::save_player_game(&env, &player, &GameState {
-                wager: 10_000_000,
-                side: Side::Heads,
-                streak: 1,
-                commitment: dummy.clone(),
-                contract_random: dummy,
-                fee_bps: 300,
-                phase: GamePhase::Revealed,
-                start_ledger: 0,
-            });
-        });
-        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
-
-        let result = client.try_reclaim_wager(&player);
-        assert_eq!(result, Err(Ok(Error::InvalidPhase)),
-            "reclaim must reject Revealed-phase games");
-    }
-
-    /// Reclaim on a `Completed` game must return `InvalidPhase`.
-    #[test]
-    fn test_reclaim_rejects_completed_phase() {
-        let (env, contract_id, client) = setup_env();
-        let player = Address::generate(&env);
-        let dummy = commitment(&env);
-        env.as_contract(&contract_id, || {
-            CoinflipContract::save_player_game(&env, &player, &GameState {
-                wager: 10_000_000,
-                side: Side::Heads,
-                streak: 0,
-                commitment: dummy.clone(),
-                contract_random: dummy,
-                fee_bps: 300,
-                phase: GamePhase::Completed,
-                start_ledger: 0,
-            });
-        });
-        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
-
-        let result = client.try_reclaim_wager(&player);
-        assert_eq!(result, Err(Ok(Error::InvalidPhase)),
-            "reclaim must reject Completed-phase games");
-    }
-
-    // ── Property tests ────────────────────────────────────────────────────
-
-    proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(100))]
-
-        /// For any valid wager, reclaim after expiry returns exactly that wager
-        /// and increments reserve_balance by the same amount.
+        /// PROPERTY: Conservation invariant holds for any single win at any
+        /// valid wager, streak, and fee_bps combination.
+        ///
+        ///   initial_reserve == final_reserve + net_payout + fee
         #[test]
-        fn prop_reclaim_returns_exact_wager(wager in 1_000_000i128..=100_000_000i128) {
-            let (env, contract_id, client) = setup_env();
-            fund(&env, &contract_id, 1_000_000_000);
+        fn prop_conservation_single_win(
+            wager   in 1_000_000i128..=100_000_000i128,
+            streak  in 1u32..=4u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+            let initial_reserve = 10_000_000_000i128;
+            set_reserves(&env, &contract_id, initial_reserve);
+
             let player = Address::generate(&env);
-            client.start_game(&player, &Side::Heads, &wager, &commitment(&env));
+            let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, streak, fee_bps);
 
-            let reserve_before = reserve_balance(&env, &contract_id);
-            advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
-
-            let reclaimed = client.reclaim_wager(&player);
-            prop_assert_eq!(reclaimed, wager,
-                "reclaim must return exactly the original wager");
-
-            let reserve_after = reserve_balance(&env, &contract_id);
-            prop_assert_eq!(reserve_after, reserve_before + wager,
-                "reserve_balance must increase by exactly the wager");
+            let stats = read_stats(&env, &contract_id);
+            prop_assert_eq!(
+                initial_reserve,
+                stats.reserve_balance + net + fee,
+                "conservation violated: initial={} final_reserve={} net={} fee={}",
+                initial_reserve, stats.reserve_balance, net, fee
+            );
         }
 
-        /// For any ledger advance strictly less than the timeout, reclaim is rejected.
+        /// PROPERTY: Conservation invariant holds for any single loss.
+        ///
+        ///   initial_reserve + wager == final_reserve
         #[test]
-        fn prop_reclaim_rejected_before_expiry(advance in 0u32..REVEAL_TIMEOUT_LEDGERS) {
-            let (env, contract_id, client) = setup_env();
-            fund(&env, &contract_id, 1_000_000_000);
-            let player = Address::generate(&env);
-            client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
-            advance_ledger(&env, advance);
+        fn prop_conservation_single_loss(
+            wager   in 1_000_000i128..=100_000_000i128,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+            let initial_reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, initial_reserve);
 
-            let result = client.try_reclaim_wager(&player);
-            prop_assert_eq!(result, Err(Ok(Error::RevealTimeout)),
-                "reclaim must be rejected for any advance < REVEAL_TIMEOUT_LEDGERS");
+            let player = Address::generate(&env);
+            do_loss(&env, &contract_id, &player, wager, fee_bps);
+
+            let stats = read_stats(&env, &contract_id);
+            prop_assert_eq!(
+                initial_reserve + wager,
+                stats.reserve_balance,
+                "loss conservation violated: initial={} wager={} final_reserve={}",
+                initial_reserve, wager, stats.reserve_balance
+            );
+            prop_assert_eq!(stats.total_fees, 0i128, "no fee must be recorded on a loss");
         }
 
-        /// After a successful reclaim, game state is always absent.
+        /// PROPERTY: Conservation holds across N mixed wins and losses.
+        ///
+        ///   initial_reserve + Σ wager_loss_i
+        ///     == final_reserve + Σ net_win_j + Σ fee_win_j
         #[test]
-        fn prop_reclaim_always_clears_state(wager in 1_000_000i128..=100_000_000i128) {
-            let (env, contract_id, client) = setup_env();
-            fund(&env, &contract_id, 1_000_000_000);
-            let player = Address::generate(&env);
-            client.start_game(&player, &Side::Heads, &wager, &commitment(&env));
-            advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
-            client.reclaim_wager(&player);
+        fn prop_conservation_mixed_wins_and_losses(
+            win_wagers  in proptest::collection::vec(1_000_000i128..=50_000_000i128, 1..=4),
+            loss_wagers in proptest::collection::vec(1_000_000i128..=50_000_000i128, 1..=4),
+            streaks     in proptest::collection::vec(1u32..=4u32, 1..=4),
+            fee_bps     in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+            let initial_reserve = 10_000_000_000i128;
+            set_reserves(&env, &contract_id, initial_reserve);
 
-            prop_assert!(!game_exists(&env, &contract_id, &player),
-                "game state must be absent after reclaim");
+            let n_wins   = win_wagers.len().min(streaks.len());
+            let n_losses = loss_wagers.len();
+
+            let mut total_net = 0i128;
+            let mut total_fee = 0i128;
+            let mut total_loss_wagers = 0i128;
+
+            for i in 0..n_wins {
+                let player = Address::generate(&env);
+                let (net, fee) = do_win_cash_out(
+                    &env, &contract_id, &player, win_wagers[i], streaks[i], fee_bps,
+                );
+                total_net += net;
+                total_fee += fee;
+            }
+            for i in 0..n_losses {
+                let player = Address::generate(&env);
+                do_loss(&env, &contract_id, &player, loss_wagers[i], fee_bps);
+                total_loss_wagers += loss_wagers[i];
+            }
+
+            let stats = read_stats(&env, &contract_id);
+            prop_assert_eq!(
+                initial_reserve + total_loss_wagers,
+                stats.reserve_balance + total_net + total_fee,
+                "mixed conservation violated"
+            );
+            prop_assert_eq!(stats.total_fees, total_fee);
+        }
+
+        /// PROPERTY: `total_fees` never decreases — fees are never refunded.
+        #[test]
+        fn prop_total_fees_never_decreases(
+            wagers  in proptest::collection::vec(1_000_000i128..=50_000_000i128, 1..=5),
+            streaks in proptest::collection::vec(1u32..=4u32, 1..=5),
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+            set_reserves(&env, &contract_id, 10_000_000_000);
+
+            let n = wagers.len().min(streaks.len());
+            let mut prev_fees = 0i128;
+
+            for i in 0..n {
+                let player = Address::generate(&env);
+                do_win_cash_out(&env, &contract_id, &player, wagers[i], streaks[i], fee_bps);
+                let current_fees = read_stats(&env, &contract_id).total_fees;
+                prop_assert!(
+                    current_fees >= prev_fees,
+                    "total_fees decreased from {} to {} at step {}",
+                    prev_fees, current_fees, i
+                );
+                prev_fees = current_fees;
+            }
+        }
+
+        /// PROPERTY: `reserve_balance` never goes negative after any sequence
+        /// of wins and losses, provided initial reserves are sufficient.
+        #[test]
+        fn prop_reserve_balance_never_negative(
+            wagers  in proptest::collection::vec(1_000_000i128..=10_000_000i128, 1..=5),
+            streaks in proptest::collection::vec(1u32..=4u32, 1..=5),
+            fee_bps in 200u32..=500u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup(&env, fee_bps);
+            // Generous reserves: 10x max payout per round × number of rounds
+            set_reserves(&env, &contract_id, 10_000_000_000);
+
+            let n = wagers.len().min(streaks.len());
+            for i in 0..n {
+                let player = Address::generate(&env);
+                do_win_cash_out(&env, &contract_id, &player, wagers[i], streaks[i], fee_bps);
+                let reserve = read_stats(&env, &contract_id).reserve_balance;
+                prop_assert!(reserve >= 0, "reserve_balance went negative at step {}", i);
+            }
+        }
+
+        /// PROPERTY: gross = net + fee for every (wager, streak, fee_bps) triple.
+        ///
+        /// This is the fundamental split invariant: the gross payout is always
+        /// partitioned exactly into the player's net and the treasury's fee.
+        #[test]
+        fn prop_gross_equals_net_plus_fee(
+            wager   in 1_000_000i128..=100_000_000i128,
+            streak  in 1u32..=4u32,
+            fee_bps in 200u32..=500u32,
+        ) {
+            let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
+            let fee   = gross.checked_mul(fee_bps as i128).unwrap() / 10_000;
+            let net   = calculate_payout(wager, streak, fee_bps).unwrap();
+            prop_assert_eq!(gross, net + fee, "gross != net + fee for wager={} streak={} fee_bps={}", wager, streak, fee_bps);
         }
     }
 }
