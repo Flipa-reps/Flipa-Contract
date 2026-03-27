@@ -1,3 +1,32 @@
+//! # Tossd Coinflip Contract
+//!
+//! Provably fair coinflip game on the Stellar/Soroban smart contract platform.
+//!
+//! ## Architecture
+//!
+//! The contract is a single `lib.rs` module containing:
+//! - Public API functions exposed via `#[contractimpl]`
+//! - Supporting types (`GameState`, `ContractConfig`, `ContractStats`, `Error`, …)
+//! - Pure helper functions (`get_multiplier`, `calculate_payout`, `verify_commitment`)
+//! - A comprehensive test suite (unit, property-based, integration harness)
+//!
+//! ## Commit-Reveal Randomness
+//!
+//! 1. Player hashes a secret: `commitment = SHA-256(secret)`
+//! 2. Player calls `start_game` with the commitment; contract stores
+//!    `contract_random = SHA-256(ledger_sequence)`.
+//! 3. Player calls `reveal(secret)`; contract verifies the commitment and
+//!    derives the outcome from `SHA-256(secret || contract_random)`.
+//!
+//! Neither party can unilaterally control the outcome:
+//! - The player cannot change their secret after committing.
+//! - The contract cannot change the ledger sequence after the game starts.
+//!
+//! ## Error Code Stability
+//!
+//! All [`Error`] variants map to stable `u32` codes (see [`error_codes`]).
+//! These codes are part of the public protocol and must not change across upgrades.
+
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Bytes, BytesN, Env};
@@ -178,22 +207,41 @@ pub enum Error {
     AlreadyInitialized = 51,
 }
 
-/// Side choice for the coinflip
+/// The player's chosen side for a coinflip.
+///
+/// Submitted at game creation and compared against the derived outcome
+/// in `reveal` to determine win/loss.
+///
+/// Serialized as `u32` via `#[repr(u32)]` for stable on-chain storage.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Side {
+    /// Heads — discriminant 0.
     Heads = 0,
+    /// Tails — discriminant 1.
     Tails = 1,
 }
 
-/// Game phase tracking
+/// Lifecycle phase of a player's active game.
+///
+/// State transitions:
+/// ```text
+/// Committed ──(reveal wins)──► Revealed ──(cash_out / claim_winnings)──► Completed
+///           ──(reveal loses)──────────────────────────────────────────► (deleted)
+///           ──(continue_streak)──► Committed  (streak preserved)
+/// ```
+///
+/// Only `Completed` games may be replaced by a new `start_game` call.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum GamePhase {
-    Committed,    // Waiting for reveal
-    Revealed,     // Outcome determined, awaiting decision
-    Completed,    // Game ended
+    /// Wager placed and commitment recorded; waiting for the player to call `reveal`.
+    Committed,
+    /// Outcome determined; player must call `cash_out`, `claim_winnings`, or `continue_streak`.
+    Revealed,
+    /// Game has ended (win settled or loss forfeited); slot is available for a new game.
+    Completed,
 }
 
 /// Per-player game state persisted in `Committed` phase at game start.
@@ -225,19 +273,32 @@ pub struct GameState {
     pub phase: GamePhase,
 }
 
-/// Contract configuration
+/// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
+///
+/// All fields are set at `initialize` time and may be updated by the admin
+/// via `set_fee`, `set_treasury`, `set_wager_limits`, and `set_paused`.
+/// In-flight games snapshot `fee_bps` into [`GameState`] so admin changes
+/// never retroactively alter active game payouts.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractConfig {
-    pub admin: Address,           // Administrator address
-    pub treasury: Address,        // Fee collection address
-    pub token: Address,           // SAC token address for wager custody (XLM or any SEP-41 token)
-    pub fee_bps: u32,            // Fee in basis points (200-500 = 2-5%)
-    pub min_wager: i128,         // Minimum wager in stroops
-    pub max_wager: i128,         // Maximum wager in stroops
-    pub paused: bool,            // Emergency pause flag
+    /// Administrator address; the only account permitted to call admin functions.
+    pub admin: Address,
+    /// Fee collection address; receives the protocol fee on every settled win.
+    pub treasury: Address,
+    /// SAC token address used for wager custody (XLM or any SEP-41 token).
+    pub token: Address,
+    /// Protocol fee in basis points (200–500 = 2–5%).
+    pub fee_bps: u32,
+    /// Inclusive minimum wager in stroops.
+    pub min_wager: i128,
+    /// Inclusive maximum wager in stroops.
+    pub max_wager: i128,
+    /// Emergency pause flag; when `true`, `start_game` is rejected.
+    pub paused: bool,
 }
 
+<<<<<<< feature/cash-out-stats
 /// Global statistics tracking the overall economic activity and solvency of the contract.
 ///
 /// Invariants and meaning:
@@ -255,15 +316,39 @@ pub struct ContractStats {
     pub total_volume: i128,      // Total XLM wagered
     pub total_fees: i128,        // Cumulative fees collected in stroops
     pub reserve_balance: i128,   // Available reserves to cover payouts
+=======
+/// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
+///
+/// Updated atomically alongside game state transitions.
+/// `reserve_balance` is the authoritative on-chain reserve figure used for
+/// solvency checks in `start_game` and `continue_streak`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractStats {
+    /// Cumulative count of games started (incremented in `start_game`).
+    pub total_games: u64,
+    /// Cumulative XLM wagered across all games, in stroops.
+    pub total_volume: i128,
+    /// Cumulative protocol fees collected across all settled wins, in stroops.
+    pub total_fees: i128,
+    /// Current contract reserve balance in stroops; decremented on payouts,
+    /// incremented when the house wins (loss forfeiture).
+    pub reserve_balance: i128,
+>>>>>>> master
 }
 
-/// Storage keys for contract data
+/// Persistent storage key variants for the contract's data model.
+///
+/// Used with `env.storage().persistent()` for all reads and writes.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageKey {
-    Config,                    // Global configuration
-    Stats,                     // Global statistics
-    PlayerGame(Address),       // Per-player game state
+    /// Global contract configuration ([`ContractConfig`]).
+    Config,
+    /// Global aggregate statistics ([`ContractStats`]).
+    Stats,
+    /// Per-player game state ([`GameState`]), keyed by player address.
+    PlayerGame(Address),
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -279,6 +364,25 @@ const MULTIPLIER_STREAK_1: u32 = 19_000; // 1.9x
 const MULTIPLIER_STREAK_2: u32 = 35_000; // 3.5x
 const MULTIPLIER_STREAK_3: u32 = 60_000; // 6.0x
 const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
+
+/// TTL constants for persistent storage entries.
+///
+/// Soroban persistent storage entries expire after `ledger_ttl` ledgers without
+/// a TTL extension.  We extend on every read/write to keep active data live.
+///
+/// Ledger cadence: ~5 seconds per ledger on Stellar mainnet.
+///
+/// | Constant              | Ledgers   | Approx duration |
+/// |-----------------------|-----------|-----------------|
+/// | `TTL_THRESHOLD`       | 100_000   | ~5.8 days       |
+/// | `TTL_EXTEND_TO`       | 500_000   | ~29 days        |
+///
+/// Tradeoff: extending on every access costs a small amount of additional
+/// compute budget per call, but prevents data loss for active games and
+/// config/stats entries.  The threshold avoids redundant extend calls when
+/// the TTL is already healthy.
+const TTL_THRESHOLD: u32 = 100_000;
+const TTL_EXTEND_TO: u32 = 500_000;
 
 /// Returns the gross payout multiplier (in basis points, 10_000 = 1x)
 /// for the given win `streak` level.
@@ -296,7 +400,9 @@ pub fn get_multiplier(streak: u32) -> u32 {
     }
 }
 
-/// Calculates the net payout for a winning streak.
+/// Calculates the full payout breakdown for a winning streak.
+///
+/// Returns `(gross, fee, net)` in stroops, or `None` on arithmetic overflow.
 ///
 /// Formulas (all in stroops):
 /// - gross = wager × multiplier_bps / 10_000
@@ -309,6 +415,29 @@ pub fn get_multiplier(streak: u32) -> u32 {
 /// 3. `fee_bps` <= 10_000 is mathematically required to avoid net < 0, enforced by config guards.
 /// 4. Subtractions are safe as `fee` is derived as a proportion of `gross` (<= `gross`).
 ///
+/// # Storage optimization note
+/// Callers that need gross, fee, and net should call this once rather than
+/// calling `calculate_payout` and then recomputing gross/fee separately.
+/// This eliminates two redundant multiplier lookups and two checked_div operations
+/// per settlement call.
+///
+/// # Arguments
+/// - `wager`   – original wager in stroops (must be > 0)
+/// - `streak`  – current win streak (passed to `get_multiplier`)
+/// - `fee_bps` – protocol fee in basis points (200–500)
+pub fn calculate_payout_breakdown(wager: i128, streak: u32, fee_bps: u32) -> Option<(i128, i128, i128)> {
+    let multiplier = get_multiplier(streak) as i128;
+    let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
+    let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
+    let net   = gross.checked_sub(fee)?;
+    Some((gross, fee, net))
+}
+
+/// Calculates the net payout for a winning streak.
+///
+/// Convenience wrapper around [`calculate_payout_breakdown`] for callers that
+/// only need the net amount (e.g. read-only queries).
+///
 /// Returns `None` if any intermediate multiplication overflows `i128`.
 ///
 /// # Arguments
@@ -316,10 +445,7 @@ pub fn get_multiplier(streak: u32) -> u32 {
 /// - `streak`  – current win streak (passed to `get_multiplier`)
 /// - `fee_bps` – protocol fee in basis points (200–500)
 pub fn calculate_payout(wager: i128, streak: u32, fee_bps: u32) -> Option<i128> {
-    let multiplier = get_multiplier(streak) as i128;
-    let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
-    let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
-    gross.checked_sub(fee)
+    calculate_payout_breakdown(wager, streak, fee_bps).map(|(_, _, net)| net)
 }
 
 /// Helper to verify a player's commitment hash.
@@ -338,6 +464,35 @@ pub fn verify_commitment(env: &Env, secret: &Bytes, commitment: &BytesN<32>) -> 
     &hash == commitment
 }
 
+/// Provably fair coinflip game contract for the Stellar/Soroban platform.
+///
+/// ## Public API
+///
+/// | Function           | Caller  | Description                                              |
+/// |--------------------|---------|----------------------------------------------------------|
+/// | `initialize`       | deployer| One-time setup: config, token, fee, wager bounds         |
+/// | `start_game`       | player  | Place a wager and submit a commitment hash               |
+/// | `reveal`           | player  | Reveal secret to determine win/loss outcome              |
+/// | `cash_out`         | player  | Settle a win without a token transfer (returns amount)   |
+/// | `claim_winnings`   | player  | Settle a win with on-chain token transfer                |
+/// | `continue_streak`  | player  | Risk current winnings for the next streak multiplier     |
+/// | `set_paused`       | admin   | Enable/disable new game creation                         |
+/// | `set_treasury`     | admin   | Update the fee collection address                        |
+/// | `set_wager_limits` | admin   | Update inclusive min/max wager bounds                    |
+/// | `set_fee`          | admin   | Update the protocol fee (200–500 bps)                    |
+///
+/// ## Randomness Model
+///
+/// Outcomes are derived from `SHA-256(player_secret || contract_random)` where
+/// `contract_random = SHA-256(ledger_sequence)`.  Neither party can unilaterally
+/// control the result: the player commits before the ledger sequence is known,
+/// and the contract cannot change the sequence after the commitment is stored.
+///
+/// ## Reserve Solvency
+///
+/// Before accepting any new game or streak continuation, the contract verifies
+/// that `reserve_balance >= worst_case_payout` (streak 4+ multiplier).
+/// This prevents the contract from accepting bets it cannot honour.
 #[contract]
 pub struct CoinflipContract;
 
@@ -400,46 +555,58 @@ impl CoinflipContract {
         };
         
         env.storage().persistent().set(&StorageKey::Config, &config);
+        env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
         env.storage().persistent().set(&StorageKey::Stats, &stats);
+        env.storage().persistent().extend_ttl(&StorageKey::Stats, TTL_THRESHOLD, TTL_EXTEND_TO);
         
         Ok(())
     }
     
-    // Storage helper functions (internal use)
+    // ── Internal storage helpers ────────────────────────────────────────────
+
+    /// Persist `config` to permanent storage.
     fn save_config(env: &Env, config: &ContractConfig) {
         env.storage().persistent().set(&StorageKey::Config, config);
+        env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    /// Load the contract configuration. Panics if the contract is not initialized.
     fn load_config(env: &Env) -> ContractConfig {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::Config)
-            .unwrap()
+        let key = StorageKey::Config;
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().get(&key).unwrap()
     }
 
+    /// Persist `stats` to permanent storage.
     fn save_stats(env: &Env, stats: &ContractStats) {
         env.storage().persistent().set(&StorageKey::Stats, stats);
+        env.storage().persistent().extend_ttl(&StorageKey::Stats, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    /// Load aggregate contract statistics. Panics if the contract is not initialized.
     fn load_stats(env: &Env) -> ContractStats {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::Stats)
-            .unwrap()
+        let key = StorageKey::Stats;
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().get(&key).unwrap()
     }
 
+    /// Persist a player's game state to permanent storage.
     fn save_player_game(env: &Env, player: &Address, game: &GameState) {
-        env.storage()
-            .persistent()
-            .set(&StorageKey::PlayerGame(player.clone()), game);
+        let key = StorageKey::PlayerGame(player.clone());
+        env.storage().persistent().set(&key, game);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    /// Load a player's game state. Returns `None` if no game exists for `player`.
     fn load_player_game(env: &Env, player: &Address) -> Option<GameState> {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::PlayerGame(player.clone()))
+        let key = StorageKey::PlayerGame(player.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.storage().persistent().get(&key)
     }
 
+    /// Remove a player's game state from storage (called on loss or after settlement).
     fn delete_player_game(env: &Env, player: &Address) {
         env.storage()
             .persistent()
@@ -633,20 +800,38 @@ impl CoinflipContract {
         }
     }
 
-    /// Claim winnings after a successful reveal.
+    /// Claim winnings after a successful reveal via on-chain token transfer.
     ///
-    /// Process:
-    /// 1. Verify game is in Revealed phase (player won)
-    /// 2. Calculate net payout (gross - fee)
-    /// 3. Transfer net payout to player
-    /// 4. Transfer fee to treasury
-    /// 5. Update contract reserves and stats
-    /// 6. Reset game to Completed phase
+    /// This is the transfer-backed settlement path.  For a no-transfer accounting
+    /// settlement (e.g. in test harnesses or off-chain integrations), use `cash_out`.
     ///
-    /// Errors:
-    /// - NoActiveGame: player has no game
-    /// - InvalidPhase: game not in Revealed phase (preventing double-claim)
-    /// - TransferFailed: token transfer fails
+    /// # Process
+    /// 1. Verify the game is in `Revealed` phase with a positive streak (player won).
+    /// 2. Calculate gross payout (`wager × multiplier / 10_000`) and fee (`gross × fee_bps / 10_000`).
+    /// 3. Verify `reserve_balance >= gross_payout` to ensure solvency.
+    /// 4. Transfer `net_payout` (gross − fee) to `player` via the SAC token client.
+    /// 5. Transfer `fee_amount` to `config.treasury`.
+    /// 6. Deduct `gross_payout` from `reserve_balance`; add `fee_amount` to `total_fees`.
+    /// 7. Advance game phase to `Completed`.
+    ///
+    /// # Arguments
+    /// - `player` – must authorize; must have an active game in `Revealed` phase
+    ///
+    /// # Returns
+    /// `Ok(())` on successful settlement.
+    ///
+    /// # Errors
+    /// | Error                  | Condition                                              |
+    /// |------------------------|--------------------------------------------------------|
+    /// | `NoActiveGame`         | No game record exists for `player`                     |
+    /// | `InvalidPhase`         | Game is not in `Revealed` phase                        |
+    /// | `InsufficientReserves` | `reserve_balance < gross_payout` or arithmetic overflow|
+    /// | `TransferFailed`       | SAC token transfer fails (propagated from token client)|
+    ///
+    /// # Note on streak == 0
+    /// A `Revealed` game with `streak == 0` indicates a loss; the game record is
+    /// deleted by `reveal` on the loss path, so `claim_winnings` will return
+    /// `NoActiveGame` rather than a dedicated loss error.
     pub fn claim_winnings(
         env: Env,
         player: Address,
@@ -664,19 +849,12 @@ impl CoinflipContract {
         let config = Self::load_config(&env);
         let token_client = token::Client::new(&env, &config.token);
 
-        // Calculate payout
-        let net_payout = calculate_payout(game.wager, game.streak, game.fee_bps)
-            .ok_or(Error::InsufficientReserves)?;
-
-        // Calculate gross payout and fee separately for accounting
-        let gross_payout = game.wager
-            .checked_mul(get_multiplier(game.streak) as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
-        let fee_amount = gross_payout
-            .checked_mul(game.fee_bps as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
+        // Single-pass payout breakdown: gross, fee, and net computed together to
+        // avoid the duplicate multiplier lookup + two checked_div calls that would
+        // result from calling calculate_payout and then recomputing gross/fee.
+        let (gross_payout, fee_amount, net_payout) =
+            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+                .ok_or(Error::InsufficientReserves)?;
 
         // Check sufficient reserves
         let stats = Self::load_stats(&env);
@@ -704,6 +882,7 @@ impl CoinflipContract {
         Ok(())
     }
 
+<<<<<<< feature/cash-out-stats
     /// Cash out winnings after a successful reveal (computes payout and cleans up state).
     ///
     /// # Pre-Execution Invariants & Guards
@@ -727,6 +906,31 @@ impl CoinflipContract {
     ///                        to fail with `NoActiveGame`.
     /// - **Zero Payouts**: If the computed net payout ends up being zero (e.g., due to rounding
     ///                     or zero wager), the state is still cleared and no reserves are deducted.
+=======
+    /// Cash out winnings after a successful reveal (accounting-only, no token transfer).
+    ///
+    /// Settles the game by updating reserve and fee accounting without issuing
+    /// an on-chain token transfer.  Use `claim_winnings` for the transfer-backed path.
+    ///
+    /// # Arguments
+    /// - `player` – must authorize; must have an active game in `Revealed` phase
+    ///
+    /// # Returns
+    /// `Ok(net_payout)` — the net payout amount in stroops on success.
+    ///
+    /// # Guards (evaluated in order, no state mutation on failure)
+    /// 1. `NoActiveGame`                – no game record exists for `player`
+    /// 2. `InvalidPhase`                – game is not in `Revealed` phase
+    /// 3. `NoWinningsToClaimOrContinue` – `streak == 0` (player lost the last flip)
+    ///
+    /// # Errors
+    /// | Error                          | Condition                                        |
+    /// |--------------------------------|--------------------------------------------------|
+    /// | `NoActiveGame`                 | No game record exists for `player`               |
+    /// | `InvalidPhase`                 | Game is not in `Revealed` phase                  |
+    /// | `NoWinningsToClaimOrContinue`  | `streak == 0` — loss state, nothing to cash out  |
+    /// | `InsufficientReserves`         | Arithmetic overflow in payout calculation        |
+>>>>>>> master
     pub fn cash_out(
         env: Env,
         player: Address,
@@ -744,21 +948,16 @@ impl CoinflipContract {
             return Err(Error::NoWinningsToClaimOrContinue);
         }
 
-        let net_payout = calculate_payout(game.wager, game.streak, game.fee_bps)
-            .ok_or(Error::InsufficientReserves)?;
-
-        let gross = game.wager
-            .checked_mul(get_multiplier(game.streak) as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
-        let fee = gross
-            .checked_mul(game.fee_bps as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
+        // Single-pass payout breakdown: gross, fee, and net computed together to
+        // avoid the duplicate multiplier lookup + two checked_div calls that would
+        // result from calling calculate_payout and then recomputing gross/fee.
+        let (gross, fee, net_payout) =
+            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+                .ok_or(Error::InsufficientReserves)?;
 
         let mut stats = Self::load_stats(&env);
         stats.reserve_balance = stats.reserve_balance
-            .checked_sub(net_payout)
+            .checked_sub(gross)
             .ok_or(Error::InsufficientReserves)?;
         stats.total_fees = stats.total_fees
             .checked_add(fee)
@@ -772,6 +971,39 @@ impl CoinflipContract {
     }
 
     /// Continue to the next streak level after a confirmed win.
+    ///
+    /// ## Continue-State Transition
+    ///
+    /// `continue_streak` is the bridge between the `Revealed` and `Committed`
+    /// phases for a winning player who chooses to risk their winnings on another
+    /// flip rather than cash out.
+    ///
+    /// ### Phase transition
+    ///
+    /// ```text
+    /// Revealed (streak ≥ 1)  ──continue_streak──►  Committed
+    /// ```
+    ///
+    /// ### What is preserved
+    ///
+    /// | Field            | Behaviour                                              |
+    /// |------------------|--------------------------------------------------------|
+    /// | `wager`          | Unchanged — the original bet stays locked              |
+    /// | `streak`         | Unchanged — incremented only by `reveal` on a win      |
+    /// | `fee_bps`        | Unchanged — snapshot from game creation is honoured    |
+    /// | `side`           | Unchanged — player's chosen side carries over          |
+    ///
+    /// ### What is replaced
+    ///
+    /// | Field            | New value                                              |
+    /// |------------------|--------------------------------------------------------|
+    /// | `commitment`     | `new_commitment` supplied by the caller                |
+    /// | `contract_random`| Fresh SHA-256 of the current ledger sequence number    |
+    /// | `phase`          | `GamePhase::Committed`                                 |
+    ///
+    /// Refreshing `contract_random` on every continue call is a security
+    /// requirement: it prevents a player from reusing a previously observed
+    /// contract contribution to predict the next outcome.
     ///
     /// ## Eligibility rules
     ///
@@ -835,8 +1067,8 @@ impl CoinflipContract {
             return Err(Error::InvalidCommitment);
         }
 
-        // Guard 5: reserves must cover the next streak's worst-case payout
-        let config = Self::load_config(&env);
+        // Guard 5: reserves must cover the next streak's worst-case payout.
+        // Config is not needed here — all required data (wager, streak) is in GameState.
         let stats = Self::load_stats(&env);
 
         let next_streak = game.streak.saturating_add(1);
@@ -861,9 +1093,6 @@ impl CoinflipContract {
         game.contract_random = contract_random.into();
 
         Self::save_player_game(&env, &player, &game);
-
-        // suppress unused-variable warning for config (loaded for future use)
-        let _ = config;
 
         Ok(())
     }
@@ -1099,6 +1328,39 @@ mod tests {
     #[test]
     fn test_calculate_payout_zero_wager() {
         assert_eq!(calculate_payout(0, 1, 300), Some(0));
+    }
+
+    #[test]
+    fn test_calculate_payout_breakdown_streak_1() {
+        // wager=10_000_000, streak=1 (1.9x), fee=300bps (3%)
+        // gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
+        // fee   = 19_000_000 * 300  / 10_000 =    570_000
+        // net   = 18_430_000
+        assert_eq!(
+            calculate_payout_breakdown(10_000_000, 1, 300),
+            Some((19_000_000, 570_000, 18_430_000))
+        );
+    }
+
+    #[test]
+    fn test_calculate_payout_breakdown_net_equals_calculate_payout() {
+        // calculate_payout must return the same net as the breakdown helper
+        for (wager, streak, fee_bps) in [(10_000_000, 1, 300), (5_000_000, 2, 500), (1_000_000, 4, 200)] {
+            let (_, _, net) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap();
+            assert_eq!(calculate_payout(wager, streak, fee_bps), Some(net));
+        }
+    }
+
+    #[test]
+    fn test_calculate_payout_breakdown_gross_minus_fee_equals_net() {
+        // Invariant: gross - fee == net for all valid inputs
+        let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 3, 400).unwrap();
+        assert_eq!(gross - fee, net);
+    }
+
+    #[test]
+    fn test_calculate_payout_breakdown_overflow_returns_none() {
+        assert_eq!(calculate_payout_breakdown(i128::MAX, 1, 300), None);
     }
 
     #[test]
@@ -2008,6 +2270,266 @@ mod tests {
         let expected = calculate_payout(10_000_000, 1, 500).unwrap();
         let payout = client.try_cash_out(&player);
         assert_eq!(payout, Ok(Ok(expected)));
+    }
+
+    // ── continue_streak unit tests ───────────────────────────────────────────
+    //
+    // These tests cover the continue-state transition:
+    //   Revealed (win) → Committed
+    //
+    // Invariants verified:
+    //   - phase resets to Committed
+    //   - new commitment is persisted
+    //   - new contract_random is derived and persisted (differs from old value)
+    //   - wager is preserved unchanged
+    //   - streak is preserved unchanged (not reset, not incremented)
+    //   - no state mutation on any guard failure
+
+    // ── Guard 1: NoActiveGame ────────────────────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_no_active_game() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    // ── Guard 2: InvalidPhase ────────────────────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_committed_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
+
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    #[test]
+    fn test_continue_streak_rejects_completed_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Completed, 1, 10_000_000);
+
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    // ── Guard 3: NoWinningsToClaimOrContinue ─────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_streak_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Revealed with streak == 0 means the player lost — continuation not allowed.
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
+
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
+    }
+
+    // ── Guard 4: InvalidCommitment ───────────────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_all_zero_commitment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 10_000_000);
+
+        let zero_commitment = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_continue_streak(&player, &zero_commitment);
+        assert_eq!(result, Err(Ok(Error::InvalidCommitment)));
+    }
+
+    // ── Guard 5: InsufficientReserves ────────────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_insufficient_reserves() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        // Leave reserves at 0 — cannot cover any payout.
+        let _ = contract_id;
+
+        let player = Address::generate(&env);
+        // Inject directly so we bypass start_game's own reserve check.
+        env.as_contract(&contract_id, || {
+            let game = GameState {
+                wager: 10_000_000,
+                side: Side::Heads,
+                streak: 1,
+                commitment: dummy_commitment(&env),
+                contract_random: dummy_commitment(&env),
+                fee_bps: 300,
+                phase: GamePhase::Revealed,
+            };
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
+    }
+
+    // ── Happy path: state transition Revealed → Committed ───────────────────
+
+    /// Core invariant: after a successful continue_streak the game must be in
+    /// Committed phase with the new commitment stored, the original wager and
+    /// streak preserved, and a fresh contract_random derived.
+    #[test]
+    fn test_continue_streak_transitions_to_committed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+        let streak = 1u32;
+
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+        let new_commitment = dummy_commitment(&env);
+        let result = client.try_continue_streak(&player, &new_commitment);
+        assert!(result.is_ok());
+
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        // Phase must be reset to Committed.
+        assert_eq!(game.phase, GamePhase::Committed);
+        // New commitment must be persisted.
+        assert_eq!(game.commitment, new_commitment);
+        // Wager must be unchanged.
+        assert_eq!(game.wager, wager);
+        // Streak must be preserved (not reset, not incremented).
+        assert_eq!(game.streak, streak);
+    }
+
+    /// contract_random must be refreshed on each continue_streak call so that
+    /// the player cannot predict the next outcome from a previously observed value.
+    #[test]
+    fn test_continue_streak_refreshes_contract_random() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 10_000_000);
+
+        // Capture the old contract_random before the transition.
+        let old_random: BytesN<32> = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+        });
+
+        // Advance the ledger so the new sequence produces a different hash.
+        env.ledger().with_mut(|l| l.sequence_number += 1);
+
+        let new_commitment = dummy_commitment(&env);
+        client.continue_streak(&player, &new_commitment);
+
+        let new_random: BytesN<32> = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+        });
+
+        // contract_random must have changed.
+        assert_ne!(old_random, new_random,
+            "contract_random must be refreshed on continue_streak");
+    }
+
+    /// Streak must be preserved across multiple consecutive continue calls so
+    /// the multiplier tier keeps climbing correctly.
+    #[test]
+    fn test_continue_streak_preserves_streak_across_multiple_rounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+
+        // Start at streak 2 (player has already won twice).
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, wager);
+
+        let new_commitment = dummy_commitment(&env);
+        client.continue_streak(&player, &new_commitment);
+
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        assert_eq!(game.streak, 2, "streak must be preserved, not reset or incremented");
+        assert_eq!(game.wager, wager, "wager must be preserved");
+        assert_eq!(game.phase, GamePhase::Committed);
+    }
+
+    /// No state mutation must occur when any guard fires.
+    #[test]
+    fn test_continue_streak_no_state_mutation_on_invalid_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
+
+        let before: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        let _ = client.try_continue_streak(&player, &dummy_commitment(&env));
+
+        let after: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        assert_eq!(before, after, "game state must be unchanged on guard failure");
+    }
+
+    /// fee_bps snapshot must survive the continue transition unchanged so that
+    /// the payout terms locked at game creation are honoured at cash-out.
+    #[test]
+    fn test_continue_streak_preserves_fee_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+        let original_fee_bps = 300u32;
+
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
+
+        let new_commitment = dummy_commitment(&env);
+        client.continue_streak(&player, &new_commitment);
+
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        assert_eq!(game.fee_bps, original_fee_bps,
+            "fee_bps snapshot must be preserved through the continue transition");
     }
 }
 
@@ -3887,6 +4409,248 @@ mod property_tests {
             let result = client.try_continue_streak(&player, &new_commit);
             prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
             prop_assert_eq!(Error::InsufficientReserves as u32, error_codes::INSUFFICIENT_RESERVES);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Feature: Continue Availability
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // ## Access Invariants
+    //
+    // `continue_streak` is ONLY available when ALL of the following hold:
+    //
+    //   1. A game record exists for the player (`NoActiveGame` otherwise).
+    //   2. The game is in `GamePhase::Revealed` (`InvalidPhase` otherwise).
+    //   3. `game.streak >= 1` — the player won the last flip
+    //      (`NoWinningsToClaimOrContinue` when streak == 0).
+    //   4. `new_commitment` is not all-zero bytes (`InvalidCommitment` otherwise).
+    //   5. Reserves cover the next-streak worst-case payout
+    //      (`InsufficientReserves` otherwise).
+    //
+    // The properties below exhaustively verify invariants 1–3 across random
+    // inputs, confirming that only a `Revealed` game with a positive streak
+    // can enter the continue flow.  Invariants 4–5 are covered by the error
+    // code descriptiveness block above.
+    //
+    // ## Why property tests?
+    //
+    // Unit tests check specific values; property tests confirm the invariant
+    // holds for *any* wager, streak, or phase value in the valid domain.
+    // This is especially important for phase gating: a single off-by-one in
+    // a match arm could silently allow a `Committed` game to continue, which
+    // would let a player skip the reveal step and manipulate outcomes.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // ── Invariant 1: no game record → NoActiveGame ───────────────────────
+        //
+        // For any valid wager and commitment, a player with no game in storage
+        // must always receive NoActiveGame regardless of what commitment they
+        // supply.  This prevents phantom-game exploitation where a caller
+        // probes the contract without ever having started a game.
+
+        /// PROPERTY CA-1: continue_streak always returns NoActiveGame when no
+        /// game record exists for the player, across all valid commitment inputs.
+        #[test]
+        fn prop_continue_unavailable_without_game(
+            commitment_bytes in prop::array::uniform32(1u8..=255u8),
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::NoActiveGame)),
+                "continue_streak must return NoActiveGame when no game exists");
+        }
+
+        // ── Invariant 2a: Committed phase → InvalidPhase ─────────────────────
+        //
+        // A game in Committed phase has not yet been revealed.  Allowing
+        // continue_streak here would let a player replace their commitment
+        // before the reveal, breaking the commit-reveal security model.
+
+        /// PROPERTY CA-2a: continue_streak is unavailable in Committed phase
+        /// for any wager or streak value.
+        #[test]
+        fn prop_continue_unavailable_in_committed_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Committed, streak, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "continue_streak must return InvalidPhase for a Committed game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── Invariant 2b: Completed phase → InvalidPhase ─────────────────────
+        //
+        // A Completed game is fully settled.  Allowing continue_streak here
+        // would let a player re-enter a finished game, potentially claiming
+        // winnings that have already been paid out.
+
+        /// PROPERTY CA-2b: continue_streak is unavailable in Completed phase
+        /// for any wager or streak value.
+        #[test]
+        fn prop_continue_unavailable_in_completed_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Completed, streak, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "continue_streak must return InvalidPhase for a Completed game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── Invariant 3: Revealed + streak == 0 → NoWinningsToClaimOrContinue
+        //
+        // A Revealed game with streak == 0 is a loss state produced when the
+        // reveal outcome did not match the player's chosen side.  The player
+        // forfeited their wager; there are no winnings to risk on a streak.
+        // Allowing continue here would let a losing player re-enter the game
+        // for free, violating fund-safety guarantees.
+
+        /// PROPERTY CA-3: continue_streak is unavailable in Revealed phase when
+        /// streak == 0 (loss state), across all wager values.
+        #[test]
+        fn prop_continue_unavailable_revealed_streak_zero(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)),
+                "continue_streak must return NoWinningsToClaimOrContinue for a \
+                 Revealed game with streak == 0 (wager={})", wager);
+        }
+
+        // ── Positive: Revealed + streak >= 1 + sufficient reserves → Ok ──────
+        //
+        // The only state that may enter the continue flow is a Revealed game
+        // with a positive streak and enough reserves to cover the next payout.
+        // This property confirms the gate opens exactly when all conditions are
+        // met, and that no valid winning state is accidentally blocked.
+
+        /// PROPERTY CA-4: continue_streak succeeds for any Revealed game with
+        /// streak >= 1 when reserves are sufficient, confirming the gate opens
+        /// for all valid winning states.
+        #[test]
+        fn prop_continue_available_revealed_winning_state(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+            commitment_bytes in prop::array::uniform32(1u8..=255u8),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+
+            // Fund reserves to cover the next streak's worst-case payout.
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert!(result.is_ok(),
+                "continue_streak must succeed for a Revealed winning game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── No state mutation on any rejection ───────────────────────────────
+        //
+        // All guard failures must be atomic: the game state and contract stats
+        // must be byte-for-byte identical before and after a rejected call.
+        // This prevents partial-write exploits where a failed continue could
+        // silently advance the phase or alter the commitment.
+
+        /// PROPERTY CA-5: game state is unchanged after any InvalidPhase rejection.
+        #[test]
+        fn prop_continue_no_mutation_on_invalid_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=5u32,
+            use_committed in any::<bool>(),
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let phase = if use_committed { GamePhase::Committed } else { GamePhase::Completed };
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, phase, streak, wager);
+
+            let before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            let _ = client.try_continue_streak(&player, &dummy_commitment_prop(&env));
+
+            let after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(before, after,
+                "game state must be unchanged after InvalidPhase rejection");
+        }
+
+        /// PROPERTY CA-6: game state is unchanged after NoWinningsToClaimOrContinue rejection.
+        #[test]
+        fn prop_continue_no_mutation_on_loss_state(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
+
+            let before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            let _ = client.try_continue_streak(&player, &dummy_commitment_prop(&env));
+
+            let after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(before, after,
+                "game state must be unchanged after NoWinningsToClaimOrContinue rejection");
         }
     }
 

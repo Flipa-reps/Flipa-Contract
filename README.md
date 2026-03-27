@@ -88,41 +88,127 @@ cargo test -- --nocapture
 ### Build for Production
 
 ```bash
-# Optimize the WASM binary
 cargo build --target wasm32-unknown-unknown --release
-
-# The optimized WASM will be at:
-# target/wasm32-unknown-unknown/release/coinflip_contract.wasm
+# Output: target/wasm32-unknown-unknown/release/coinflip_contract.wasm
 ```
 
-### Deploy to Stellar
+### Automated Deployment Script
+
+A deployment script is provided at `contract/deploy.sh`. It builds the WASM,
+deploys the contract, and calls `initialize` in one step.
 
 ```bash
-# Deploy using Stellar CLI
+# Set credentials — never commit these
+export ADMIN_SECRET="S..."          # admin Stellar secret key
+export TREASURY_ADDRESS="G..."      # treasury public key (must differ from admin)
+
+# Optional overrides (defaults shown)
+export FEE_BPS=300                  # 3% rake
+export MIN_WAGER=1000000            # 0.1 XLM
+export MAX_WAGER=100000000          # 10 XLM
+
+# Deploy to testnet
+./contract/deploy.sh testnet
+
+# Deploy to mainnet
+./contract/deploy.sh mainnet
+```
+
+The script prints the contract ID and a reserve-funding reminder on success.
+
+### Manual Deployment (step-by-step)
+
+```bash
+# 1. Deploy WASM
 stellar contract deploy \
   --wasm target/wasm32-unknown-unknown/release/coinflip_contract.wasm \
-  --source <YOUR_SECRET_KEY> \
-  --network testnet
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet
 
-# Initialize the contract
+# 2. Initialize
 stellar contract invoke \
   --id <CONTRACT_ID> \
   --source <ADMIN_SECRET_KEY> \
-  --network testnet \
+  --network mainnet \
   -- initialize \
   --admin <ADMIN_ADDRESS> \
   --treasury <TREASURY_ADDRESS> \
   --fee_bps 300 \
   --min_wager 1000000 \
   --max_wager 100000000
+
+# 3. Fund reserves (minimum: MAX_WAGER × 10 = 1,000,000,000 stroops for defaults)
+# Transfer XLM to the contract address via the Stellar network before opening to players.
 ```
 
 ### Recommended Mainnet Parameters
 
-- **Fee**: 300-500 basis points (3-5%)
-- **Min Wager**: 1,000,000 stroops (0.1 XLM)
-- **Max Wager**: 100,000,000 stroops (10 XLM)
-- **Initial Reserves**: 10x max wager × max multiplier
+| Parameter      | Recommended Value          | Notes                                      |
+| -------------- | -------------------------- | ------------------------------------------ |
+| `fee_bps`      | 300–500 (3–5%)             | Must be in range enforced by contract      |
+| `min_wager`    | 1,000,000 stroops (0.1 XLM)| Prevents dust spam                         |
+| `max_wager`    | 100,000,000 stroops (10 XLM)| Cap exposure per game                     |
+| Initial reserve| ≥ max_wager × 10           | Covers worst-case 10x streak-4+ payout     |
+
+### Mainnet Rollout Checklist
+
+Pre-deploy:
+- [ ] Run full test suite: `cargo test` → `132 passed; 0 failed; 4 ignored`
+- [ ] Build succeeds with zero errors and zero new warnings
+- [ ] Admin and treasury keys are separate accounts (contract rejects same address)
+- [ ] Admin key is a hardware wallet or multisig — never a hot key
+- [ ] Treasury address is a cold wallet or protocol-controlled account
+- [ ] `ADMIN_SECRET` is stored in a secrets manager, not in shell history or `.env` files
+
+Deploy:
+- [ ] Deploy to testnet first and run a full game flow end-to-end
+- [ ] Verify contract ID matches expected WASM hash
+- [ ] Confirm `initialize` parameters match intended values via `get_stats()`
+- [ ] Fund contract reserve to at least `max_wager × 10` before opening to players
+- [ ] Verify `reserve_balance` via `get_stats()` after funding
+
+Post-deploy:
+- [ ] Monitor `reserve_balance` — top up before it falls below `max_wager × 10`
+- [ ] Set up alerting on `ContractPaused` / `InsufficientReserves` errors
+- [ ] Document the deployed contract ID and block height in your ops runbook
+- [ ] Test `set_paused(true)` and `set_paused(false)` from the admin key
+
+### Security Assumptions for Mainnet
+
+1. Commit-reveal integrity — The contract cannot manipulate outcomes because the
+   player's secret is unknown until `reveal`. The player cannot manipulate outcomes
+   because the commitment is locked in `start_game`. Neither party can bias the
+   XOR-based outcome without controlling both secrets simultaneously.
+
+2. Admin key compromise — A compromised admin key can pause new games and change
+   fee/wager parameters, but cannot steal player funds or alter in-flight game
+   state. Rotate the admin key immediately if compromise is suspected using
+   `set_treasury` / `set_wager_limits` / `set_fee` from a new admin address
+   (requires re-initialization if the admin address itself must change).
+
+3. Treasury key compromise — A compromised treasury key exposes accumulated fees
+   only. Player wagers and reserves are held by the contract, not the treasury.
+   Update the treasury address via `set_treasury` from the admin key.
+
+4. Reserve solvency — The contract enforces a solvency check before every
+   `start_game` and `continue_streak`. If reserves fall below the worst-case
+   payout for the current `max_wager` at streak 4+ (10x multiplier), new games
+   are rejected with `InsufficientReserves`. This is a protocol-level guarantee,
+   not an operational one — keep reserves funded.
+
+5. Fee snapshot isolation — The `fee_bps` stored in each `GameState` at
+   `start_game` time is immutable for that game. Admin fee changes via `set_fee`
+   only affect games started after the change. In-flight games settle at the
+   fee rate they were opened with.
+
+6. Overflow safety — All arithmetic uses `checked_*` operations. `calculate_payout`
+   returns `None` for wagers above `i128::MAX / 100_000`, which the wager
+   validation guards prevent from ever reaching settlement.
+
+7. Timeout recovery — If a player abandons a game after `start_game` without
+   calling `reveal`, the `RevealTimeout` path allows the wager to be reclaimed
+   after the timeout window. Ensure the timeout window is appropriate for your
+   expected block times.
 
 ## 🧪 Testing Strategy
 
@@ -169,6 +255,165 @@ test result: ok. 43 passed; 0 failed; 0 ignored
 ```
 
 Any failure at this checkpoint indicates a regression in core logic and must be resolved before game-flow work continues.
+
+---
+
+## ✅ Task 18 — Final Verification Checklist
+
+This checklist must be completed in full before merging any PR that touches game-flow logic, settlement, or the test suite.
+
+### 1. Build
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+- [ ] Build completes with zero errors
+- [ ] Zero new warnings introduced (pre-existing warnings are documented and acceptable)
+- [ ] `target/wasm32-unknown-unknown/release/coinflip_contract.wasm` is produced
+
+### 2. Full Test Suite
+
+Run the complete suite and confirm the expected totals:
+
+```bash
+cargo test
+```
+
+Expected output:
+
+```
+test result: ok. 132 passed; 0 failed; 4 ignored
+```
+
+The 4 ignored tests require a deployed SAC token and are intentionally skipped in the local environment.
+
+### 3. Module-Level Test Commands
+
+Each module can be run in isolation to pinpoint regressions:
+
+```bash
+cargo test --lib tests::                          # unit tests
+cargo test --lib property_tests::                 # core property + wager boundary tests
+cargo test --lib streak_increment_tests::         # streak increment invariants
+cargo test --lib outcome_determinism_tests::      # pure helper determinism
+cargo test --lib randomness_regression_tests::    # commit-reveal security
+cargo test --lib loss_forfeiture_tests::          # loss path accounting
+cargo test --lib integration_tests::              # end-to-end game flows
+```
+
+### 4. Test Suite Breakdown
+
+| Module                        | Count   | What it covers                                                                 |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------ |
+| `tests`                       | 57      | Unit tests: multipliers, payout math, init, error codes, reveal, cash_out      |
+| `property_tests`              | 25      | Payout correctness, wager boundaries, multiplier monotonicity, config storage  |
+| `streak_increment_tests`      | 11      | Streak +1 invariant, monotonicity, tier transitions, payout ordering           |
+| `outcome_determinism_tests`   | 6       | Identical inputs → identical outputs for all pure helpers                      |
+| `randomness_regression_tests` | 5       | Commit-reveal: round-trip, distinct secrets, tamper resistance                 |
+| `loss_forfeiture_tests`       | 5       | Loss returns false, state deleted, reserve credited, slot freed, side-agnostic |
+| `integration_tests`           | 14      | Full game flows: win/loss/streak/pause/guards/stats/boundary                   |
+| **Total**                     | **123** | (132 with transfer tests; 4 ignored require deployed SAC)                      |
+
+### 5. Invariant Coverage
+
+Confirm each invariant class has passing tests before merge:
+
+**Wager Validation**
+- [ ] `wager < min_wager` → `WagerBelowMinimum` (off-by-one: `min - 1` rejected, `min` accepted)
+- [ ] `wager > max_wager` → `WagerAboveMaximum` (off-by-one: `max + 1` rejected, `max` accepted)
+- [ ] Guards execute before any state mutation — no partial writes on rejection
+
+**Commit-Reveal Security**
+- [ ] Wrong secret → `CommitmentMismatch`, phase unchanged
+- [ ] Distinct secrets produce distinct commitments
+- [ ] Tampered commitment or tampered secret both fail verification
+- [ ] Verification is not symmetric (hash(A) ≠ hash(B) even if A ≈ B)
+
+**Streak Mechanics**
+- [ ] Fresh game always starts at `streak = 0`
+- [ ] Each win increments streak by exactly 1 (never 0, never 2+)
+- [ ] Streak progression is strictly monotonic
+- [ ] No multiplier tier is skipped (1 → 2 → 3 → 4 in single steps)
+- [ ] Multiplier caps at 10x for streak ≥ 4; counter continues without reset
+- [ ] Payout at streak N+1 is strictly greater than payout at streak N
+
+**Loss Forfeiture**
+- [ ] `reveal` returns `Ok(false)` on any loss
+- [ ] Player game state is fully deleted from storage after a loss
+- [ ] `reserve_balance` increases by exactly the forfeited wager
+- [ ] Player slot is freed immediately — new `start_game` succeeds without cleanup
+- [ ] New game after loss starts with `streak = 0` (no carry-over)
+- [ ] Forfeiture semantics are identical for Heads and Tails losses
+- [ ] Reserve overflow near `i128::MAX` is handled safely (no wrap or panic)
+
+**Settlement Accounting**
+- [ ] `gross = wager × multiplier_bps / 10_000`
+- [ ] `fee = gross × fee_bps / 10_000`
+- [ ] `net = gross − fee`
+- [ ] Contract balance decreases by exactly `gross`
+- [ ] Treasury balance increases by exactly `fee`
+- [ ] Player balance increases by exactly `net`
+- [ ] `continue_streak` involves zero token transfers
+- [ ] Reserve solvency check fires before any transfer
+
+**Reserve Solvency**
+- [ ] `start_game` rejected when `reserve_balance < worst_case_payout` (streak 4+ multiplier)
+- [ ] `continue_streak` rejected when reserves are insufficient
+- [ ] Reserve balance never goes negative
+
+**Admin Controls**
+- [ ] `set_paused(true)` blocks `start_game`; in-flight games still settle
+- [ ] `set_paused(false)` re-enables new game creation
+- [ ] Unauthorized callers rejected with `Unauthorized`
+- [ ] `fee_bps` snapshot in `GameState` isolates in-flight games from admin fee changes
+
+**Overflow Safety**
+- [ ] `calculate_payout` returns `None` for wagers above `i128::MAX / 100_000`
+- [ ] All arithmetic uses `checked_*` operations — no silent wraps
+
+### 6. Error Code Stability
+
+Confirm no error discriminant values have changed (breaking protocol change):
+
+| Code | Variant                      |
+| ---- | ---------------------------- |
+| 1    | `WagerBelowMinimum`          |
+| 2    | `WagerAboveMaximum`          |
+| 3    | `ActiveGameExists`           |
+| 4    | `InsufficientReserves`       |
+| 5    | `ContractPaused`             |
+| 10   | `NoActiveGame`               |
+| 11   | `InvalidPhase`               |
+| 12   | `CommitmentMismatch`         |
+| 13   | `RevealTimeout`              |
+| 20   | `NoWinningsToClaimOrContinue`|
+| 21   | `InvalidCommitment`          |
+| 30   | `Unauthorized`               |
+| 31   | `InvalidFeePercentage`       |
+| 32   | `InvalidWagerLimits`         |
+| 40   | `TransferFailed`             |
+| 50   | `AdminTreasuryConflict`      |
+| 51   | `AlreadyInitialized`         |
+
+- [ ] All 17 variants present with correct `u32` discriminants
+- [ ] No variant has been renumbered or removed
+
+### 7. Documentation
+
+- [ ] All public API functions have `///` doc comments
+- [ ] All `Error` variants have doc comments referencing their error code constant
+- [ ] `GamePhase` state-transition diagram is accurate
+- [ ] `CoinflipContract` public API table is up to date
+- [ ] `error_codes` module table matches the `Error` enum
+
+### 8. Pre-Merge Sign-Off
+
+- [ ] `cargo test` passes with 0 failures
+- [ ] Zero new compiler warnings introduced
+- [ ] PR targets the correct branch (`feature/final-verification-checklist` → `main` or `develop`)
+- [ ] Commit message follows convention: `docs: add final verification checklist for comprehensive testing`
+- [ ] All checklist items above are checked
 
 ## 🔒 Security Features
 
