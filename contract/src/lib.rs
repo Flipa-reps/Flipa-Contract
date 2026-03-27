@@ -4161,6 +4161,248 @@ mod property_tests {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Feature: Continue Availability
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // ## Access Invariants
+    //
+    // `continue_streak` is ONLY available when ALL of the following hold:
+    //
+    //   1. A game record exists for the player (`NoActiveGame` otherwise).
+    //   2. The game is in `GamePhase::Revealed` (`InvalidPhase` otherwise).
+    //   3. `game.streak >= 1` — the player won the last flip
+    //      (`NoWinningsToClaimOrContinue` when streak == 0).
+    //   4. `new_commitment` is not all-zero bytes (`InvalidCommitment` otherwise).
+    //   5. Reserves cover the next-streak worst-case payout
+    //      (`InsufficientReserves` otherwise).
+    //
+    // The properties below exhaustively verify invariants 1–3 across random
+    // inputs, confirming that only a `Revealed` game with a positive streak
+    // can enter the continue flow.  Invariants 4–5 are covered by the error
+    // code descriptiveness block above.
+    //
+    // ## Why property tests?
+    //
+    // Unit tests check specific values; property tests confirm the invariant
+    // holds for *any* wager, streak, or phase value in the valid domain.
+    // This is especially important for phase gating: a single off-by-one in
+    // a match arm could silently allow a `Committed` game to continue, which
+    // would let a player skip the reveal step and manipulate outcomes.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // ── Invariant 1: no game record → NoActiveGame ───────────────────────
+        //
+        // For any valid wager and commitment, a player with no game in storage
+        // must always receive NoActiveGame regardless of what commitment they
+        // supply.  This prevents phantom-game exploitation where a caller
+        // probes the contract without ever having started a game.
+
+        /// PROPERTY CA-1: continue_streak always returns NoActiveGame when no
+        /// game record exists for the player, across all valid commitment inputs.
+        #[test]
+        fn prop_continue_unavailable_without_game(
+            commitment_bytes in prop::array::uniform32(1u8..=255u8),
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::NoActiveGame)),
+                "continue_streak must return NoActiveGame when no game exists");
+        }
+
+        // ── Invariant 2a: Committed phase → InvalidPhase ─────────────────────
+        //
+        // A game in Committed phase has not yet been revealed.  Allowing
+        // continue_streak here would let a player replace their commitment
+        // before the reveal, breaking the commit-reveal security model.
+
+        /// PROPERTY CA-2a: continue_streak is unavailable in Committed phase
+        /// for any wager or streak value.
+        #[test]
+        fn prop_continue_unavailable_in_committed_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Committed, streak, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "continue_streak must return InvalidPhase for a Committed game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── Invariant 2b: Completed phase → InvalidPhase ─────────────────────
+        //
+        // A Completed game is fully settled.  Allowing continue_streak here
+        // would let a player re-enter a finished game, potentially claiming
+        // winnings that have already been paid out.
+
+        /// PROPERTY CA-2b: continue_streak is unavailable in Completed phase
+        /// for any wager or streak value.
+        #[test]
+        fn prop_continue_unavailable_in_completed_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Completed, streak, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "continue_streak must return InvalidPhase for a Completed game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── Invariant 3: Revealed + streak == 0 → NoWinningsToClaimOrContinue
+        //
+        // A Revealed game with streak == 0 is a loss state produced when the
+        // reveal outcome did not match the player's chosen side.  The player
+        // forfeited their wager; there are no winnings to risk on a streak.
+        // Allowing continue here would let a losing player re-enter the game
+        // for free, violating fund-safety guarantees.
+
+        /// PROPERTY CA-3: continue_streak is unavailable in Revealed phase when
+        /// streak == 0 (loss state), across all wager values.
+        #[test]
+        fn prop_continue_unavailable_revealed_streak_zero(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)),
+                "continue_streak must return NoWinningsToClaimOrContinue for a \
+                 Revealed game with streak == 0 (wager={})", wager);
+        }
+
+        // ── Positive: Revealed + streak >= 1 + sufficient reserves → Ok ──────
+        //
+        // The only state that may enter the continue flow is a Revealed game
+        // with a positive streak and enough reserves to cover the next payout.
+        // This property confirms the gate opens exactly when all conditions are
+        // met, and that no valid winning state is accidentally blocked.
+
+        /// PROPERTY CA-4: continue_streak succeeds for any Revealed game with
+        /// streak >= 1 when reserves are sufficient, confirming the gate opens
+        /// for all valid winning states.
+        #[test]
+        fn prop_continue_available_revealed_winning_state(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+            commitment_bytes in prop::array::uniform32(1u8..=255u8),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(CoinflipContract, ());
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let admin    = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let token    = Address::generate(&env);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+
+            // Fund reserves to cover the next streak's worst-case payout.
+            fund_reserves(&env, &contract_id, i128::MAX / 4);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert!(result.is_ok(),
+                "continue_streak must succeed for a Revealed winning game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── No state mutation on any rejection ───────────────────────────────
+        //
+        // All guard failures must be atomic: the game state and contract stats
+        // must be byte-for-byte identical before and after a rejected call.
+        // This prevents partial-write exploits where a failed continue could
+        // silently advance the phase or alter the commitment.
+
+        /// PROPERTY CA-5: game state is unchanged after any InvalidPhase rejection.
+        #[test]
+        fn prop_continue_no_mutation_on_invalid_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=5u32,
+            use_committed in any::<bool>(),
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let phase = if use_committed { GamePhase::Committed } else { GamePhase::Completed };
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, phase, streak, wager);
+
+            let before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            let _ = client.try_continue_streak(&player, &dummy_commitment_prop(&env));
+
+            let after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(before, after,
+                "game state must be unchanged after InvalidPhase rejection");
+        }
+
+        /// PROPERTY CA-6: game state is unchanged after NoWinningsToClaimOrContinue rejection.
+        #[test]
+        fn prop_continue_no_mutation_on_loss_state(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
+
+            let before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            let _ = client.try_continue_streak(&player, &dummy_commitment_prop(&env));
+
+            let after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(before, after,
+                "game state must be unchanged after NoWinningsToClaimOrContinue rejection");
+        }
+    }
+
     // Feature: Error Code Descriptiveness, Property: error_codes module constants ↔ enum discriminants
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
