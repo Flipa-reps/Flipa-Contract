@@ -261,6 +261,8 @@ pub enum GamePhase {
 ///                      used for all subsequent settlement calculations so
 ///                      later admin fee changes do not alter in-flight games
 /// - `phase`          – lifecycle position: `Committed` → `Revealed` → `Completed`
+/// - `start_ledger`   – ledger sequence number at `start_game` time; used by
+///                      `reclaim_wager` to enforce the reveal timeout window
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GameState {
@@ -271,6 +273,8 @@ pub struct GameState {
     pub contract_random: BytesN<32>,
     pub fee_bps: u32,
     pub phase: GamePhase,
+    /// Ledger sequence at game creation; used for timeout enforcement.
+    pub start_ledger: u32,
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -363,6 +367,10 @@ const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
 /// the TTL is already healthy.
 const TTL_THRESHOLD: u32 = 100_000;
 const TTL_EXTEND_TO: u32 = 500_000;
+
+/// Number of ledgers a player has to call `reveal` before the wager can be
+/// reclaimed via `reclaim_wager`.  At ~5 s/ledger this is roughly 8 minutes.
+const REVEAL_TIMEOUT_LEDGERS: u32 = 100;
 
 /// Returns the gross payout multiplier (in basis points, 10_000 = 1x)
 /// for the given win `streak` level.
@@ -699,6 +707,7 @@ impl CoinflipContract {
             contract_random,
             fee_bps: config.fee_bps,
             phase: GamePhase::Committed,
+            start_ledger: env.ledger().sequence(),
         };
 
         Self::save_player_game(&env, &player, &game);
@@ -1200,6 +1209,71 @@ impl CoinflipContract {
 
         Ok(())
     }
+
+    /// Reclaim a wager from a game that has exceeded the reveal timeout.
+    ///
+    /// If a player starts a game but never calls `reveal`, their wager is
+    /// locked in the contract indefinitely.  After `REVEAL_TIMEOUT_LEDGERS`
+    /// ledgers have elapsed since `start_game`, the player may call
+    /// `reclaim_wager` to recover their wager and clean up the game slot.
+    ///
+    /// # Timeout Invariant
+    ///
+    /// A game is considered expired when:
+    /// ```text
+    /// current_ledger >= game.start_ledger + REVEAL_TIMEOUT_LEDGERS
+    /// ```
+    ///
+    /// # Process (on success)
+    /// 1. Verify the player has a game in `Committed` phase.
+    /// 2. Verify the reveal window has expired.
+    /// 3. Credit the wager back to `reserve_balance` (house keeps the wager
+    ///    because the player failed to reveal — this prevents griefing by
+    ///    locking reserves indefinitely).
+    /// 4. Delete the player's game state to free the slot.
+    ///
+    /// # Arguments
+    /// - `player` – must authorize; must have a game in `Committed` phase
+    ///
+    /// # Returns
+    /// `Ok(wager)` — the reclaimed wager amount in stroops.
+    ///
+    /// # Errors
+    /// | Error           | Condition                                              |
+    /// |-----------------|--------------------------------------------------------|
+    /// | `NoActiveGame`  | No game record exists for `player`                     |
+    /// | `InvalidPhase`  | Game is not in `Committed` phase                       |
+    /// | `RevealTimeout` | Reveal window has **not** yet expired (too early)      |
+    pub fn reclaim_wager(env: Env, player: Address) -> Result<i128, Error> {
+        player.require_auth();
+
+        let game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // Only Committed games can time out — Revealed games must be settled normally.
+        if game.phase != GamePhase::Committed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // Reject if the timeout window has not yet elapsed.
+        let current = env.ledger().sequence();
+        let expires_at = game.start_ledger.saturating_add(REVEAL_TIMEOUT_LEDGERS);
+        if current < expires_at {
+            return Err(Error::RevealTimeout);
+        }
+
+        // Credit wager to reserves and free the player slot.
+        let mut stats = Self::load_stats(&env);
+        stats.reserve_balance = stats
+            .reserve_balance
+            .checked_add(game.wager)
+            .unwrap_or(stats.reserve_balance);
+        Self::save_stats(&env, &stats);
+
+        Self::delete_player_game(&env, &player);
+
+        Ok(game.wager)
+    }
 }
 
 #[cfg(test)]
@@ -1497,6 +1571,7 @@ mod tests {
                     contract_random: env.crypto().sha256(&Bytes::from_slice(env, &[2u8; 32])).into(),
                     fee_bps,
                     phase: GamePhase::Revealed,
+                    start_ledger: 0,
                 };
                 CoinflipContract::save_player_game(env, &player, &game);
             });
@@ -1647,6 +1722,7 @@ mod tests {
             contract_random: dummy,
             fee_bps: 300,
             phase,
+            start_ledger: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -2334,6 +2410,7 @@ mod tests {
                 contract_random: dummy_commitment(&env),
                 fee_bps: 300,
                 phase: GamePhase::Revealed,
+                start_ledger: 0,
             };
             CoinflipContract::save_player_game(&env, &player, &game);
         });
@@ -4871,6 +4948,7 @@ mod cumulative_fee_tests {
             contract_random: dummy,
             fee_bps,
             phase: GamePhase::Revealed,
+            start_ledger: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -6346,6 +6424,7 @@ mod integration_tests {
                 contract_random: commitment, // deterministic stand-in
                 fee_bps: DEFAULT_FEE_BPS,
                 phase,
+                start_ledger: 0,
             };
             self.env.as_contract(&self.contract_id, || {
                 CoinflipContract::save_player_game(&self.env, player, &game);
@@ -6664,6 +6743,265 @@ mod integration_tests {
         assert!(won, "probe_outcome prediction must match actual reveal outcome");
     }
 }
- master
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: Timeout Reclaim Tests
+//
+// Invariants verified:
+// 1. `reclaim_wager` is rejected before the timeout window expires
+//    (`RevealTimeout`).
+// 2. After expiry, `reclaim_wager` succeeds, returns the original wager,
+//    deletes the game state, and credits the wager to `reserve_balance`.
+// 3. `reclaim_wager` is rejected when no game exists (`NoActiveGame`).
+// 4. `reclaim_wager` is rejected for games not in `Committed` phase
+//    (`InvalidPhase`).
+// 5. After a successful reclaim the player slot is free — a new `start_game`
+//    is accepted immediately.
+// 6. Property: for any wager in [min, max], reclaim after expiry always
+//    returns exactly that wager and increments `reserve_balance` by the same
+//    amount.
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod timeout_reclaim_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+
+    // ── Shared helpers ────────────────────────────────────────────────────
+
+    fn setup_env() -> (Env, Address, CoinflipContractClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client: CoinflipContractClient<'static> = unsafe {
+            core::mem::transmute(CoinflipContractClient::new(&env, &contract_id))
+        };
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        (env, contract_id, client)
+    }
+
+    fn fund(env: &Env, contract_id: &Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &stats);
+        });
+    }
+
+    fn reserve_balance(env: &Env, contract_id: &Address) -> i128 {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_stats(env).reserve_balance
+        })
+    }
+
+    fn game_exists(env: &Env, contract_id: &Address, player: &Address) -> bool {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_player_game(env, player).is_some()
+        })
+    }
+
+    fn commitment(env: &Env) -> BytesN<32> {
+        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[42u8; 32])).into()
+    }
+
+    /// Advance the ledger sequence by `n` ledgers.
+    fn advance_ledger(env: &Env, n: u32) {
+        env.ledger().with_mut(|li| li.sequence_number += n);
+    }
+
+    // ── Unit tests ────────────────────────────────────────────────────────
+
+    /// Reclaim before timeout must return `RevealTimeout`.
+    #[test]
+    fn test_reclaim_rejected_before_timeout() {
+        let (env, contract_id, client) = setup_env();
+        fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
+
+        // Advance by one less than the timeout — still within window.
+        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS - 1);
+
+        let result = client.try_reclaim_wager(&player);
+        assert_eq!(result, Err(Ok(Error::RevealTimeout)),
+            "reclaim must be rejected before timeout expires");
+    }
+
+    /// Reclaim at exactly the expiry ledger must succeed.
+    #[test]
+    fn test_reclaim_accepted_at_expiry() {
+        let (env, contract_id, client) = setup_env();
+        fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+        client.start_game(&player, &Side::Heads, &wager, &commitment(&env));
+
+        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
+
+        let reclaimed = client.reclaim_wager(&player);
+        assert_eq!(reclaimed, wager, "reclaim must return the original wager");
+    }
+
+    /// After reclaim, game state must be deleted.
+    #[test]
+    fn test_reclaim_deletes_game_state() {
+        let (env, contract_id, client) = setup_env();
+        fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
+        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
+        client.reclaim_wager(&player);
+
+        assert!(!game_exists(&env, &contract_id, &player),
+            "game state must be deleted after reclaim");
+    }
+
+    /// After reclaim, `reserve_balance` must increase by exactly the wager.
+    #[test]
+    fn test_reclaim_credits_reserve() {
+        let (env, contract_id, client) = setup_env();
+        let initial_reserve = 1_000_000_000i128;
+        fund(&env, &contract_id, initial_reserve);
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+        client.start_game(&player, &Side::Heads, &wager, &commitment(&env));
+        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
+        client.reclaim_wager(&player);
+
+        let after = reserve_balance(&env, &contract_id);
+        assert_eq!(after, initial_reserve + wager,
+            "reserve_balance must increase by exactly the wager");
+    }
+
+    /// After reclaim, the player slot is free — a new start_game must succeed.
+    #[test]
+    fn test_reclaim_frees_slot_for_new_game() {
+        let (env, contract_id, client) = setup_env();
+        fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
+        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
+        client.reclaim_wager(&player);
+
+        let result = client.try_start_game(&player, &Side::Tails, &10_000_000, &commitment(&env));
+        assert!(result.is_ok(), "new start_game must succeed after reclaim frees the slot");
+    }
+
+    /// Reclaim with no game in storage must return `NoActiveGame`.
+    #[test]
+    fn test_reclaim_no_active_game() {
+        let (env, _contract_id, client) = setup_env();
+        let player = Address::generate(&env);
+        let result = client.try_reclaim_wager(&player);
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    /// Reclaim on a `Revealed` game must return `InvalidPhase`.
+    #[test]
+    fn test_reclaim_rejects_revealed_phase() {
+        let (env, contract_id, client) = setup_env();
+        fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        // Inject a Revealed game directly.
+        let dummy = commitment(&env);
+        env.as_contract(&contract_id, || {
+            CoinflipContract::save_player_game(&env, &player, &GameState {
+                wager: 10_000_000,
+                side: Side::Heads,
+                streak: 1,
+                commitment: dummy.clone(),
+                contract_random: dummy,
+                fee_bps: 300,
+                phase: GamePhase::Revealed,
+                start_ledger: 0,
+            });
+        });
+        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
+
+        let result = client.try_reclaim_wager(&player);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+            "reclaim must reject Revealed-phase games");
+    }
+
+    /// Reclaim on a `Completed` game must return `InvalidPhase`.
+    #[test]
+    fn test_reclaim_rejects_completed_phase() {
+        let (env, contract_id, client) = setup_env();
+        let player = Address::generate(&env);
+        let dummy = commitment(&env);
+        env.as_contract(&contract_id, || {
+            CoinflipContract::save_player_game(&env, &player, &GameState {
+                wager: 10_000_000,
+                side: Side::Heads,
+                streak: 0,
+                commitment: dummy.clone(),
+                contract_random: dummy,
+                fee_bps: 300,
+                phase: GamePhase::Completed,
+                start_ledger: 0,
+            });
+        });
+        advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
+
+        let result = client.try_reclaim_wager(&player);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+            "reclaim must reject Completed-phase games");
+    }
+
+    // ── Property tests ────────────────────────────────────────────────────
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(100))]
+
+        /// For any valid wager, reclaim after expiry returns exactly that wager
+        /// and increments reserve_balance by the same amount.
+        #[test]
+        fn prop_reclaim_returns_exact_wager(wager in 1_000_000i128..=100_000_000i128) {
+            let (env, contract_id, client) = setup_env();
+            fund(&env, &contract_id, 1_000_000_000);
+            let player = Address::generate(&env);
+            client.start_game(&player, &Side::Heads, &wager, &commitment(&env));
+
+            let reserve_before = reserve_balance(&env, &contract_id);
+            advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
+
+            let reclaimed = client.reclaim_wager(&player);
+            prop_assert_eq!(reclaimed, wager,
+                "reclaim must return exactly the original wager");
+
+            let reserve_after = reserve_balance(&env, &contract_id);
+            prop_assert_eq!(reserve_after, reserve_before + wager,
+                "reserve_balance must increase by exactly the wager");
+        }
+
+        /// For any ledger advance strictly less than the timeout, reclaim is rejected.
+        #[test]
+        fn prop_reclaim_rejected_before_expiry(advance in 0u32..REVEAL_TIMEOUT_LEDGERS) {
+            let (env, contract_id, client) = setup_env();
+            fund(&env, &contract_id, 1_000_000_000);
+            let player = Address::generate(&env);
+            client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
+            advance_ledger(&env, advance);
+
+            let result = client.try_reclaim_wager(&player);
+            prop_assert_eq!(result, Err(Ok(Error::RevealTimeout)),
+                "reclaim must be rejected for any advance < REVEAL_TIMEOUT_LEDGERS");
+        }
+
+        /// After a successful reclaim, game state is always absent.
+        #[test]
+        fn prop_reclaim_always_clears_state(wager in 1_000_000i128..=100_000_000i128) {
+            let (env, contract_id, client) = setup_env();
+            fund(&env, &contract_id, 1_000_000_000);
+            let player = Address::generate(&env);
+            client.start_game(&player, &Side::Heads, &wager, &commitment(&env));
+            advance_ledger(&env, REVEAL_TIMEOUT_LEDGERS);
+            client.reclaim_wager(&player);
+
+            prop_assert!(!game_exists(&env, &contract_id, &player),
+                "game state must be absent after reclaim");
+        }
     }
 }
