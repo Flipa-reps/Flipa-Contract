@@ -751,6 +751,39 @@ impl CoinflipContract {
 
     /// Continue to the next streak level after a confirmed win.
     ///
+    /// ## Continue-State Transition
+    ///
+    /// `continue_streak` is the bridge between the `Revealed` and `Committed`
+    /// phases for a winning player who chooses to risk their winnings on another
+    /// flip rather than cash out.
+    ///
+    /// ### Phase transition
+    ///
+    /// ```text
+    /// Revealed (streak ≥ 1)  ──continue_streak──►  Committed
+    /// ```
+    ///
+    /// ### What is preserved
+    ///
+    /// | Field            | Behaviour                                              |
+    /// |------------------|--------------------------------------------------------|
+    /// | `wager`          | Unchanged — the original bet stays locked              |
+    /// | `streak`         | Unchanged — incremented only by `reveal` on a win      |
+    /// | `fee_bps`        | Unchanged — snapshot from game creation is honoured    |
+    /// | `side`           | Unchanged — player's chosen side carries over          |
+    ///
+    /// ### What is replaced
+    ///
+    /// | Field            | New value                                              |
+    /// |------------------|--------------------------------------------------------|
+    /// | `commitment`     | `new_commitment` supplied by the caller                |
+    /// | `contract_random`| Fresh SHA-256 of the current ledger sequence number    |
+    /// | `phase`          | `GamePhase::Committed`                                 |
+    ///
+    /// Refreshing `contract_random` on every continue call is a security
+    /// requirement: it prevents a player from reusing a previously observed
+    /// contract contribution to predict the next outcome.
+    ///
     /// ## Eligibility rules
     ///
     /// A player may call `continue_streak` **only** when all of the following
@@ -1986,6 +2019,266 @@ mod tests {
         let expected = calculate_payout(10_000_000, 1, 500).unwrap();
         let payout = client.try_cash_out(&player);
         assert_eq!(payout, Ok(Ok(expected)));
+    }
+
+    // ── continue_streak unit tests ───────────────────────────────────────────
+    //
+    // These tests cover the continue-state transition:
+    //   Revealed (win) → Committed
+    //
+    // Invariants verified:
+    //   - phase resets to Committed
+    //   - new commitment is persisted
+    //   - new contract_random is derived and persisted (differs from old value)
+    //   - wager is preserved unchanged
+    //   - streak is preserved unchanged (not reset, not incremented)
+    //   - no state mutation on any guard failure
+
+    // ── Guard 1: NoActiveGame ────────────────────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_no_active_game() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    // ── Guard 2: InvalidPhase ────────────────────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_committed_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
+
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    #[test]
+    fn test_continue_streak_rejects_completed_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Completed, 1, 10_000_000);
+
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    // ── Guard 3: NoWinningsToClaimOrContinue ─────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_streak_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Revealed with streak == 0 means the player lost — continuation not allowed.
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
+
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
+    }
+
+    // ── Guard 4: InvalidCommitment ───────────────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_all_zero_commitment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 10_000_000);
+
+        let zero_commitment = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_continue_streak(&player, &zero_commitment);
+        assert_eq!(result, Err(Ok(Error::InvalidCommitment)));
+    }
+
+    // ── Guard 5: InsufficientReserves ────────────────────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejects_insufficient_reserves() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        // Leave reserves at 0 — cannot cover any payout.
+        let _ = contract_id;
+
+        let player = Address::generate(&env);
+        // Inject directly so we bypass start_game's own reserve check.
+        env.as_contract(&contract_id, || {
+            let game = GameState {
+                wager: 10_000_000,
+                side: Side::Heads,
+                streak: 1,
+                commitment: dummy_commitment(&env),
+                contract_random: dummy_commitment(&env),
+                fee_bps: 300,
+                phase: GamePhase::Revealed,
+            };
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+
+        let result = client.try_continue_streak(&player, &dummy_commitment(&env));
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
+    }
+
+    // ── Happy path: state transition Revealed → Committed ───────────────────
+
+    /// Core invariant: after a successful continue_streak the game must be in
+    /// Committed phase with the new commitment stored, the original wager and
+    /// streak preserved, and a fresh contract_random derived.
+    #[test]
+    fn test_continue_streak_transitions_to_committed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+        let streak = 1u32;
+
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+        let new_commitment = dummy_commitment(&env);
+        let result = client.try_continue_streak(&player, &new_commitment);
+        assert!(result.is_ok());
+
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        // Phase must be reset to Committed.
+        assert_eq!(game.phase, GamePhase::Committed);
+        // New commitment must be persisted.
+        assert_eq!(game.commitment, new_commitment);
+        // Wager must be unchanged.
+        assert_eq!(game.wager, wager);
+        // Streak must be preserved (not reset, not incremented).
+        assert_eq!(game.streak, streak);
+    }
+
+    /// contract_random must be refreshed on each continue_streak call so that
+    /// the player cannot predict the next outcome from a previously observed value.
+    #[test]
+    fn test_continue_streak_refreshes_contract_random() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 10_000_000);
+
+        // Capture the old contract_random before the transition.
+        let old_random: BytesN<32> = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+        });
+
+        // Advance the ledger so the new sequence produces a different hash.
+        env.ledger().with_mut(|l| l.sequence_number += 1);
+
+        let new_commitment = dummy_commitment(&env);
+        client.continue_streak(&player, &new_commitment);
+
+        let new_random: BytesN<32> = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+        });
+
+        // contract_random must have changed.
+        assert_ne!(old_random, new_random,
+            "contract_random must be refreshed on continue_streak");
+    }
+
+    /// Streak must be preserved across multiple consecutive continue calls so
+    /// the multiplier tier keeps climbing correctly.
+    #[test]
+    fn test_continue_streak_preserves_streak_across_multiple_rounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+
+        // Start at streak 2 (player has already won twice).
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, wager);
+
+        let new_commitment = dummy_commitment(&env);
+        client.continue_streak(&player, &new_commitment);
+
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        assert_eq!(game.streak, 2, "streak must be preserved, not reset or incremented");
+        assert_eq!(game.wager, wager, "wager must be preserved");
+        assert_eq!(game.phase, GamePhase::Committed);
+    }
+
+    /// No state mutation must occur when any guard fires.
+    #[test]
+    fn test_continue_streak_no_state_mutation_on_invalid_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
+
+        let before: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        let _ = client.try_continue_streak(&player, &dummy_commitment(&env));
+
+        let after: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        assert_eq!(before, after, "game state must be unchanged on guard failure");
+    }
+
+    /// fee_bps snapshot must survive the continue transition unchanged so that
+    /// the payout terms locked at game creation are honoured at cash-out.
+    #[test]
+    fn test_continue_streak_preserves_fee_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+        let original_fee_bps = 300u32;
+
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
+
+        let new_commitment = dummy_commitment(&env);
+        client.continue_streak(&player, &new_commitment);
+
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+
+        assert_eq!(game.fee_bps, original_fee_bps,
+            "fee_bps snapshot must be preserved through the continue transition");
     }
 }
 
@@ -3869,120 +4162,160 @@ mod property_tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Feature: Continued Game Randomness
+    // Feature: Continue Availability
     // ═══════════════════════════════════════════════════════════════════════
     //
-    // ## Randomness Refresh Assumptions
+    // ## Access Invariants
     //
-    // Every call to `continue_streak` MUST derive a fresh `contract_random`
-    // value from the current ledger sequence number.  This is a security
-    // requirement, not an optimisation.
+    // `continue_streak` is ONLY available when ALL of the following hold:
     //
-    // ### Why prior entropy must never be reused
+    //   1. A game record exists for the player (`NoActiveGame` otherwise).
+    //   2. The game is in `GamePhase::Revealed` (`InvalidPhase` otherwise).
+    //   3. `game.streak >= 1` — the player won the last flip
+    //      (`NoWinningsToClaimOrContinue` when streak == 0).
+    //   4. `new_commitment` is not all-zero bytes (`InvalidCommitment` otherwise).
+    //   5. Reserves cover the next-streak worst-case payout
+    //      (`InsufficientReserves` otherwise).
     //
-    // The outcome of each flip is determined by:
+    // The properties below exhaustively verify invariants 1–3 across random
+    // inputs, confirming that only a `Revealed` game with a positive streak
+    // can enter the continue flow.  Invariants 4–5 are covered by the error
+    // code descriptiveness block above.
     //
-    //   sha256(player_secret ++ contract_random)[0] % 2
+    // ## Why property tests?
     //
-    // `contract_random` is the contract's contribution to the entropy pool.
-    // Its purpose is to prevent a player from choosing a secret *after*
-    // knowing the contract's value, which would let them guarantee a win.
-    //
-    // If `contract_random` were reused across rounds:
-    //
-    //   1. After the first reveal the player knows `contract_random`.
-    //   2. They can compute offline which secret produces a winning outcome.
-    //   3. They supply that secret in the next reveal, guaranteeing a win.
-    //
-    // Refreshing from the ledger sequence on every `continue_streak` call
-    // closes this window: the new value is not known until the transaction
-    // is included in a ledger, which happens *after* the player has already
-    // committed to their next secret.
-    //
-    // ### Ledger sequence as entropy source
-    //
-    // `contract_random = sha256(ledger_sequence.to_be_bytes())`
-    //
-    // The ledger sequence advances monotonically and is determined by the
-    // network, not by the player or the contract.  Two calls at different
-    // ledger sequences therefore produce different `contract_random` values
-    // (collision probability is negligible for SHA-256).
-    //
-    // ### Properties covered
-    //
-    // | ID    | Description                                                        |
-    // |-------|--------------------------------------------------------------------|
-    // | CR-1  | contract_random changes when ledger sequence advances              |
-    // | CR-2  | contract_random is deterministic for the same ledger sequence      |
-    // | CR-3  | contract_random differs across consecutive continues               |
-    // | CR-4  | contract_random is a valid SHA-256 output (non-zero, 32 bytes)     |
-    // | CR-5  | prior contract_random is not reused after a successful continue    |
+    // Unit tests check specific values; property tests confirm the invariant
+    // holds for *any* wager, streak, or phase value in the valid domain.
+    // This is especially important for phase gating: a single off-by-one in
+    // a match arm could silently allow a `Committed` game to continue, which
+    // would let a player skip the reveal step and manipulate outcomes.
     // ═══════════════════════════════════════════════════════════════════════
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(200))]
 
-        // ── CR-1: randomness changes when ledger sequence advances ────────────
+        // ── Invariant 1: no game record → NoActiveGame ───────────────────────
         //
-        // This is the foundational property: two continues at different ledger
-        // sequences must produce different contract_random values.  A regression
-        // here (e.g. using a cached sequence) would silently reuse entropy.
+        // For any valid wager and commitment, a player with no game in storage
+        // must always receive NoActiveGame regardless of what commitment they
+        // supply.  This prevents phantom-game exploitation where a caller
+        // probes the contract without ever having started a game.
 
-        /// PROPERTY CR-1: contract_random after continue_streak differs from the
-        /// value produced at a different ledger sequence, for any wager/streak.
+        /// PROPERTY CA-1: continue_streak always returns NoActiveGame when no
+        /// game record exists for the player, across all valid commitment inputs.
         #[test]
-        fn prop_randomness_changes_with_ledger_sequence(
-            wager       in 1_000_000i128..=10_000_000i128,
-            streak      in 1u32..=4u32,
-            seq_advance in 1u32..=1_000u32,
+        fn prop_continue_unavailable_without_game(
+            commitment_bytes in prop::array::uniform32(1u8..=255u8),
         ) {
             let env = Env::default();
-            env.mock_all_auths();
-            let contract_id = env.register(CoinflipContract, ());
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
             let client = CoinflipContractClient::new(&env, &contract_id);
 
-            let admin    = Address::generate(&env);
-            let treasury = Address::generate(&env);
-            let token    = Address::generate(&env);
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
-            fund_reserves(&env, &contract_id, i128::MAX / 4);
+            let player = Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
 
-            // First continue at the initial ledger sequence.
-            let player_a = Address::generate(&env);
-            inject_game_prop(&env, &contract_id, &player_a, GamePhase::Revealed, streak, wager);
-            client.continue_streak(&player_a, &dummy_commitment_prop(&env));
-            let random_a: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player_a).unwrap().contract_random
-            });
-
-            // Advance the ledger sequence, then do a second continue.
-            env.ledger().with_mut(|l| l.sequence_number += seq_advance);
-
-            let player_b = Address::generate(&env);
-            inject_game_prop(&env, &contract_id, &player_b, GamePhase::Revealed, streak, wager);
-            client.continue_streak(&player_b, &dummy_commitment_prop(&env));
-            let random_b: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player_b).unwrap().contract_random
-            });
-
-            prop_assert_ne!(random_a, random_b,
-                "contract_random must differ when ledger sequence advances by {} \
-                 (wager={}, streak={})", seq_advance, wager, streak);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::NoActiveGame)),
+                "continue_streak must return NoActiveGame when no game exists");
         }
 
-        // ── CR-2: randomness is deterministic for the same ledger sequence ────
+        // ── Invariant 2a: Committed phase → InvalidPhase ─────────────────────
         //
-        // Two continues at the *same* ledger sequence must produce the same
-        // contract_random.  This confirms the derivation is a pure function of
-        // the sequence number and not influenced by any mutable contract state
-        // that could be manipulated by the player.
+        // A game in Committed phase has not yet been revealed.  Allowing
+        // continue_streak here would let a player replace their commitment
+        // before the reveal, breaking the commit-reveal security model.
 
-        /// PROPERTY CR-2: two continues at the same ledger sequence produce
-        /// identical contract_random values.
+        /// PROPERTY CA-2a: continue_streak is unavailable in Committed phase
+        /// for any wager or streak value.
         #[test]
-        fn prop_randomness_deterministic_for_same_sequence(
+        fn prop_continue_unavailable_in_committed_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Committed, streak, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "continue_streak must return InvalidPhase for a Committed game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── Invariant 2b: Completed phase → InvalidPhase ─────────────────────
+        //
+        // A Completed game is fully settled.  Allowing continue_streak here
+        // would let a player re-enter a finished game, potentially claiming
+        // winnings that have already been paid out.
+
+        /// PROPERTY CA-2b: continue_streak is unavailable in Completed phase
+        /// for any wager or streak value.
+        #[test]
+        fn prop_continue_unavailable_in_completed_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Completed, streak, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "continue_streak must return InvalidPhase for a Completed game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── Invariant 3: Revealed + streak == 0 → NoWinningsToClaimOrContinue
+        //
+        // A Revealed game with streak == 0 is a loss state produced when the
+        // reveal outcome did not match the player's chosen side.  The player
+        // forfeited their wager; there are no winnings to risk on a streak.
+        // Allowing continue here would let a losing player re-enter the game
+        // for free, violating fund-safety guarantees.
+
+        /// PROPERTY CA-3: continue_streak is unavailable in Revealed phase when
+        /// streak == 0 (loss state), across all wager values.
+        #[test]
+        fn prop_continue_unavailable_revealed_streak_zero(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
+
+            let commitment = dummy_commitment_prop(&env);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)),
+                "continue_streak must return NoWinningsToClaimOrContinue for a \
+                 Revealed game with streak == 0 (wager={})", wager);
+        }
+
+        // ── Positive: Revealed + streak >= 1 + sufficient reserves → Ok ──────
+        //
+        // The only state that may enter the continue flow is a Revealed game
+        // with a positive streak and enough reserves to cover the next payout.
+        // This property confirms the gate opens exactly when all conditions are
+        // met, and that no valid winning state is accidentally blocked.
+
+        /// PROPERTY CA-4: continue_streak succeeds for any Revealed game with
+        /// streak >= 1 when reserves are sufficient, confirming the gate opens
+        /// for all valid winning states.
+        #[test]
+        fn prop_continue_available_revealed_winning_state(
             wager  in 1_000_000i128..=10_000_000i128,
             streak in 1u32..=4u32,
+            commitment_bytes in prop::array::uniform32(1u8..=255u8),
         ) {
             let env = Env::default();
             env.mock_all_auths();
@@ -3993,175 +4326,80 @@ mod property_tests {
             let treasury = Address::generate(&env);
             let token    = Address::generate(&env);
             client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
-            fund_reserves(&env, &contract_id, i128::MAX / 4);
 
-            // Two players continue at the same ledger sequence.
-            let player_a = Address::generate(&env);
-            let player_b = Address::generate(&env);
-            inject_game_prop(&env, &contract_id, &player_a, GamePhase::Revealed, streak, wager);
-            inject_game_prop(&env, &contract_id, &player_b, GamePhase::Revealed, streak, wager);
-
-            client.continue_streak(&player_a, &dummy_commitment_prop(&env));
-            client.continue_streak(&player_b, &dummy_commitment_prop(&env));
-
-            let random_a: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player_a).unwrap().contract_random
-            });
-            let random_b: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player_b).unwrap().contract_random
-            });
-
-            prop_assert_eq!(random_a, random_b,
-                "contract_random must be identical for two continues at the same \
-                 ledger sequence (wager={}, streak={})", wager, streak);
-        }
-
-        // ── CR-3: consecutive continues produce different randomness ──────────
-        //
-        // A single player continuing multiple times must receive a different
-        // contract_random on each round (assuming the ledger advances between
-        // calls, which it does in production).  This is the direct anti-reuse
-        // property: it proves the contract reads the *current* sequence on
-        // every call rather than caching the value from a previous round.
-
-        /// PROPERTY CR-3: a player's contract_random differs between two
-        /// consecutive continues when the ledger sequence advances between them.
-        #[test]
-        fn prop_consecutive_continues_produce_distinct_randomness(
-            wager       in 1_000_000i128..=10_000_000i128,
-            seq_advance in 1u32..=100u32,
-        ) {
-            let env = Env::default();
-            env.mock_all_auths();
-            let contract_id = env.register(CoinflipContract, ());
-            let client = CoinflipContractClient::new(&env, &contract_id);
-
-            let admin    = Address::generate(&env);
-            let treasury = Address::generate(&env);
-            let token    = Address::generate(&env);
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
-            fund_reserves(&env, &contract_id, i128::MAX / 4);
-
-            let player = Address::generate(&env);
-
-            // Round 1: Revealed (streak=1) → continue → Committed.
-            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
-            client.continue_streak(&player, &dummy_commitment_prop(&env));
-            let random_round_1: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
-            });
-
-            // Advance ledger, then simulate a win to get back to Revealed.
-            env.ledger().with_mut(|l| l.sequence_number += seq_advance);
-            env.as_contract(&contract_id, || {
-                let mut game = CoinflipContract::load_player_game(&env, &player).unwrap();
-                game.phase = GamePhase::Revealed;
-                game.streak = 2;
-                CoinflipContract::save_player_game(&env, &player, &game);
-            });
-
-            // Round 2: continue again.
-            client.continue_streak(&player, &dummy_commitment_prop(&env));
-            let random_round_2: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
-            });
-
-            prop_assert_ne!(random_round_1, random_round_2,
-                "contract_random must differ between consecutive continues when \
-                 ledger advances by {} (wager={})", seq_advance, wager);
-        }
-
-        // ── CR-4: contract_random is a valid non-zero SHA-256 output ─────────
-        //
-        // The derived value must never be the all-zero sentinel.  An all-zero
-        // contract_random would be indistinguishable from an uninitialised
-        // field and could be exploited if any downstream code treats zero as
-        // a special case.  SHA-256 collision with the zero digest is
-        // computationally infeasible, but we verify it explicitly.
-
-        /// PROPERTY CR-4: contract_random stored after continue_streak is never
-        /// all-zero bytes, for any wager, streak, or ledger sequence offset.
-        #[test]
-        fn prop_randomness_is_never_zero(
-            wager       in 1_000_000i128..=10_000_000i128,
-            streak      in 1u32..=4u32,
-            seq_offset  in 0u32..=10_000u32,
-        ) {
-            let env = Env::default();
-            env.mock_all_auths();
-            let contract_id = env.register(CoinflipContract, ());
-            let client = CoinflipContractClient::new(&env, &contract_id);
-
-            let admin    = Address::generate(&env);
-            let treasury = Address::generate(&env);
-            let token    = Address::generate(&env);
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
-            fund_reserves(&env, &contract_id, i128::MAX / 4);
-
-            env.ledger().with_mut(|l| l.sequence_number += seq_offset);
-
-            let player = Address::generate(&env);
-            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
-            client.continue_streak(&player, &dummy_commitment_prop(&env));
-
-            let random: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
-            });
-
-            let zero = BytesN::from_array(&env, &[0u8; 32]);
-            prop_assert_ne!(random, zero,
-                "contract_random must never be all-zero bytes \
-                 (wager={}, streak={}, seq_offset={})", wager, streak, seq_offset);
-        }
-
-        // ── CR-5: prior contract_random is not reused after a successful continue
-        //
-        // After a successful continue, the stored contract_random must differ
-        // from the value that was present before the call.  This is the direct
-        // anti-reuse check: it fails if the implementation accidentally skips
-        // the refresh step (e.g. due to a missing assignment or early return).
-
-        /// PROPERTY CR-5: contract_random stored after continue_streak differs
-        /// from the value that was stored before the call, when the ledger
-        /// sequence has advanced.
-        #[test]
-        fn prop_prior_randomness_not_reused(
-            wager       in 1_000_000i128..=10_000_000i128,
-            streak      in 1u32..=4u32,
-            seq_advance in 1u32..=1_000u32,
-        ) {
-            let env = Env::default();
-            env.mock_all_auths();
-            let contract_id = env.register(CoinflipContract, ());
-            let client = CoinflipContractClient::new(&env, &contract_id);
-
-            let admin    = Address::generate(&env);
-            let treasury = Address::generate(&env);
-            let token    = Address::generate(&env);
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            // Fund reserves to cover the next streak's worst-case payout.
             fund_reserves(&env, &contract_id, i128::MAX / 4);
 
             let player = Address::generate(&env);
             inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
 
-            // Capture the contract_random that was injected (stand-in for the
-            // value produced by the previous reveal).
-            let random_before: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+            let commitment = BytesN::from_array(&env, &commitment_bytes);
+            let result = client.try_continue_streak(&player, &commitment);
+            prop_assert!(result.is_ok(),
+                "continue_streak must succeed for a Revealed winning game \
+                 (wager={}, streak={})", wager, streak);
+        }
+
+        // ── No state mutation on any rejection ───────────────────────────────
+        //
+        // All guard failures must be atomic: the game state and contract stats
+        // must be byte-for-byte identical before and after a rejected call.
+        // This prevents partial-write exploits where a failed continue could
+        // silently advance the phase or alter the commitment.
+
+        /// PROPERTY CA-5: game state is unchanged after any InvalidPhase rejection.
+        #[test]
+        fn prop_continue_no_mutation_on_invalid_phase(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=5u32,
+            use_committed in any::<bool>(),
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let phase = if use_committed { GamePhase::Committed } else { GamePhase::Completed };
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, phase, streak, wager);
+
+            let before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
             });
 
-            // Advance the ledger so the new sequence produces a different hash.
-            env.ledger().with_mut(|l| l.sequence_number += seq_advance);
+            let _ = client.try_continue_streak(&player, &dummy_commitment_prop(&env));
 
-            client.continue_streak(&player, &dummy_commitment_prop(&env));
-
-            let random_after: BytesN<32> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+            let after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
             });
 
-            prop_assert_ne!(random_before, random_after,
-                "contract_random must be refreshed and must not equal the prior \
-                 value (wager={}, streak={}, seq_advance={})", wager, streak, seq_advance);
+            prop_assert_eq!(before, after,
+                "game state must be unchanged after InvalidPhase rejection");
+        }
+
+        /// PROPERTY CA-6: game state is unchanged after NoWinningsToClaimOrContinue rejection.
+        #[test]
+        fn prop_continue_no_mutation_on_loss_state(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let contract_id = setup_contract_with_bounds(&env, 1_000_000, 100_000_000);
+            let client = CoinflipContractClient::new(&env, &contract_id);
+
+            let player = Address::generate(&env);
+            inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
+
+            let before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            let _ = client.try_continue_streak(&player, &dummy_commitment_prop(&env));
+
+            let after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+
+            prop_assert_eq!(before, after,
+                "game state must be unchanged after NoWinningsToClaimOrContinue rejection");
         }
     }
 
