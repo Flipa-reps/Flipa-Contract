@@ -170,6 +170,165 @@ test result: ok. 43 passed; 0 failed; 0 ignored
 
 Any failure at this checkpoint indicates a regression in core logic and must be resolved before game-flow work continues.
 
+---
+
+## ✅ Task 18 — Final Verification Checklist
+
+This checklist must be completed in full before merging any PR that touches game-flow logic, settlement, or the test suite.
+
+### 1. Build
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+- [ ] Build completes with zero errors
+- [ ] Zero new warnings introduced (pre-existing warnings are documented and acceptable)
+- [ ] `target/wasm32-unknown-unknown/release/coinflip_contract.wasm` is produced
+
+### 2. Full Test Suite
+
+Run the complete suite and confirm the expected totals:
+
+```bash
+cargo test
+```
+
+Expected output:
+
+```
+test result: ok. 132 passed; 0 failed; 4 ignored
+```
+
+The 4 ignored tests require a deployed SAC token and are intentionally skipped in the local environment.
+
+### 3. Module-Level Test Commands
+
+Each module can be run in isolation to pinpoint regressions:
+
+```bash
+cargo test --lib tests::                          # unit tests
+cargo test --lib property_tests::                 # core property + wager boundary tests
+cargo test --lib streak_increment_tests::         # streak increment invariants
+cargo test --lib outcome_determinism_tests::      # pure helper determinism
+cargo test --lib randomness_regression_tests::    # commit-reveal security
+cargo test --lib loss_forfeiture_tests::          # loss path accounting
+cargo test --lib integration_tests::              # end-to-end game flows
+```
+
+### 4. Test Suite Breakdown
+
+| Module                        | Count   | What it covers                                                                 |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------ |
+| `tests`                       | 57      | Unit tests: multipliers, payout math, init, error codes, reveal, cash_out      |
+| `property_tests`              | 25      | Payout correctness, wager boundaries, multiplier monotonicity, config storage  |
+| `streak_increment_tests`      | 11      | Streak +1 invariant, monotonicity, tier transitions, payout ordering           |
+| `outcome_determinism_tests`   | 6       | Identical inputs → identical outputs for all pure helpers                      |
+| `randomness_regression_tests` | 5       | Commit-reveal: round-trip, distinct secrets, tamper resistance                 |
+| `loss_forfeiture_tests`       | 5       | Loss returns false, state deleted, reserve credited, slot freed, side-agnostic |
+| `integration_tests`           | 14      | Full game flows: win/loss/streak/pause/guards/stats/boundary                   |
+| **Total**                     | **123** | (132 with transfer tests; 4 ignored require deployed SAC)                      |
+
+### 5. Invariant Coverage
+
+Confirm each invariant class has passing tests before merge:
+
+**Wager Validation**
+- [ ] `wager < min_wager` → `WagerBelowMinimum` (off-by-one: `min - 1` rejected, `min` accepted)
+- [ ] `wager > max_wager` → `WagerAboveMaximum` (off-by-one: `max + 1` rejected, `max` accepted)
+- [ ] Guards execute before any state mutation — no partial writes on rejection
+
+**Commit-Reveal Security**
+- [ ] Wrong secret → `CommitmentMismatch`, phase unchanged
+- [ ] Distinct secrets produce distinct commitments
+- [ ] Tampered commitment or tampered secret both fail verification
+- [ ] Verification is not symmetric (hash(A) ≠ hash(B) even if A ≈ B)
+
+**Streak Mechanics**
+- [ ] Fresh game always starts at `streak = 0`
+- [ ] Each win increments streak by exactly 1 (never 0, never 2+)
+- [ ] Streak progression is strictly monotonic
+- [ ] No multiplier tier is skipped (1 → 2 → 3 → 4 in single steps)
+- [ ] Multiplier caps at 10x for streak ≥ 4; counter continues without reset
+- [ ] Payout at streak N+1 is strictly greater than payout at streak N
+
+**Loss Forfeiture**
+- [ ] `reveal` returns `Ok(false)` on any loss
+- [ ] Player game state is fully deleted from storage after a loss
+- [ ] `reserve_balance` increases by exactly the forfeited wager
+- [ ] Player slot is freed immediately — new `start_game` succeeds without cleanup
+- [ ] New game after loss starts with `streak = 0` (no carry-over)
+- [ ] Forfeiture semantics are identical for Heads and Tails losses
+- [ ] Reserve overflow near `i128::MAX` is handled safely (no wrap or panic)
+
+**Settlement Accounting**
+- [ ] `gross = wager × multiplier_bps / 10_000`
+- [ ] `fee = gross × fee_bps / 10_000`
+- [ ] `net = gross − fee`
+- [ ] Contract balance decreases by exactly `gross`
+- [ ] Treasury balance increases by exactly `fee`
+- [ ] Player balance increases by exactly `net`
+- [ ] `continue_streak` involves zero token transfers
+- [ ] Reserve solvency check fires before any transfer
+
+**Reserve Solvency**
+- [ ] `start_game` rejected when `reserve_balance < worst_case_payout` (streak 4+ multiplier)
+- [ ] `continue_streak` rejected when reserves are insufficient
+- [ ] Reserve balance never goes negative
+
+**Admin Controls**
+- [ ] `set_paused(true)` blocks `start_game`; in-flight games still settle
+- [ ] `set_paused(false)` re-enables new game creation
+- [ ] Unauthorized callers rejected with `Unauthorized`
+- [ ] `fee_bps` snapshot in `GameState` isolates in-flight games from admin fee changes
+
+**Overflow Safety**
+- [ ] `calculate_payout` returns `None` for wagers above `i128::MAX / 100_000`
+- [ ] All arithmetic uses `checked_*` operations — no silent wraps
+
+### 6. Error Code Stability
+
+Confirm no error discriminant values have changed (breaking protocol change):
+
+| Code | Variant                      |
+| ---- | ---------------------------- |
+| 1    | `WagerBelowMinimum`          |
+| 2    | `WagerAboveMaximum`          |
+| 3    | `ActiveGameExists`           |
+| 4    | `InsufficientReserves`       |
+| 5    | `ContractPaused`             |
+| 10   | `NoActiveGame`               |
+| 11   | `InvalidPhase`               |
+| 12   | `CommitmentMismatch`         |
+| 13   | `RevealTimeout`              |
+| 20   | `NoWinningsToClaimOrContinue`|
+| 21   | `InvalidCommitment`          |
+| 30   | `Unauthorized`               |
+| 31   | `InvalidFeePercentage`       |
+| 32   | `InvalidWagerLimits`         |
+| 40   | `TransferFailed`             |
+| 50   | `AdminTreasuryConflict`      |
+| 51   | `AlreadyInitialized`         |
+
+- [ ] All 17 variants present with correct `u32` discriminants
+- [ ] No variant has been renumbered or removed
+
+### 7. Documentation
+
+- [ ] All public API functions have `///` doc comments
+- [ ] All `Error` variants have doc comments referencing their error code constant
+- [ ] `GamePhase` state-transition diagram is accurate
+- [ ] `CoinflipContract` public API table is up to date
+- [ ] `error_codes` module table matches the `Error` enum
+
+### 8. Pre-Merge Sign-Off
+
+- [ ] `cargo test` passes with 0 failures
+- [ ] Zero new compiler warnings introduced
+- [ ] PR targets the correct branch (`feature/final-verification-checklist` → `main` or `develop`)
+- [ ] Commit message follows convention: `docs: add final verification checklist for comprehensive testing`
+- [ ] All checklist items above are checked
+
 ## 🔒 Security Features
 
 1. **Commit-Reveal Pattern**: Prevents outcome manipulation by either party
