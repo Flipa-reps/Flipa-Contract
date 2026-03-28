@@ -46,15 +46,15 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Ad
 /// | 3    | `ActiveGameExists`           | Game creation  | `start_game`                       |
 /// | 4    | `InsufficientReserves`       | Game creation  | `start_game`, `continue_streak`    |
 /// | 5    | `ContractPaused`             | Game creation  | `start_game`                       |
-/// | 10   | `NoActiveGame`               | Game state     | `reveal`, `claim_winnings`, `continue_streak` |
-/// | 11   | `InvalidPhase`               | Game state     | `reveal`, `claim_winnings`, `continue_streak` |
+/// | 10   | `NoActiveGame`               | Game state     | `reveal`, `claim_winnings`, `continue_streak`, `cash_out` |
+/// | 11   | `InvalidPhase`               | Game state     | `reveal`, `claim_winnings`, `continue_streak`, `cash_out` |
 /// | 12   | `CommitmentMismatch`         | Reveal         | `reveal`                           |
-/// | 13   | `RevealTimeout`              | Reveal         | (reserved)                         |
-/// | 20   | `NoWinningsToClaimOrContinue`| Action         | `continue_streak`                  |
+/// | 13   | `RevealTimeout`              | Reveal         | (reserved for future timeout enforcement) |
+/// | 20   | `NoWinningsToClaimOrContinue`| Action         | `cash_out`, `claim_winnings`, `continue_streak` |
 /// | 21   | `InvalidCommitment`          | Action         | `continue_streak`                  |
-/// | 30   | `Unauthorized`               | Admin          | (reserved)                         |
-/// | 31   | `InvalidFeePercentage`       | Admin          | `initialize`                       |
-/// | 32   | `InvalidWagerLimits`         | Admin          | `initialize`                       |
+/// | 30   | `Unauthorized`               | Admin          | `set_paused`, `set_treasury`, `set_wager_limits`, `set_fee` |
+/// | 31   | `InvalidFeePercentage`       | Admin          | `initialize`, `set_fee`            |
+/// | 32   | `InvalidWagerLimits`         | Admin          | `initialize`, `set_wager_limits`   |
 /// | 40   | `TransferFailed`             | Transfer       | `claim_winnings`                   |
 /// | 50   | `AdminTreasuryConflict`      | Initialization | `initialize`                       |
 /// | 51   | `AlreadyInitialized`         | Initialization | `initialize`                       |
@@ -162,7 +162,7 @@ pub enum Error {
     // ── Action errors (20–21) ───────────────────────────────────────────────
 
     /// Player has no winnings to claim or continue (streak == 0 in Revealed phase).
-    /// Returned by: `continue_streak` (guard 3).
+    /// Returned by: `cash_out`, `claim_winnings`, `continue_streak`.
     /// Code: 20 — see [`error_codes::NO_WINNINGS_TO_CLAIM_OR_CONTINUE`]
     NoWinningsToClaimOrContinue = 20,
 
@@ -173,17 +173,18 @@ pub enum Error {
 
     // ── Admin errors (30–32) ────────────────────────────────────────────────
 
-    /// Caller is not authorized for admin operations (reserved).
+    /// Caller is not authorized for admin operations.
+    /// Returned by: `set_paused`, `set_treasury`, `set_wager_limits`, `set_fee`.
     /// Code: 30 — see [`error_codes::UNAUTHORIZED`]
     Unauthorized = 30,
 
     /// Fee percentage is outside the accepted range (200–500 bps / 2–5%).
-    /// Returned by: `initialize`.
+    /// Returned by: `initialize`, `set_fee`.
     /// Code: 31 — see [`error_codes::INVALID_FEE_PERCENTAGE`]
     InvalidFeePercentage = 31,
 
     /// Wager limits are invalid (`min_wager >= max_wager`).
-    /// Returned by: `initialize`.
+    /// Returned by: `initialize`, `set_wager_limits`.
     /// Code: 32 — see [`error_codes::INVALID_WAGER_LIMITS`]
     InvalidWagerLimits = 32,
 
@@ -307,6 +308,14 @@ pub struct ContractConfig {
 /// Updated atomically alongside game state transitions.
 /// `reserve_balance` is the authoritative on-chain reserve figure used for
 /// solvency checks in `start_game` and `continue_streak`.
+///
+/// Invariants:
+/// - `total_games`: Strictly monotonically increasing; incremented in `start_game`.
+/// - `total_volume`: Cumulative wagers placed; never decreases.
+/// - `total_fees`: Cumulative protocol fees collected; never decreases (fees are never refunded).
+/// - `reserve_balance`: Must always be sufficient to cover the worst-case payout (10x wager).
+///   Decreases when players cash out or claim winnings (gross deducted), increases when players
+///   lose and forfeit their wager.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractStats {
@@ -814,13 +823,15 @@ impl CoinflipContract {
     /// |------------------------|--------------------------------------------------------|
     /// | `NoActiveGame`         | No game record exists for `player`                     |
     /// | `InvalidPhase`         | Game is not in `Revealed` phase                        |
+    /// | `NoWinningsToClaimOrContinue` | `streak == 0` — loss state, nothing to claim    |
     /// | `InsufficientReserves` | `reserve_balance < gross_payout` or arithmetic overflow|
     /// | `TransferFailed`       | SAC token transfer fails (propagated from token client)|
     ///
     /// # Note on streak == 0
     /// A `Revealed` game with `streak == 0` indicates a loss; the game record is
-    /// deleted by `reveal` on the loss path, so `claim_winnings` will return
-    /// `NoActiveGame` rather than a dedicated loss error.
+    /// deleted by `reveal` on the loss path, so in practice `claim_winnings` will
+    /// return `NoActiveGame` for a lost game.  The explicit `streak == 0` guard
+    /// below defends against any injected state that bypasses the normal flow.
     pub fn claim_winnings(
         env: Env,
         player: Address,
@@ -833,6 +844,12 @@ impl CoinflipContract {
         // Must be in Revealed phase to claim (player won)
         if game.phase != GamePhase::Revealed {
             return Err(Error::InvalidPhase);
+        }
+
+        // streak == 0 in Revealed phase is a loss state — no winnings to claim.
+        // In normal flow this state is deleted by reveal, but guard defensively.
+        if game.streak == 0 {
+            return Err(Error::NoWinningsToClaimOrContinue);
         }
 
         let config = Self::load_config(&env);
@@ -851,22 +868,24 @@ impl CoinflipContract {
             return Err(Error::InsufficientReserves);
         }
 
-        // Transfer net payout to player
-        token_client.transfer(&env.current_contract_address(), &player, &net_payout);
-
-        // Transfer fee to treasury
-        token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
-
-        // Update contract state
+        // Update accounting state BEFORE transfers so that if a transfer panics
+        // the reserve ledger is already consistent (Soroban aborts the entire
+        // transaction on panic, so partial state is never committed).
         let mut stats = stats;
         stats.reserve_balance = stats.reserve_balance.checked_sub(gross_payout)
             .ok_or(Error::InsufficientReserves)?;
         stats.total_fees = stats.total_fees.checked_add(fee_amount).unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
 
-        // Reset game to completed
+        // Mark game completed before transfers for the same reason.
         game.phase = GamePhase::Completed;
         Self::save_player_game(&env, &player, &game);
+
+        // Transfer net payout to player
+        token_client.transfer(&env.current_contract_address(), &player, &net_payout);
+
+        // Transfer fee to treasury
+        token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
 
         Ok(())
     }
@@ -1805,6 +1824,27 @@ mod tests {
 
         let result = client.try_cash_out(&player);
         assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
+    }
+
+    #[test]
+    fn test_claim_winnings_rejects_losing_state_streak_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+
+        let player = Address::generate(&env);
+        // Inject a Revealed game with streak == 0 (loss state).
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
+
+        let result = client.try_claim_winnings(&player);
+        assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
+
+        // State must be unchanged — no partial mutation.
+        let game: GameState = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap()
+        });
+        assert_eq!(game.phase, GamePhase::Revealed);
+        assert_eq!(game.streak, 0);
     }
 
     // ── Happy path ───────────────────────────────────────────────────────────
