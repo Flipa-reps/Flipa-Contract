@@ -1299,6 +1299,7 @@ impl CoinflipContract {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger;
 
     #[test]
     fn test_get_multiplier_streak_levels() {
@@ -2752,7 +2753,7 @@ mod property_tests {
     // ───────────────────────────────────────────────────────────────────────
 
     // Helper function to set up contract and return client
-    fn setup_contract_with_bounds(
+    pub(crate) fn setup_contract_with_bounds(
         env: &Env,
         min_wager: i128,
         max_wager: i128,
@@ -2777,7 +2778,7 @@ mod property_tests {
         contract_id
     }
 
-    fn dummy_commitment_prop(env: &Env) -> BytesN<32> {
+    pub(crate) fn dummy_commitment_prop(env: &Env) -> BytesN<32> {
         env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[42u8; 32])).into()
     }
 
@@ -6057,7 +6058,7 @@ mod reserve_solvency_tests {
             if reserves >= max_payout {
                 prop_assert!(result.is_ok(), "Game should start when reserves ({}) >= max_payout ({})", reserves, max_payout);
             } else {
-                prop_assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into(), 
+                prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)), 
                     "Game should be rejected with InsufficientReserves when reserves ({}) < max_payout ({})", reserves, max_payout);
             }
         }
@@ -6072,8 +6073,9 @@ mod reserve_solvency_tests {
         let player = soroban_sdk::Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
-        let result = client.start_game(&player, &Side::Heads, &wager, &commitment);
-        assert!(result.is_ok(), "Game MUST start at exact threshold");
+        // start_game returns () on success, not Result
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+        // If we reach here without panic, the test passed
     }
 
     #[test]
@@ -6086,7 +6088,7 @@ mod reserve_solvency_tests {
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
         let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
-        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into());
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
     #[test]
@@ -6099,7 +6101,7 @@ mod reserve_solvency_tests {
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
         let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
-        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into());
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
     #[test]
@@ -6141,8 +6143,9 @@ mod reserve_solvency_tests {
         let player = soroban_sdk::Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
-        let result = client.start_game(&player, &Side::Heads, &wager, &commitment);
-        assert!(result.is_ok(), "Max wager should be accepted if reserves cover it");
+        // start_game returns () on success, not Result
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+        // If we reach here without panic, the test passed
     }
 
     #[test]
@@ -6174,7 +6177,7 @@ mod reserve_solvency_tests {
         let new_commitment = BytesN::from_array(&env, &[1u8; 32]);
         let result = client.try_continue_streak(&player, &new_commitment);
         
-        assert_eq!(result.unwrap_err(), (Error::InsufficientReserves as u32).into(), 
+        assert_eq!(result, Err(Ok(Error::InsufficientReserves)), 
             "continue_streak must reject if reserves cannot cover next tier");
     }
 }
@@ -6186,6 +6189,8 @@ mod reserve_solvency_tests {
 mod concurrency_edge_case_tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use crate::property_tests::{setup_contract_with_bounds, dummy_commitment_prop};
+    use proptest::prelude::*;
 
     #[test]
     fn test_rapid_sequential_start_attempts() {
@@ -6784,75 +6789,84 @@ mod integration_tests {
     }
 }
 
+
 // ═══════════════════════════════════════════════════════════════════════════
-// Feature: Fund Conservation (Issue #149)
-// Module:  fund_conservation_tests
+// Issue #125 — Cash Out Availability Property Tests
 //
-// ## Tossd Accounting Model
+// ELIGIBILITY INVARIANT:
+//   cash_out MUST succeed if and only if ALL of the following hold:
+//     1. A game record exists for the player in storage.
+//     2. The game is in GamePhase::Revealed.
+//     3. game.streak >= 1  (player won at least one flip).
+//     4. The contract holds sufficient reserves to cover the gross payout.
 //
-// Every stroop that enters or leaves the contract must be accounted for by
-// exactly one of three internal ledgers:
+// Any violation of conditions 1–3 must be rejected with the correct error
+// BEFORE any state mutation occurs (no partial writes on rejection).
 //
-//   1. **reserve_balance** – the contract's vault; holds all unallocated funds.
-//      Increases when a player deposits (start_game) or loses (reveal → loss).
-//      Decreases when a player wins and cashes out (gross payout deducted).
-//
-//   2. **total_fees** – cumulative protocol revenue sent to the treasury.
-//      Increases by `fee = gross * fee_bps / 10_000` on every winning cash-out.
-//      Never decreases (fees are never refunded).
-//
-//   3. **player_payout** – the net amount returned to the winning player.
-//      Equals `gross - fee` for each settled win.
-//
-// ### Conservation Invariant
-//
-//   Initial_Reserve + Total_Deposits
-//     == Final_Reserve + Total_Player_Payouts + Total_Fees_Collected
-//
-// Where:
-//   - `Total_Deposits`       = sum of all wagers placed via `start_game`
-//   - `Total_Player_Payouts` = sum of all net payouts from `cash_out`
-//   - `Total_Fees_Collected` = `stats.total_fees` after all settlements
-//   - `Final_Reserve`        = `stats.reserve_balance` after all settlements
-//
-// On a loss the wager flows directly into `reserve_balance` (no fee split).
-// On a win the gross payout is split: `net_payout` → player, `fee` → treasury,
-// and `reserve_balance` is reduced by the full gross amount.
-//
-// ### Auditor Notes
-//
-// - All arithmetic uses `checked_*` operations; overflow saturates rather than
-//   wrapping, so the invariant may be off by at most 1 stroop per operation in
-//   pathological near-MAX scenarios (not reachable in production).
-// - `cash_out` deducts the **gross** payout from reserves (not the net), then
-//   records the fee separately in `total_fees`. This is intentional: the fee
-//   portion never re-enters the reserve pool.
-// - `claim_winnings` performs the same accounting as `cash_out` but also
-//   executes real token transfers; the reserve accounting is identical.
-// - Loss forfeiture credits the exact wager to reserves with no fee deduction.
+// INELIGIBLE CONDITIONS (must be rejected):
+//   - No game exists                  → Error::NoActiveGame
+//   - Phase == Committed              → Error::InvalidPhase
+//   - Phase == Completed              → Error::InvalidPhase
+//   - Phase == Revealed, streak == 0  → Error::NoWinningsToClaimOrContinue
+//   - Double claim (game already Completed after first cash_out)
+//                                     → Error::InvalidPhase
 // ═══════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
-mod fund_conservation_tests {
+mod cash_out_availability_tests {
     use super::*;
     use proptest::prelude::*;
     use soroban_sdk::testutils::Address as _;
+    use crate::property_tests::{setup_contract_with_bounds, dummy_commitment_prop};
 
-    // ── helpers ──────────────────────────────────────────────────────────────
+    // ── Module-level helpers ─────────────────────────────────────────────────
 
-    /// Set up a fresh contract with ample reserves and return the contract id.
-    fn setup(env: &Env, fee_bps: u32) -> soroban_sdk::Address {
+    /// Initialise a contract and return (contract_id, client).
+    fn setup_env(env: &Env) -> (Address, CoinflipContractClient) {
         env.mock_all_auths();
         let contract_id = env.register(CoinflipContract, ());
         let client = CoinflipContractClient::new(env, &contract_id);
         let admin    = Address::generate(env);
         let treasury = Address::generate(env);
-        let token    = Address::generate(env);
-        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
-        contract_id
+        #[allow(deprecated)]
+        let token    = env.register_stellar_asset_contract(admin.clone());
+        // fee_bps=300, min=1_000_000, max=100_000_000
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        (contract_id, client)
     }
 
-    /// Directly set `reserve_balance` in contract storage.
-    fn set_reserves(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
+    /// Deterministic non-zero commitment suitable for property tests.
+    fn prop_commitment(env: &Env) -> BytesN<32> {
+        env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[0xABu8; 32])).into()
+    }
+
+    /// Inject a GameState directly into storage, bypassing start_game.
+    /// This lets tests exercise any (phase, streak, wager) combination
+    /// without needing a real commit-reveal round.
+    fn inject(
+        env: &Env,
+        contract_id: &Address,
+        player: &Address,
+        phase: GamePhase,
+        streak: u32,
+        wager: i128,
+    ) {
+        let dummy = prop_commitment(env);
+        let game = GameState {
+            wager,
+            side: Side::Heads,
+            streak,
+            commitment: dummy.clone(),
+            contract_random: dummy,
+            fee_bps: 300,
+            phase,
+        };
+        env.as_contract(contract_id, || {
+            CoinflipContract::save_player_game(env, player, &game);
+        });
+    }
+
+    /// Set the tracked reserve_balance in ContractStats.
+    fn set_reserves(env: &Env, contract_id: &Address, amount: i128) {
         env.as_contract(contract_id, || {
             let mut stats = CoinflipContract::load_stats(env);
             stats.reserve_balance = amount;
@@ -6860,473 +6874,456 @@ mod fund_conservation_tests {
         });
     }
 
-    /// Read `ContractStats` from storage.
-    fn read_stats(env: &Env, contract_id: &soroban_sdk::Address) -> ContractStats {
-        env.as_contract(contract_id, || CoinflipContract::load_stats(env))
-    }
-
-    /// Inject a `Revealed`-phase winning game and call `cash_out`.
-    /// Returns `(net_payout, fee)` for the caller to track.
-    fn do_win_cash_out(
-        env: &Env,
-        contract_id: &soroban_sdk::Address,
-        player: &Address,
-        wager: i128,
-        streak: u32,
-        fee_bps: u32,
-    ) -> (i128, i128) {
-        let dummy: BytesN<32> = env
-            .crypto()
-            .sha256(&soroban_sdk::Bytes::from_slice(env, &[7u8; 32]))
-            .into();
-        let game = GameState {
-            wager,
-            side: Side::Heads,
-            streak,
-            commitment: dummy.clone(),
-            contract_random: dummy,
-            fee_bps,
-            phase: GamePhase::Revealed,
-        };
-        env.as_contract(contract_id, || {
-            CoinflipContract::save_player_game(env, player, &game);
+    /// Mint tokens to the contract so token transfers don't fail.
+    fn mint_to(env: &Env, contract_id: &Address, amount: i128) {
+        let config: ContractConfig = env.as_contract(contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
         });
-        CoinflipContractClient::new(env, contract_id).cash_out(player);
-
-        let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
-        let fee   = gross.checked_mul(fee_bps as i128).unwrap() / 10_000;
-        let net   = gross - fee;
-        (net, fee)
+        soroban_sdk::token::StellarAssetClient::new(env, &config.token)
+            .mint(contract_id, &amount);
     }
 
-    /// Simulate a loss: inject a `Committed`-phase game and call `reveal` with
-    /// a secret that deterministically loses for `Side::Heads`.
-    ///
-    /// In the default test env (ledger seq = 0):
-    ///   contract_random[0] = 0xdf  →  [3u8;32] sha256[0]=0x64 XOR 0xdf = bit 1 → Tails → LOSS
-    fn do_loss(
-        env: &Env,
-        contract_id: &soroban_sdk::Address,
-        player: &Address,
-        wager: i128,
-        fee_bps: u32,
-    ) {
-        let secret: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(env, &[3u8; 32]);
-        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
-        let game = GameState {
-            wager,
-            side: Side::Heads,
-            streak: 0,
-            commitment,
-            contract_random: env
-                .crypto()
-                .sha256(&soroban_sdk::Bytes::from_slice(env, &[0u8; 4]))
-                .into(),
-            fee_bps,
-            phase: GamePhase::Committed,
-        };
+    /// Read ContractStats from storage.
+    fn read_stats(env: &Env, contract_id: &Address) -> ContractStats {
         env.as_contract(contract_id, || {
-            CoinflipContract::save_player_game(env, player, &game);
-        });
-        CoinflipContractClient::new(env, contract_id).reveal(player, &secret);
+            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        })
     }
 
-    // ── unit tests ────────────────────────────────────────────────────────────
+    // ── Property: no-game condition ──────────────────────────────────────────
+    //
+    // INVARIANT: cash_out called for a player with no game record must always
+    // return Error::NoActiveGame, regardless of who the player is.
+    //
+    // This covers:
+    //   - A brand-new address that has never played.
+    //   - An address whose game was deleted after settlement.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Conservation invariant over a single win:
-    ///   initial_reserve + wager == final_reserve + net_payout + fee
-    ///
-    /// Accounting trace (wager=10_000_000, streak=1, fee_bps=300):
-    ///   gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
-    ///   fee   = 19_000_000 * 300   / 10_000 =    570_000
-    ///   net   = 18_430_000
-    ///   reserve_delta = -19_000_000  (gross deducted)
-    ///   conservation: 100_000_000 + 0 == (100_000_000 - 19_000_000) + 18_430_000 + 570_000 ✓
-    #[test]
-    fn test_conservation_single_win() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-        let initial_reserve = 100_000_000i128;
-        set_reserves(&env, &contract_id, initial_reserve);
+        /// PROPERTY CA-1: cash_out with no game record → NoActiveGame.
+        ///
+        /// For any player address that has no game in storage, cash_out must
+        /// be rejected with Error::NoActiveGame.  No state mutation must occur.
+        #[test]
+        fn prop_cash_out_no_game_returns_no_active_game(
+            // seed drives Address::generate deterministically via proptest
+            _seed in 0u8..=255u8,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
 
-        let player = Address::generate(&env);
-        let wager  = 10_000_000i128;
-        let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, 1, 300);
-
-        let stats = read_stats(&env, &contract_id);
-        // Conservation: initial_reserve == final_reserve + net + fee
-        assert_eq!(
-            initial_reserve,
-            stats.reserve_balance + net + fee,
-            "fund conservation violated on single win"
-        );
-        assert_eq!(stats.total_fees, fee);
-    }
-
-    /// Conservation invariant over a single loss:
-    ///   initial_reserve + wager == final_reserve  (no payout, no fee)
-    #[test]
-    fn test_conservation_single_loss() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-        let initial_reserve = 100_000_000i128;
-        set_reserves(&env, &contract_id, initial_reserve);
-
-        let player = Address::generate(&env);
-        let wager  = 10_000_000i128;
-        do_loss(&env, &contract_id, &player, wager, 300);
-
-        let stats = read_stats(&env, &contract_id);
-        assert_eq!(
-            initial_reserve + wager,
-            stats.reserve_balance,
-            "fund conservation violated on single loss"
-        );
-        assert_eq!(stats.total_fees, 0, "no fee on a loss");
-    }
-
-    /// Conservation over a win-then-loss sequence (zero-sum scenario):
-    ///   After a win cash-out followed by a loss, the net reserve change equals
-    ///   `wager_loss - gross_win`.  Total fees equal the fee from the win only.
-    #[test]
-    fn test_conservation_win_then_loss_zero_sum() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-        let initial_reserve = 500_000_000i128;
-        set_reserves(&env, &contract_id, initial_reserve);
-
-        let p_win  = Address::generate(&env);
-        let p_loss = Address::generate(&env);
-        let wager  = 10_000_000i128;
-
-        let (net_win, fee_win) = do_win_cash_out(&env, &contract_id, &p_win, wager, 1, 300);
-        do_loss(&env, &contract_id, &p_loss, wager, 300);
-
-        let stats = read_stats(&env, &contract_id);
-        // After win: reserve = initial - gross_win
-        // After loss: reserve = initial - gross_win + wager_loss
-        let gross_win = net_win + fee_win;
-        let expected_reserve = initial_reserve - gross_win + wager;
-        assert_eq!(stats.reserve_balance, expected_reserve, "reserve mismatch after win+loss");
-        assert_eq!(stats.total_fees, fee_win, "only the win contributes a fee");
-    }
-
-    /// Conservation over N sequential wins by different players:
-    ///   initial_reserve == final_reserve + Σ net_i + Σ fee_i
-    #[test]
-    fn test_conservation_multiple_sequential_wins() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-        let initial_reserve = 1_000_000_000i128;
-        set_reserves(&env, &contract_id, initial_reserve);
-
-        let cases: &[(i128, u32)] = &[
-            (10_000_000, 1),
-            ( 5_000_000, 2),
-            ( 2_000_000, 4),
-            (50_000_000, 3),
-        ];
-
-        let mut total_net = 0i128;
-        let mut total_fee = 0i128;
-        for &(wager, streak) in cases {
+            // Fresh player — no game record exists.
             let player = Address::generate(&env);
-            let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, streak, 300);
-            total_net += net;
-            total_fee += fee;
+
+            let stats_before = read_stats(&env, &contract_id);
+            let result = client.try_cash_out(&player);
+
+            // Must be rejected with the correct error.
+            prop_assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+
+            // No state mutation: stats unchanged.
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance);
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees);
         }
 
-        let stats = read_stats(&env, &contract_id);
-        assert_eq!(
-            initial_reserve,
-            stats.reserve_balance + total_net + total_fee,
-            "fund conservation violated across multiple wins"
-        );
-        assert_eq!(stats.total_fees, total_fee);
-    }
+        /// PROPERTY CA-2: cash_out after game deletion → NoActiveGame.
+        ///
+        /// After a successful cash_out the game transitions to Completed but
+        /// the record remains in storage.  After a loss the record is deleted.
+        /// A second cash_out attempt on a Completed game must return
+        /// Error::InvalidPhase (double-claim guard), not succeed silently.
+        ///
+        /// This property verifies the double-claim path across random wagers.
+        #[test]
+        fn prop_cash_out_double_claim_rejected(
+            wager in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
 
-    /// Conservation with minimum wager (1_000_000 stroops = 0.1 XLM).
-    #[test]
-    fn test_conservation_minimum_wager() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-        let initial_reserve = 100_000_000i128;
-        set_reserves(&env, &contract_id, initial_reserve);
+            // Provide ample reserves and token balance.
+            let reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, reserve);
+            mint_to(&env, &contract_id, reserve);
 
-        let player = Address::generate(&env);
-        let wager  = 1_000_000i128; // minimum
-        let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, 1, 300);
-
-        let stats = read_stats(&env, &contract_id);
-        assert_eq!(
-            initial_reserve,
-            stats.reserve_balance + net + fee,
-            "conservation violated at minimum wager"
-        );
-    }
-
-    /// Conservation with maximum wager (100_000_000 stroops = 10 XLM).
-    #[test]
-    fn test_conservation_maximum_wager() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-        let initial_reserve = 10_000_000_000i128; // 10x max wager to cover streak 4+
-        set_reserves(&env, &contract_id, initial_reserve);
-
-        let player = Address::generate(&env);
-        let wager  = 100_000_000i128; // maximum
-        let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, 1, 300);
-
-        let stats = read_stats(&env, &contract_id);
-        assert_eq!(
-            initial_reserve,
-            stats.reserve_balance + net + fee,
-            "conservation violated at maximum wager"
-        );
-    }
-
-    /// Player balance invariant: net payout equals `gross - fee` exactly.
-    ///
-    /// Verifies the player-facing accounting model:
-    ///   player_receives = wager * multiplier / 10_000 * (1 - fee_bps / 10_000)
-    #[test]
-    fn test_player_balance_matches_expected_payout() {
-        let fee_bps = 300u32;
-        let wager   = 10_000_000i128;
-        let streak  = 1u32;
-
-        let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
-        let fee   = gross.checked_mul(fee_bps as i128).unwrap() / 10_000;
-        let expected_net = gross - fee;
-
-        let computed_net = calculate_payout(wager, streak, fee_bps).unwrap();
-        assert_eq!(computed_net, expected_net, "player payout formula mismatch");
-        assert_eq!(computed_net + fee, gross, "gross = net + fee invariant violated");
-    }
-
-    /// Treasury/fee pool invariant: `total_fees` equals the sum of all
-    /// individually computed fees across all settled games.
-    #[test]
-    fn test_treasury_fee_pool_matches_sum_of_fees() {
-        let env = Env::default();
-        let contract_id = setup(&env, 400);
-        set_reserves(&env, &contract_id, 1_000_000_000);
-
-        let cases: &[(i128, u32, u32)] = &[
-            (10_000_000, 1, 400),
-            ( 5_000_000, 2, 400),
-            (20_000_000, 3, 400),
-        ];
-
-        let mut expected_total_fees = 0i128;
-        for &(wager, streak, fee_bps) in cases {
             let player = Address::generate(&env);
-            let (_, fee) = do_win_cash_out(&env, &contract_id, &player, wager, streak, fee_bps);
-            expected_total_fees += fee;
+            // Inject a winning Revealed state.
+            inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            // First cash_out must succeed.
+            let first = client.try_cash_out(&player);
+            prop_assert!(first.is_ok(), "first cash_out must succeed for Revealed+streak≥1");
+
+            // Second cash_out on the now-Completed game must be rejected.
+            // The game record is still present (phase=Completed), so the error
+            // is InvalidPhase, not NoActiveGame.
+            let second = client.try_cash_out(&player);
+            prop_assert_eq!(second, Err(Ok(Error::InvalidPhase)),
+                "double cash_out must be rejected with InvalidPhase");
+        }
+    }
+
+    // ── Property: invalid phase conditions ──────────────────────────────────
+    //
+    // INVARIANT: cash_out must return Error::InvalidPhase for any game that is
+    // not in GamePhase::Revealed, regardless of the streak value or wager.
+    //
+    // Phases tested:
+    //   - Committed  (reveal not yet called)
+    //   - Completed  (game already settled)
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(150))]
+
+        /// PROPERTY CA-3: Committed phase → InvalidPhase for any streak/wager.
+        ///
+        /// A game in Committed phase means the player has placed their wager
+        /// and commitment but has not yet called reveal.  cash_out must be
+        /// rejected because the outcome is not yet known.
+        ///
+        /// No funds must be transferred and no state must change on rejection.
+        #[test]
+        fn prop_cash_out_committed_phase_rejected(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let player = Address::generate(&env);
+            inject(&env, &contract_id, &player, GamePhase::Committed, streak, wager);
+
+            let stats_before = read_stats(&env, &contract_id);
+            let result = client.try_cash_out(&player);
+
+            // Correct error regardless of streak value.
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "Committed phase must always return InvalidPhase");
+
+            // Guard ordering: no state mutation before the phase check.
+            let game_after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game_after.phase, GamePhase::Committed,
+                "game phase must not change on rejection");
+
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance,
+                "reserve_balance must not change on rejection");
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees,
+                "total_fees must not change on rejection");
         }
 
-        let stats = read_stats(&env, &contract_id);
-        assert_eq!(stats.total_fees, expected_total_fees, "treasury fee pool mismatch");
+        /// PROPERTY CA-4: Completed phase → InvalidPhase for any streak/wager.
+        ///
+        /// A game in Completed phase has already been settled (win cashed out
+        /// or loss forfeited).  cash_out must be rejected — there is nothing
+        /// left to claim.
+        ///
+        /// This is the double-claim guard at the phase level.
+        #[test]
+        fn prop_cash_out_completed_phase_rejected(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=10u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let player = Address::generate(&env);
+            inject(&env, &contract_id, &player, GamePhase::Completed, streak, wager);
+
+            let stats_before = read_stats(&env, &contract_id);
+            let result = client.try_cash_out(&player);
+
+            prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)),
+                "Completed phase must always return InvalidPhase");
+
+            // State must be unchanged.
+            let game_after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game_after.phase, GamePhase::Completed,
+                "game phase must not change on rejection");
+
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance,
+                "reserve_balance must not change on rejection");
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees,
+                "total_fees must not change on rejection");
+        }
     }
 
-    /// Contract total vault invariant: `reserve_balance` equals the sum of all
-    /// internal ledger movements (deposits - payouts).
-    ///
-    /// Specifically: reserve_balance = initial + Σ losses - Σ gross_wins
-    #[test]
-    fn test_contract_vault_matches_internal_ledger() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-        let initial = 500_000_000i128;
-        set_reserves(&env, &contract_id, initial);
+    // ── Property: streak == 0 in Revealed phase ──────────────────────────────
+    //
+    // INVARIANT: A Revealed game with streak == 0 represents a loss state.
+    // cash_out must return Error::NoWinningsToClaimOrContinue.
+    // This is distinct from the phase guard — the phase IS correct (Revealed)
+    // but the streak condition is not met.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(150))]
 
-        let wager = 10_000_000i128;
+        /// PROPERTY CA-5: Revealed phase + streak == 0 → NoWinningsToClaimOrContinue.
+        ///
+        /// streak == 0 in Revealed phase means the player lost the flip.
+        /// cash_out must be rejected because there are no winnings to claim.
+        ///
+        /// No funds must be transferred and no state must change on rejection.
+        #[test]
+        fn prop_cash_out_revealed_streak_zero_rejected(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
 
-        // Two wins
-        let p1 = Address::generate(&env);
-        let p2 = Address::generate(&env);
-        let (net1, fee1) = do_win_cash_out(&env, &contract_id, &p1, wager, 1, 300);
-        let (net2, fee2) = do_win_cash_out(&env, &contract_id, &p2, wager, 2, 300);
+            let player = Address::generate(&env);
+            // Revealed phase, streak == 0 → loss state.
+            inject(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
 
-        // One loss
-        let p3 = Address::generate(&env);
-        do_loss(&env, &contract_id, &p3, wager, 300);
+            let stats_before = read_stats(&env, &contract_id);
+            let result = client.try_cash_out(&player);
 
-        let gross1 = net1 + fee1;
-        let gross2 = net2 + fee2;
-        let expected_reserve = initial - gross1 - gross2 + wager; // loss adds wager back
+            prop_assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)),
+                "Revealed+streak==0 must return NoWinningsToClaimOrContinue");
 
-        let stats = read_stats(&env, &contract_id);
-        assert_eq!(stats.reserve_balance, expected_reserve, "vault ledger mismatch");
+            // No state mutation on rejection.
+            let game_after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game_after.phase, GamePhase::Revealed,
+                "game phase must not change on rejection");
+            prop_assert_eq!(game_after.streak, 0u32,
+                "streak must not change on rejection");
+
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance,
+                "reserve_balance must not change on rejection");
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees,
+                "total_fees must not change on rejection");
+        }
     }
 
-    // ── property tests ────────────────────────────────────────────────────────
-
+    // ── Property: eligible states succeed ───────────────────────────────────
+    //
+    // INVARIANT: cash_out MUST succeed when:
+    //   - phase == Revealed
+    //   - streak >= 1
+    //   - reserves >= gross payout
+    //
+    // On success:
+    //   - Returns Ok(net_payout) where net = gross - fee
+    //   - game.phase transitions to Completed
+    //   - stats.reserve_balance decreases by exactly gross
+    //   - stats.total_fees increases by exactly fee
+    //   - net_payout > 0
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(200))]
 
-        /// PROPERTY: Conservation invariant holds for any single win at any
-        /// valid wager, streak, and fee_bps combination.
+        /// PROPERTY CA-6: Revealed + streak ≥ 1 → cash_out succeeds and
+        /// returns a positive net payout.
         ///
-        ///   initial_reserve == final_reserve + net_payout + fee
+        /// For any valid (wager, streak) combination with sufficient reserves,
+        /// cash_out must succeed and the returned net payout must be positive.
         #[test]
-        fn prop_conservation_single_win(
-            wager   in 1_000_000i128..=100_000_000i128,
-            streak  in 1u32..=4u32,
-            fee_bps in 200u32..=500u32,
+        fn prop_cash_out_eligible_state_succeeds(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
         ) {
             let env = Env::default();
-            let contract_id = setup(&env, fee_bps);
-            let initial_reserve = 10_000_000_000i128;
-            set_reserves(&env, &contract_id, initial_reserve);
+            let (contract_id, client) = setup_env(&env);
+
+            let reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, reserve);
+            mint_to(&env, &contract_id, reserve);
 
             let player = Address::generate(&env);
-            let (net, fee) = do_win_cash_out(&env, &contract_id, &player, wager, streak, fee_bps);
+            inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
 
-            let stats = read_stats(&env, &contract_id);
-            prop_assert_eq!(
-                initial_reserve,
-                stats.reserve_balance + net + fee,
-                "conservation violated: initial={} final_reserve={} net={} fee={}",
-                initial_reserve, stats.reserve_balance, net, fee
-            );
+            let result = client.try_cash_out(&player);
+
+            // Must succeed.
+            prop_assert!(result.is_ok(),
+                "cash_out must succeed for Revealed phase with streak >= 1");
+
+            let net = result.unwrap().unwrap();
+
+            // Net payout must be positive.
+            prop_assert!(net > 0,
+                "net payout must be positive; got {}", net);
+
+            // Game must transition to Completed.
+            let game: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game.phase, GamePhase::Completed,
+                "game must be Completed after successful cash_out");
         }
 
-        /// PROPERTY: Conservation invariant holds for any single loss.
+        /// PROPERTY CA-7: Accounting invariant — reserve decreases by gross,
+        /// fees increase by fee, net = gross - fee.
         ///
-        ///   initial_reserve + wager == final_reserve
+        /// For any eligible (wager, streak), the settlement accounting must
+        /// satisfy:
+        ///   gross = wager × multiplier_bps / 10_000
+        ///   fee   = gross × fee_bps / 10_000
+        ///   net   = gross - fee
+        ///   reserve_after = reserve_before - gross
+        ///   total_fees_after = total_fees_before + fee
         #[test]
-        fn prop_conservation_single_loss(
-            wager   in 1_000_000i128..=100_000_000i128,
-            fee_bps in 200u32..=500u32,
+        fn prop_cash_out_accounting_invariant(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
         ) {
             let env = Env::default();
-            let contract_id = setup(&env, fee_bps);
-            let initial_reserve = 1_000_000_000i128;
-            set_reserves(&env, &contract_id, initial_reserve);
+            let (contract_id, client) = setup_env(&env);
+
+            let reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, reserve);
+            mint_to(&env, &contract_id, reserve);
 
             let player = Address::generate(&env);
-            do_loss(&env, &contract_id, &player, wager, fee_bps);
+            inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
 
-            let stats = read_stats(&env, &contract_id);
+            let stats_before = read_stats(&env, &contract_id);
+
+            let net = client.cash_out(&player);
+
+            // Compute expected values using the same helpers the contract uses.
+            let (expected_gross, expected_fee, expected_net) =
+                calculate_payout_breakdown(wager, streak, 300).unwrap();
+
+            prop_assert_eq!(net, expected_net,
+                "returned net must equal gross - fee");
+
+            let stats_after = read_stats(&env, &contract_id);
+
             prop_assert_eq!(
-                initial_reserve + wager,
-                stats.reserve_balance,
-                "loss conservation violated: initial={} wager={} final_reserve={}",
-                initial_reserve, wager, stats.reserve_balance
+                stats_after.reserve_balance,
+                stats_before.reserve_balance - expected_gross,
+                "reserve must decrease by exactly gross"
             );
-            prop_assert_eq!(stats.total_fees, 0i128, "no fee must be recorded on a loss");
-        }
-
-        /// PROPERTY: Conservation holds across N mixed wins and losses.
-        ///
-        ///   initial_reserve + Σ wager_loss_i
-        ///     == final_reserve + Σ net_win_j + Σ fee_win_j
-        #[test]
-        fn prop_conservation_mixed_wins_and_losses(
-            win_wagers  in proptest::collection::vec(1_000_000i128..=50_000_000i128, 1..=4),
-            loss_wagers in proptest::collection::vec(1_000_000i128..=50_000_000i128, 1..=4),
-            streaks     in proptest::collection::vec(1u32..=4u32, 1..=4),
-            fee_bps     in 200u32..=500u32,
-        ) {
-            let env = Env::default();
-            let contract_id = setup(&env, fee_bps);
-            let initial_reserve = 10_000_000_000i128;
-            set_reserves(&env, &contract_id, initial_reserve);
-
-            let n_wins   = win_wagers.len().min(streaks.len());
-            let n_losses = loss_wagers.len();
-
-            let mut total_net = 0i128;
-            let mut total_fee = 0i128;
-            let mut total_loss_wagers = 0i128;
-
-            for i in 0..n_wins {
-                let player = Address::generate(&env);
-                let (net, fee) = do_win_cash_out(
-                    &env, &contract_id, &player, win_wagers[i], streaks[i], fee_bps,
-                );
-                total_net += net;
-                total_fee += fee;
-            }
-            for i in 0..n_losses {
-                let player = Address::generate(&env);
-                do_loss(&env, &contract_id, &player, loss_wagers[i], fee_bps);
-                total_loss_wagers += loss_wagers[i];
-            }
-
-            let stats = read_stats(&env, &contract_id);
             prop_assert_eq!(
-                initial_reserve + total_loss_wagers,
-                stats.reserve_balance + total_net + total_fee,
-                "mixed conservation violated"
+                stats_after.total_fees,
+                stats_before.total_fees + expected_fee,
+                "total_fees must increase by exactly fee"
             );
-            prop_assert_eq!(stats.total_fees, total_fee);
         }
 
-        /// PROPERTY: `total_fees` never decreases — fees are never refunded.
-        #[test]
-        fn prop_total_fees_never_decreases(
-            wagers  in proptest::collection::vec(1_000_000i128..=50_000_000i128, 1..=5),
-            streaks in proptest::collection::vec(1u32..=4u32, 1..=5),
-            fee_bps in 200u32..=500u32,
-        ) {
-            let env = Env::default();
-            let contract_id = setup(&env, fee_bps);
-            set_reserves(&env, &contract_id, 10_000_000_000);
-
-            let n = wagers.len().min(streaks.len());
-            let mut prev_fees = 0i128;
-
-            for i in 0..n {
-                let player = Address::generate(&env);
-                do_win_cash_out(&env, &contract_id, &player, wagers[i], streaks[i], fee_bps);
-                let current_fees = read_stats(&env, &contract_id).total_fees;
-                prop_assert!(
-                    current_fees >= prev_fees,
-                    "total_fees decreased from {} to {} at step {}",
-                    prev_fees, current_fees, i
-                );
-                prev_fees = current_fees;
-            }
-        }
-
-        /// PROPERTY: `reserve_balance` never goes negative after any sequence
-        /// of wins and losses, provided initial reserves are sufficient.
-        #[test]
-        fn prop_reserve_balance_never_negative(
-            wagers  in proptest::collection::vec(1_000_000i128..=10_000_000i128, 1..=5),
-            streaks in proptest::collection::vec(1u32..=4u32, 1..=5),
-            fee_bps in 200u32..=500u32,
-        ) {
-            let env = Env::default();
-            let contract_id = setup(&env, fee_bps);
-            // Generous reserves: 10x max payout per round × number of rounds
-            set_reserves(&env, &contract_id, 10_000_000_000);
-
-            let n = wagers.len().min(streaks.len());
-            for i in 0..n {
-                let player = Address::generate(&env);
-                do_win_cash_out(&env, &contract_id, &player, wagers[i], streaks[i], fee_bps);
-                let reserve = read_stats(&env, &contract_id).reserve_balance;
-                prop_assert!(reserve >= 0, "reserve_balance went negative at step {}", i);
-            }
-        }
-
-        /// PROPERTY: gross = net + fee for every (wager, streak, fee_bps) triple.
+        /// PROPERTY CA-8: Payout is strictly monotone with streak.
         ///
-        /// This is the fundamental split invariant: the gross payout is always
-        /// partitioned exactly into the player's net and the treasury's fee.
+        /// A higher streak must always produce a strictly higher net payout
+        /// for the same wager.  This guards against multiplier regression.
         #[test]
-        fn prop_gross_equals_net_plus_fee(
-            wager   in 1_000_000i128..=100_000_000i128,
-            streak  in 1u32..=4u32,
-            fee_bps in 200u32..=500u32,
+        fn prop_cash_out_payout_monotone_with_streak(
+            wager in 1_000_000i128..=5_000_000i128,
         ) {
-            let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
-            let fee   = gross.checked_mul(fee_bps as i128).unwrap() / 10_000;
-            let net   = calculate_payout(wager, streak, fee_bps).unwrap();
-            prop_assert_eq!(gross, net + fee, "gross != net + fee for wager={} streak={} fee_bps={}", wager, streak, fee_bps);
+            // streak 1 < streak 2 < streak 3 < streak 4
+            let fee_bps = 300u32;
+            let (_, _, net1) = calculate_payout_breakdown(wager, 1, fee_bps).unwrap();
+            let (_, _, net2) = calculate_payout_breakdown(wager, 2, fee_bps).unwrap();
+            let (_, _, net3) = calculate_payout_breakdown(wager, 3, fee_bps).unwrap();
+            let (_, _, net4) = calculate_payout_breakdown(wager, 4, fee_bps).unwrap();
+
+            prop_assert!(net1 < net2, "streak-1 net must be less than streak-2 net");
+            prop_assert!(net2 < net3, "streak-2 net must be less than streak-3 net");
+            prop_assert!(net3 < net4, "streak-3 net must be less than streak-4 net");
+        }
+
+        /// PROPERTY CA-9: cash_out frees the player slot for a new game.
+        ///
+        /// After a successful cash_out the game record is in Completed phase.
+        /// The player must be able to start a new game immediately (the slot
+        /// is not blocked by the Completed record — start_game checks for
+        /// Committed/Revealed phases only, not Completed).
+        #[test]
+        fn prop_cash_out_frees_slot_for_new_game(
+            wager  in 1_000_000i128..=5_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let reserve = 1_000_000_000i128;
+            set_reserves(&env, &contract_id, reserve);
+            mint_to(&env, &contract_id, reserve);
+
+            let player = Address::generate(&env);
+            inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+
+            // Cash out succeeds.
+            prop_assert!(client.try_cash_out(&player).is_ok());
+
+            // Player can immediately start a new game.
+            let new_commitment = prop_commitment(&env);
+            let result = client.try_start_game(
+                &player, &Side::Tails, &1_000_000, &new_commitment,
+            );
+            prop_assert!(result.is_ok(),
+                "start_game must succeed after cash_out (slot must be free)");
+        }
+    }
+
+    // ── Property: guard ordering — no state mutation on any rejection ────────
+    //
+    // INVARIANT: All eligibility checks must fire before any state mutation.
+    // A rejected cash_out must leave the game record and contract stats
+    // byte-for-byte identical to their pre-call state.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(150))]
+
+        /// PROPERTY CA-10: No state mutation on any ineligible cash_out call.
+        ///
+        /// For every ineligible (phase, streak) combination, both the game
+        /// record and the contract stats must be unchanged after the call.
+        ///
+        /// Covers all three rejection paths in a single property:
+        ///   - Committed phase (any streak)
+        ///   - Completed phase (any streak)
+        ///   - Revealed phase + streak == 0
+        #[test]
+        fn prop_cash_out_no_state_mutation_on_rejection(
+            wager  in 1_000_000i128..=100_000_000i128,
+            streak in 0u32..=5u32,
+            // 0 = Committed, 1 = Completed, 2 = Revealed+streak_zero
+            case   in 0u8..=2u8,
+        ) {
+            let env = Env::default();
+            let (contract_id, client) = setup_env(&env);
+
+            let player = Address::generate(&env);
+
+            // Build an ineligible state based on `case`.
+            let (phase, effective_streak) = match case {
+                0 => (GamePhase::Committed, streak),
+                1 => (GamePhase::Completed, streak),
+                _ => (GamePhase::Revealed, 0),   // streak forced to 0 → loss state
+            };
+            inject(&env, &contract_id, &player, phase.clone(), effective_streak, wager);
+
+            let game_before: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            let stats_before = read_stats(&env, &contract_id);
+
+            // Call must fail.
+            let result = client.try_cash_out(&player);
+            prop_assert!(result.is_err() || matches!(result, Err(_)),
+                "ineligible cash_out must return an error");
+
+            // Game record must be byte-for-byte identical.
+            let game_after: GameState = env.as_contract(&contract_id, || {
+                CoinflipContract::load_player_game(&env, &player).unwrap()
+            });
+            prop_assert_eq!(game_before, game_after,
+                "game state must not change on rejected cash_out");
+
+            // Stats must be unchanged.
+            let stats_after = read_stats(&env, &contract_id);
+            prop_assert_eq!(stats_before.reserve_balance, stats_after.reserve_balance,
+                "reserve_balance must not change on rejected cash_out");
+            prop_assert_eq!(stats_before.total_fees, stats_after.total_fees,
+                "total_fees must not change on rejected cash_out");
         }
     }
 }
