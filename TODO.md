@@ -1,18 +1,13 @@
-# TODO: Complete Integration Tests for Game Flow (#340)
+# Task #341: Add property tests for fund conservation
 
-## Approved Plan Steps (Issue #340)
+## Steps (1/6 complete)
 
-### 1. [x] Create branch `add-integration-tests-complete-game-flow` ✅
-### 2. [] Extend contract/src/lib.rs integration_tests:
-   - test_losses_at_streak_1_to_4_plus(): Inject Revealed(streak=1/2/3/4+), verify cash_out/continue_streak → NoWinningsToClaimOrContinue, reserves unchanged.
-   - test_max_streak_4_wins_cash_out(): 4 consecutive wins via play_round+continue, verify 10x payout.
-   - test_streak_losses_preserve_reserves(): Loss scenarios post-streak.
-   - test_claim_winnings_token_transfers(): Verify player/treasury balances with StellarAssetClient.
-### 3. [] cd contract && cargo test (all pass + new tests)
-### 4. [] Commit: `test: add integration tests for complete game flow (#340)`
-### 5. [] gh pr create --title "..." --body "..."
-### 6. [] Update TODO.md: Mark complete
+### 1. [ ] Create branch: `git checkout -b add-property-tests-fund-conservation`
+### 2. [x] Add `prop_fund_conservation` property test to `contract/integration_tests.rs`
+### 3. [ ] `cargo test --lib integration` - verify passes 200+ cases
+### 4. [ ] Commit: `git add . && git commit -m "test: add property tests for fund conservation (#341)"`
+### 5. [ ] `gh pr create --title "Add property tests for fund conservation (#341)" --body "Implements Property 21 verifying total funds conserved across game lifecycle"`
+### 6. [ ] Verify PR tests pass
 
-**Progress**: 1/6 complete  
-**Next**: Edit lib.rs integration_tests
+**Property 21 verifies**: total_funds = player_balance + contract_reserve + treasury_balance remains constant through complete game lifecycles (start→reveal→cash_out/claim/continue) across randomized wagers/fees/streaks, 200+ iterations. ✓ Added to integration_tests.rs
 
