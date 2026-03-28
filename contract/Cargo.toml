@@ -6,6 +6,11 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[[test]]
+name = "integration"
+path = "integration_tests.rs"
+
+
 [dependencies]
 soroban-sdk = "22.0.0"
 
