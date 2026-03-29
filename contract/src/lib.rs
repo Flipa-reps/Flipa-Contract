@@ -6111,6 +6111,98 @@ mod reserve_solvency_tests {
         }
     }
 
+    // Feature: soroban-coinflip-game, Property 23: Reserve solvency check
+    //
+    // Required reserve formula:
+    //   required_reserve = wager × MULTIPLIER_STREAK_4_PLUS / 10_000
+    //                    = wager × 100_000 / 10_000
+    //                    = wager × 10
+    //
+    // Rationale: the contract must hold enough to cover the worst-case payout
+    // (streak 4+, 10x multiplier) before fees are deducted. Using the gross
+    // multiplier (not net) ensures the reserve covers both the player payout
+    // and the treasury fee in full, with no dependency on the fee rate.
+    //
+    // Boundary: the check is `reserve_balance < max_payout`, so
+    //   reserve == wager × 10       → accepted (inclusive lower bound)
+    //   reserve == wager × 10 - 1   → rejected
+    //
+    // Assumptions:
+    //   - wager is already validated to be within [min_wager, max_wager]
+    //   - reserve_balance is a signed i128; negative values are impossible in
+    //     normal operation but are handled safely (they satisfy < max_payout)
+    //   - overflow in checked_mul returns Err(InsufficientReserves) directly
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// PROPERTY 23a: Solvency satisfied — game accepted.
+        /// For any wager where reserve >= wager * 10, start_game must succeed.
+        #[test]
+        fn prop_23a_solvency_satisfied_game_accepted(
+            wager   in 1_000_000i128..=1_000_000_000i128,
+            surplus in 0i128..=1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let required = wager * 10;
+            let reserves = required + surplus;
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert!(result.is_ok(),
+                "reserve ({}) >= required ({}): game must be accepted", reserves, required);
+        }
+
+        /// PROPERTY 23b: Solvency not satisfied — game rejected with InsufficientReserves.
+        /// For any wager where reserve < wager * 10, start_game must return InsufficientReserves.
+        #[test]
+        fn prop_23b_solvency_not_satisfied_game_rejected(
+            wager   in 1_000_000i128..=1_000_000_000i128,
+            deficit in 1i128..=9_999_999_999i128,
+        ) {
+            let env = Env::default();
+            let required = wager * 10;
+            let reserves = (required - deficit).max(0);
+            prop_assume!(reserves < required);
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
+                "reserve ({}) < required ({}): must return InsufficientReserves", reserves, required);
+        }
+
+        /// PROPERTY 23c: Boundary inclusive — reserve == wager * 10 is accepted.
+        #[test]
+        fn prop_23c_boundary_exact_accepted(
+            wager in 1_000_000i128..=1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let reserves = wager * 10;
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert!(result.is_ok(),
+                "reserve == wager*10 ({}): boundary must be accepted", reserves);
+        }
+
+        /// PROPERTY 23d: Boundary exclusive — reserve == wager * 10 - 1 is rejected.
+        #[test]
+        fn prop_23d_boundary_minus_one_rejected(
+            wager in 1_000_000i128..=1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let reserves = wager * 10 - 1;
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
+                "reserve == wager*10-1 ({}): must be rejected", reserves);
+        }
+    }
+
     #[test]
     fn test_exact_threshold_acceptance() {
         let env = Env::default();
