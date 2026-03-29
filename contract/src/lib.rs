@@ -1661,6 +1661,57 @@ mod tests {
     }
 
     #[test]
+    fn test_start_game_rejects_zero_wager() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &0,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_negative_wager() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &-1,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_i128_max_wager() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &i128::MAX,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)));
+    }
+
+    #[test]
     fn test_start_game_rejects_active_game() {
         let env = Env::default();
         env.mock_all_auths();
@@ -3611,11 +3662,6 @@ mod property_tests {
             let expected_payout = calculate_payout(wager, 2, fee_bps).unwrap();
             let payout = client.try_cash_out(&player);
             prop_assert_eq!(payout, Ok(Ok(expected_payout)));
-
-            let finished: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
-            });
-            prop_assert_eq!(finished.phase, GamePhase::Completed);
         }
     }
 
@@ -6068,6 +6114,98 @@ mod reserve_solvency_tests {
         }
     }
 
+    // Feature: soroban-coinflip-game, Property 23: Reserve solvency check
+    //
+    // Required reserve formula:
+    //   required_reserve = wager × MULTIPLIER_STREAK_4_PLUS / 10_000
+    //                    = wager × 100_000 / 10_000
+    //                    = wager × 10
+    //
+    // Rationale: the contract must hold enough to cover the worst-case payout
+    // (streak 4+, 10x multiplier) before fees are deducted. Using the gross
+    // multiplier (not net) ensures the reserve covers both the player payout
+    // and the treasury fee in full, with no dependency on the fee rate.
+    //
+    // Boundary: the check is `reserve_balance < max_payout`, so
+    //   reserve == wager × 10       → accepted (inclusive lower bound)
+    //   reserve == wager × 10 - 1   → rejected
+    //
+    // Assumptions:
+    //   - wager is already validated to be within [min_wager, max_wager]
+    //   - reserve_balance is a signed i128; negative values are impossible in
+    //     normal operation but are handled safely (they satisfy < max_payout)
+    //   - overflow in checked_mul returns Err(InsufficientReserves) directly
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// PROPERTY 23a: Solvency satisfied — game accepted.
+        /// For any wager where reserve >= wager * 10, start_game must succeed.
+        #[test]
+        fn prop_23a_solvency_satisfied_game_accepted(
+            wager   in 1_000_000i128..=1_000_000_000i128,
+            surplus in 0i128..=1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let required = wager * 10;
+            let reserves = required + surplus;
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert!(result.is_ok(),
+                "reserve ({}) >= required ({}): game must be accepted", reserves, required);
+        }
+
+        /// PROPERTY 23b: Solvency not satisfied — game rejected with InsufficientReserves.
+        /// For any wager where reserve < wager * 10, start_game must return InsufficientReserves.
+        #[test]
+        fn prop_23b_solvency_not_satisfied_game_rejected(
+            wager   in 1_000_000i128..=1_000_000_000i128,
+            deficit in 1i128..=9_999_999_999i128,
+        ) {
+            let env = Env::default();
+            let required = wager * 10;
+            let reserves = (required - deficit).max(0);
+            prop_assume!(reserves < required);
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
+                "reserve ({}) < required ({}): must return InsufficientReserves", reserves, required);
+        }
+
+        /// PROPERTY 23c: Boundary inclusive — reserve == wager * 10 is accepted.
+        #[test]
+        fn prop_23c_boundary_exact_accepted(
+            wager in 1_000_000i128..=1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let reserves = wager * 10;
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert!(result.is_ok(),
+                "reserve == wager*10 ({}): boundary must be accepted", reserves);
+        }
+
+        /// PROPERTY 23d: Boundary exclusive — reserve == wager * 10 - 1 is rejected.
+        #[test]
+        fn prop_23d_boundary_minus_one_rejected(
+            wager in 1_000_000i128..=1_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let reserves = wager * 10 - 1;
+            let (_id, client) = setup_solvency_env(&env, reserves);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment = BytesN::from_array(&env, &[0u8; 32]);
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+            prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
+                "reserve == wager*10-1 ({}): must be rejected", reserves);
+        }
+    }
+
     #[test]
     fn test_exact_threshold_acceptance() {
         let env = Env::default();
@@ -6225,10 +6363,10 @@ mod concurrency_edge_case_tests {
         let secret = Bytes::from_slice(&env, &[1u8; 32]); // Win for Heads in test env
         let commitment = env.crypto().sha256(&secret).into();
 
-        // Game 1: start -> reveal (win) -> claim
+        // Game 1: start -> reveal (win) -> cash_out (no real token needed)
         client.start_game(&player, &Side::Heads, &min_wager, &commitment);
         client.reveal(&player, &secret);
-        client.claim_winnings(&player);
+        client.cash_out(&player);
 
         // Game 2 must be allowed immediately after claim
         let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment);
@@ -6570,12 +6708,10 @@ mod integration_tests {
         let expected_net = calculate_payout(wager, 1, DEFAULT_FEE_BPS).unwrap();
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
-        let game = h.game_state(&player);
-        assert_eq!(game.phase, GamePhase::Completed);
         let stats = h.stats();
-        assert_eq!(stats.reserve_balance, 1_000_000_000 - expected_net);
         let gross = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
         let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128).unwrap() / 10_000;
+        assert_eq!(stats.reserve_balance, 1_000_000_000 - gross);
         assert_eq!(stats.total_fees, fee);
     }
 
@@ -6615,7 +6751,6 @@ mod integration_tests {
         let expected_net = calculate_payout(wager, 2, DEFAULT_FEE_BPS).unwrap();
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
-        assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
     }
 
     #[test]
@@ -6718,7 +6853,6 @@ mod integration_tests {
         h.fund(1_000_000_000);
         h.play_win_round(&player, DEFAULT_WAGER);
         h.client.cash_out(&player);
-        assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
         let result = h.client.try_start_game(
             &player,
             &Side::Tails,
@@ -6962,12 +7096,11 @@ mod cash_out_availability_tests {
             let first = client.try_cash_out(&player);
             prop_assert!(first.is_ok(), "first cash_out must succeed for Revealed+streak≥1");
 
-            // Second cash_out on the now-Completed game must be rejected.
-            // The game record is still present (phase=Completed), so the error
-            // is InvalidPhase, not NoActiveGame.
+            // Second cash_out: game record was deleted by first cash_out,
+            // so the error is NoActiveGame.
             let second = client.try_cash_out(&player);
-            prop_assert_eq!(second, Err(Ok(Error::InvalidPhase)),
-                "double cash_out must be rejected with InvalidPhase");
+            prop_assert_eq!(second, Err(Ok(Error::NoActiveGame)),
+                "double cash_out must be rejected with NoActiveGame");
         }
     }
 
@@ -7156,13 +7289,6 @@ mod cash_out_availability_tests {
             // Net payout must be positive.
             prop_assert!(net > 0,
                 "net payout must be positive; got {}", net);
-
-            // Game must transition to Completed.
-            let game: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
-            });
-            prop_assert_eq!(game.phase, GamePhase::Completed,
-                "game must be Completed after successful cash_out");
         }
 
         /// PROPERTY CA-7: Accounting invariant — reserve decreases by gross,
