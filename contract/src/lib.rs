@@ -1296,6 +1296,9 @@ impl CoinflipContract {
 }
 
 #[cfg(test)]
+mod multiplier_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
@@ -4031,6 +4034,7 @@ mod property_tests {
             contract_random: dummy,
             fee_bps: 300,
             phase,
+            start_ledger: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -6859,6 +6863,7 @@ mod cash_out_availability_tests {
             contract_random: dummy,
             fee_bps: 300,
             phase,
+            start_ledger: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
