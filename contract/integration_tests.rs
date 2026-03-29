@@ -1,5 +1,7 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger, StellarAssetClient as _};
+use proptest::{prelude::*, collection::vec};
+use proptest::prop_assert_eq;
 
 #[cfg(test)]
 mod integration_tests {
@@ -114,6 +116,24 @@ mod integration_tests {
             combined.append(&cr_copy);
             let outcome_bit = self.env.crypto().sha256(&combined).to_array()[0] % 2;
             if outcome_bit == 0 { Side::Heads } else { Side::Tails }
+        }
+
+        /// PROPERTY 21 HELPER: Get total funds = player_balance + contract_reserve + treasury_balance
+        pub fn total_funds(&self, player: &Address) -> i128 {
+            let contract_id = self.env.current_contract_address();
+            let token_id: Address = self.env.as_contract(&contract_id, || {
+                CoinflipContract::load_config(&self.env).token.clone()
+            });
+            let token_client = soroban_sdk::token::StellarAssetClient::new(&self.env, &token_id);
+            
+            let config = self.env.as_contract(&contract_id, || CoinflipContract::load_config(&self.env));
+            let treasury = config.treasury.clone();
+            
+            let player_balance = token_client.balance(player);
+            let treasury_balance = token_client.balance(&treasury);
+            let reserve_balance = self.stats().reserve_balance;
+            
+            player_balance + treasury_balance + reserve_balance
         }
     }
 
@@ -231,6 +251,99 @@ mod integration_tests {
         assert_eq!(token_client.balance(&contract_id), pre_contract - gross);
         assert_eq!(token_client.balance(&player), pre_player + net);
         assert_eq!(token_client.balance(&treasury), pre_treasury + fee);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// PROPERTY 21: Fund Conservation
+        /// Total funds = player_balance + contract_reserve + treasury_balance remains
+        /// constant throughout complete game lifecycles with randomized wagers, fees,
+        /// settlement choices, and multi-round streaks.
+        ///
+        /// Tests scenarios:
+        /// - Direct win → cash_out
+        /// - Win → continue_streak → next win/loss
+        /// - Pure loss sequences (forfeit to reserves)
+        /// - claim_winnings with token transfers
+        ///
+        /// Invariant: sum unchanged after every operation.
+        #[test]
+        fn prop_fund_conservation(
+            fee_bps   in 200u32..=500u32,
+            base_wager in 2_000_000i128..20_000_000i128,
+            num_rounds in 1usize..6usize,
+            continue_chance in 0.0f64..1.0,
+            use_claim_winnings in any::<bool>(),
+        ) {
+            let mut h = Harness::new();
+            
+            // Set custom fee for this test run
+            let contract_id = h.env.current_contract_address();
+            h.env.as_contract(&contract_id, || {
+                let mut config = CoinflipContract::load_config(&h.env);
+                config.fee_bps = fee_bps;
+                CoinflipContract::save_config(&h.env, &config);
+            });
+            
+            let player = h.player();
+            let mut initial_reserve = 1_000_000_000i128;
+            h.fund(initial_reserve);
+            
+            // Mint excess tokens to contract to cover all possible payouts
+            let token_id: Address = h.env.as_contract(&contract_id, || {
+                CoinflipContract::load_config(&h.env).token.clone()
+            });
+            let token_client = soroban_sdk::token::StellarAssetClient::new(&h.env, &token_id);
+            token_client.mint(&contract_id, &initial_reserve);
+            
+            let initial_total = h.total_funds(&player);
+            
+            let mut current_wager = base_wager;
+            for round in 0..num_rounds {
+                // Play round
+                let is_win = h.play_win_round(&player, current_wager);
+                
+                // Verify conservation after reveal
+                prop_assert_eq!(h.total_funds(&player), initial_total,
+                    "Funds mismatch after round {} reveal (win={})", round, is_win);
+                
+                if !is_win {
+                    // Loss: game deleted, wager → reserves (no further action needed)
+                    continue;
+                }
+                
+                // Win: choose settlement or continue based on probability
+                let game = h.game_state(&player).unwrap();
+                let streak = game.streak;
+                
+                if rand::random::<f64>() < continue_chance && streak < 4 {
+                    // Continue streak (no funds move)
+                    let next_commitment = h.make_commitment(42u8);
+                    h.client.continue_streak(&player, &next_commitment).unwrap();
+                    // Double wager for next round risk
+                    current_wager = current_wager * 2;
+                    prop_assert_eq!(h.total_funds(&player), initial_total,
+                        "Funds mismatch after continue_streak (streak={})", streak);
+                } else {
+                    // Settle: cash_out or claim_winnings
+                    if use_claim_winnings {
+                        h.client.claim_winnings(&player).unwrap();
+                    } else {
+                        h.client.cash_out(&player).unwrap();
+                    }
+                    // Reset wager for next game
+                    current_wager = base_wager;
+                    prop_assert_eq!(h.total_funds(&player), initial_total,
+                        "Funds mismatch after settlement (streak={}, claim={})", 
+                        streak, use_claim_winnings);
+                }
+            }
+            
+            // Final verification after all rounds
+            prop_assert_eq!(h.total_funds(&player), initial_total,
+                "Funds mismatch after {} complete rounds", num_rounds);
+        }
     }
 }
 
