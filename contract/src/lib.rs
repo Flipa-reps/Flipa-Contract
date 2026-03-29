@@ -7363,3 +7363,130 @@ mod cash_out_availability_tests {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #344 — Admin Access Control Tests
+//
+// Verifies that all four admin-only functions reject non-admin callers with
+// Error::Unauthorized and that the legitimate admin always succeeds.
+//
+// Functions under test: set_fee, set_wager_limits, set_treasury, set_paused
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod admin_access_control_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    /// Returns (contract_id, client, admin, treasury).
+    fn setup(env: &Env) -> (Address, CoinflipContractClient, Address, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin    = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token    = Address::generate(env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        (contract_id, client, admin, treasury)
+    }
+
+    // ── set_fee ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_fee_two_non_admins_both_rejected() {
+        let env = Env::default();
+        let (_, client, _, _) = setup(&env);
+        let stranger1 = Address::generate(&env);
+        let stranger2 = Address::generate(&env);
+        assert_eq!(client.try_set_fee(&stranger1, &400), Err(Ok(Error::Unauthorized)));
+        assert_eq!(client.try_set_fee(&stranger2, &400), Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_fee_treasury_rejected() {
+        let env = Env::default();
+        let (_, client, _, treasury) = setup(&env);
+        assert_eq!(client.try_set_fee(&treasury, &400), Err(Ok(Error::Unauthorized)));
+    }
+
+    // ── set_wager_limits ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_wager_limits_two_non_admins_both_rejected() {
+        let env = Env::default();
+        let (_, client, _, _) = setup(&env);
+        let stranger1 = Address::generate(&env);
+        let stranger2 = Address::generate(&env);
+        assert_eq!(client.try_set_wager_limits(&stranger1, &2_000_000, &200_000_000), Err(Ok(Error::Unauthorized)));
+        assert_eq!(client.try_set_wager_limits(&stranger2, &2_000_000, &200_000_000), Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_wager_limits_treasury_rejected() {
+        let env = Env::default();
+        let (_, client, _, treasury) = setup(&env);
+        assert_eq!(client.try_set_wager_limits(&treasury, &2_000_000, &200_000_000), Err(Ok(Error::Unauthorized)));
+    }
+
+    // ── set_treasury ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_treasury_two_non_admins_both_rejected() {
+        let env = Env::default();
+        let (_, client, _, _) = setup(&env);
+        let stranger1 = Address::generate(&env);
+        let stranger2 = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+        assert_eq!(client.try_set_treasury(&stranger1, &new_treasury), Err(Ok(Error::Unauthorized)));
+        assert_eq!(client.try_set_treasury(&stranger2, &new_treasury), Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_treasury_current_treasury_rejected() {
+        let env = Env::default();
+        let (_, client, _, treasury) = setup(&env);
+        let new_treasury = Address::generate(&env);
+        assert_eq!(client.try_set_treasury(&treasury, &new_treasury), Err(Ok(Error::Unauthorized)));
+    }
+
+    // ── set_paused ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_paused_two_non_admins_both_rejected() {
+        let env = Env::default();
+        let (_, client, _, _) = setup(&env);
+        let stranger1 = Address::generate(&env);
+        let stranger2 = Address::generate(&env);
+        assert_eq!(client.try_set_paused(&stranger1, &true), Err(Ok(Error::Unauthorized)));
+        assert_eq!(client.try_set_paused(&stranger2, &true), Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_set_paused_treasury_rejected() {
+        let env = Env::default();
+        let (_, client, _, treasury) = setup(&env);
+        assert_eq!(client.try_set_paused(&treasury, &true), Err(Ok(Error::Unauthorized)));
+    }
+
+    // ── Admin succeeds on all four functions ─────────────────────────────────
+
+    #[test]
+    fn test_admin_succeeds_on_all_functions() {
+        let env = Env::default();
+        let (contract_id, client, admin, _) = setup(&env);
+        let new_treasury = Address::generate(&env);
+
+        assert!(client.try_set_fee(&admin, &400).is_ok());
+        assert!(client.try_set_wager_limits(&admin, &2_000_000, &200_000_000).is_ok());
+        assert!(client.try_set_treasury(&admin, &new_treasury).is_ok());
+        assert!(client.try_set_paused(&admin, &true).is_ok());
+
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(cfg.fee_bps, 400);
+        assert_eq!(cfg.min_wager, 2_000_000);
+        assert_eq!(cfg.max_wager, 200_000_000);
+        assert_eq!(cfg.treasury, new_treasury);
+        assert!(cfg.paused);
+    }
+}
