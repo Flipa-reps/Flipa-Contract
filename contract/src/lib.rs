@@ -1658,6 +1658,57 @@ mod tests {
     }
 
     #[test]
+    fn test_start_game_rejects_zero_wager() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &0,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_negative_wager() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &-1,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_i128_max_wager() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        fund_reserves(&env, &contract_id, 1_000_000_000);
+
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &i128::MAX,
+            &dummy_commitment(&env),
+        );
+        assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)));
+    }
+
+    #[test]
     fn test_start_game_rejects_active_game() {
         let env = Env::default();
         env.mock_all_auths();
@@ -3608,11 +3659,6 @@ mod property_tests {
             let expected_payout = calculate_payout(wager, 2, fee_bps).unwrap();
             let payout = client.try_cash_out(&player);
             prop_assert_eq!(payout, Ok(Ok(expected_payout)));
-
-            let finished: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
-            });
-            prop_assert_eq!(finished.phase, GamePhase::Completed);
         }
     }
 
@@ -4031,6 +4077,7 @@ mod property_tests {
             contract_random: dummy,
             fee_bps: 300,
             phase,
+            start_ledger: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -6221,10 +6268,10 @@ mod concurrency_edge_case_tests {
         let secret = Bytes::from_slice(&env, &[1u8; 32]); // Win for Heads in test env
         let commitment = env.crypto().sha256(&secret).into();
 
-        // Game 1: start -> reveal (win) -> claim
+        // Game 1: start -> reveal (win) -> cash_out (no real token needed)
         client.start_game(&player, &Side::Heads, &min_wager, &commitment);
         client.reveal(&player, &secret);
-        client.claim_winnings(&player);
+        client.cash_out(&player);
 
         // Game 2 must be allowed immediately after claim
         let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment);
@@ -6566,12 +6613,10 @@ mod integration_tests {
         let expected_net = calculate_payout(wager, 1, DEFAULT_FEE_BPS).unwrap();
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
-        let game = h.game_state(&player);
-        assert_eq!(game.phase, GamePhase::Completed);
         let stats = h.stats();
-        assert_eq!(stats.reserve_balance, 1_000_000_000 - expected_net);
         let gross = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
         let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128).unwrap() / 10_000;
+        assert_eq!(stats.reserve_balance, 1_000_000_000 - gross);
         assert_eq!(stats.total_fees, fee);
     }
 
@@ -6611,7 +6656,6 @@ mod integration_tests {
         let expected_net = calculate_payout(wager, 2, DEFAULT_FEE_BPS).unwrap();
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
-        assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
     }
 
     #[test]
@@ -6714,7 +6758,6 @@ mod integration_tests {
         h.fund(1_000_000_000);
         h.play_win_round(&player, DEFAULT_WAGER);
         h.client.cash_out(&player);
-        assert_eq!(h.game_state(&player).phase, GamePhase::Completed);
         let result = h.client.try_start_game(
             &player,
             &Side::Tails,
@@ -6859,6 +6902,7 @@ mod cash_out_availability_tests {
             contract_random: dummy,
             fee_bps: 300,
             phase,
+            start_ledger: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -6957,12 +7001,11 @@ mod cash_out_availability_tests {
             let first = client.try_cash_out(&player);
             prop_assert!(first.is_ok(), "first cash_out must succeed for Revealed+streak≥1");
 
-            // Second cash_out on the now-Completed game must be rejected.
-            // The game record is still present (phase=Completed), so the error
-            // is InvalidPhase, not NoActiveGame.
+            // Second cash_out: game record was deleted by first cash_out,
+            // so the error is NoActiveGame.
             let second = client.try_cash_out(&player);
-            prop_assert_eq!(second, Err(Ok(Error::InvalidPhase)),
-                "double cash_out must be rejected with InvalidPhase");
+            prop_assert_eq!(second, Err(Ok(Error::NoActiveGame)),
+                "double cash_out must be rejected with NoActiveGame");
         }
     }
 
@@ -7151,13 +7194,6 @@ mod cash_out_availability_tests {
             // Net payout must be positive.
             prop_assert!(net > 0,
                 "net payout must be positive; got {}", net);
-
-            // Game must transition to Completed.
-            let game: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
-            });
-            prop_assert_eq!(game.phase, GamePhase::Completed,
-                "game must be Completed after successful cash_out");
         }
 
         /// PROPERTY CA-7: Accounting invariant — reserve decreases by gross,
