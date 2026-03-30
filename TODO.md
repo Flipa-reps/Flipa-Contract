@@ -1,33 +1,22 @@
-# Cross-Browser Compatibility Tests - Issue #377
+# Snapshot Tests for Contract State Serialization (#379)
 
-## Plan Progress
+✅ **Complete** - All requirements implemented in `contract/src/snapshot_tests.rs`:
 
-✅ **Step 1**: Plan approved by user. Create TODO.md for tracking.
+## Implemented Coverage:
+- [x] ContractConfig snapshots (default, edge cases: paused=true, max fee/wager)
+- [x] ContractStats snapshots (zero state, production values)
+- [x] GameState snapshots (Committed, all phases via macro, streak edge cases 0-4+u32::MAX)
+- [x] Enum variant serialization (Side, GamePhase, StorageKey, Error stable codes)
+- [x] Roundtrip ser/de verification (bytes identical after ser→de→ser)
+- [x] Backward compatibility probes (legacy bytes deserialization)
+- [x] Snapshot update workflow (`cargo test update_snapshots`)
 
-✅ **Step 2**: Create git branch `add-cross-browser-compatibility-tests`.
+## Verification Commands:
+```bash
+cd contract
+cargo test snapshot_tests -- --nocapture   # Review snapshots
+cargo test update_snapshots               # Update if needed
+```
 
-⏳ **Step 3**: cd frontend && npm install -D @playwright/test && npx playwright install --with-deps.
-
-⏳ **Step 4**: Update frontend/package.json with Playwright scripts/deps.
-
-✅ **Step 5**: Create frontend/playwright.config.ts.
-
-✅ **Step 6**: Update frontend/vite.config.ts for baseURL.
-
-✅ **Step 7**: Create frontend/tests/e2e/ directory and tests:
-   - wallet.spec.ts (wallet connection)
-   - gameflow.spec.ts (wager/commit/reveal/cashout)
-   - responsive.spec.ts (mobile/desktop)
-
-⏳ **Step 8**: Update frontend/README.md or create CROSS_BROWSER_TESTS.md with instructions/report.
-
-⏳ **Step 9**: Run tests locally across browsers, verify screenshots/videos.
-
-⏳ **Step 10**: Commit changes with scoped messages, create PR referencing #377.
-
-**Notes**:
-- Testing Chrome, Firefox, Safari(WebKit), Edge, mobile emulations.
-- Use Playwright HTML reporter for cross-browser matrix.
-- Mock Stellar wallet SDK for tests.
-
+**Status:** Ready for branch/commit. Tests pass and catch unintended state changes.
 
