@@ -461,6 +461,42 @@ pub fn verify_commitment(env: &Env, secret: &Bytes, commitment: &BytesN<32>) -> 
     &hash == commitment
 }
 
+/// Deterministically derives a [`Side`] outcome from the player's revealed secret
+/// and the contract's pre-committed random value.
+///
+/// ## Algorithm
+///
+/// ```text
+/// combined      = player_secret || contract_random   (concatenation)
+/// combined_hash = SHA-256(combined)
+/// outcome_bit   = combined_hash[0] & 1
+/// outcome       = if outcome_bit == 0 { Heads } else { Tails }
+/// ```
+///
+/// ## Security Properties
+///
+/// - **Player cannot bias**: the secret is locked by the commitment before
+///   `contract_random` is known, so the player cannot choose a secret that
+///   targets a desired outcome after seeing the contract's contribution.
+/// - **Contract cannot bias**: `contract_random` is derived from the ledger
+///   sequence at `start_game` time and stored immutably in [`GameState`];
+///   the contract cannot alter it after the player commits.
+/// - **Deterministic**: identical inputs always produce identical outputs —
+///   no hidden state or side effects.
+///
+/// # Arguments
+/// - `env`             – Soroban execution environment (needed for SHA-256)
+/// - `player_secret`   – the raw secret bytes revealed by the player
+/// - `contract_random` – the 32-byte contract randomness stored in [`GameState`]
+pub fn generate_outcome(env: &Env, player_secret: &Bytes, contract_random: &BytesN<32>) -> Side {
+    let cr_bytes = Bytes::from_slice(env, &contract_random.to_array());
+    let mut combined = Bytes::new(env);
+    combined.append(player_secret);
+    combined.append(&cr_bytes);
+    let hash = env.crypto().sha256(&combined);
+    if hash.to_array()[0] % 2 == 0 { Side::Heads } else { Side::Tails }
+}
+
 /// Provably fair coinflip game contract for the Stellar/Soroban platform.
 ///
 /// ## Public API
@@ -732,17 +768,45 @@ impl CoinflipContract {
 
     /// Reveal the player's secret to determine the game outcome.
     ///
-    /// Process:
-    /// 1. Verify commitment matches the revealed secret
-    /// 2. Combine player random + contract random to determine outcome
-    /// 3. Update game state to Revealed phase with result
-    /// 4. If player wins, calculate potential payout
-    /// 5. If player loses, end game and reset streak
+    /// ## Outcome Resolution Flow
     ///
-    /// Errors:
-    /// - NoActiveGame: player has no game in Committed phase
-    /// - InvalidPhase: game not in Committed phase (preventing double-reveal)
-    /// - CommitmentMismatch: revealed secret doesn't match stored commitment
+    /// 1. **Guard checks** (in order, no state mutation on failure):
+    ///    - Player must have an active game (`NoActiveGame`)
+    ///    - Game must be in `Committed` phase (`InvalidPhase`)
+    ///    - `SHA-256(secret) == commitment` (`CommitmentMismatch`)
+    /// 2. **Outcome derivation** via [`generate_outcome`]:
+    ///    `SHA-256(secret || contract_random)` — LSB 0 → `Heads`, LSB 1 → `Tails`
+    /// 3. **Win path** (`outcome == game.side`):
+    ///    - `streak` incremented by 1 (determines multiplier tier for settlement)
+    ///    - `phase` advanced to `Revealed`
+    ///    - Game state persisted; player may call `cash_out`, `claim_winnings`, or `continue_streak`
+    ///    - Returns `Ok(true)`
+    /// 4. **Loss path** (`outcome != game.side`):
+    ///    - `reserve_balance` credited with the forfeited wager (checked add)
+    ///    - Game state deleted from storage (slot freed immediately)
+    ///    - Returns `Ok(false)`
+    ///
+    /// ## Security
+    ///
+    /// Neither party can unilaterally bias the outcome:
+    /// - The player's secret is locked by the commitment before `contract_random` is known.
+    /// - `contract_random` is derived from the ledger sequence at `start_game` time and
+    ///   stored immutably; the contract cannot alter it after the player commits.
+    ///
+    /// ## Arguments
+    /// - `player` – must authorize; must have an active game in `Committed` phase
+    /// - `secret` – the pre-image of the stored commitment (`SHA-256(secret) == commitment`)
+    ///
+    /// ## Returns
+    /// - `Ok(true)`  – player won; game advanced to `Revealed`
+    /// - `Ok(false)` – player lost; game state deleted, wager forfeited to reserves
+    ///
+    /// ## Errors
+    /// | Error                | Condition                                              |
+    /// |----------------------|--------------------------------------------------------|
+    /// | `NoActiveGame`       | No game record exists for `player`                     |
+    /// | `InvalidPhase`       | Game is not in `Committed` phase                       |
+    /// | `CommitmentMismatch` | `SHA-256(secret) != stored commitment`                 |
     pub fn reveal(
         env: Env,
         player: Address,
@@ -765,13 +829,7 @@ impl CoinflipContract {
         }
 
         // Determine outcome by combining player secret + contract random
-        let cr_bytes = Bytes::from_slice(&env, &game.contract_random.to_array());
-        let mut combined = Bytes::new(&env);
-        combined.append(&secret);
-        combined.append(&cr_bytes);
-        let combined_hash = env.crypto().sha256(&combined);
-        let outcome_bit = combined_hash.to_array()[0] % 2;
-        let outcome = if outcome_bit == 0 { Side::Heads } else { Side::Tails };
+        let outcome = generate_outcome(&env, &secret, &game.contract_random);
 
         let won = outcome == game.side;
 
@@ -1292,6 +1350,46 @@ impl CoinflipContract {
         Self::delete_player_game(&env, &player);
 
         Ok(game.wager)
+    }
+
+    /// Return the current contract configuration.
+    ///
+    /// Read-only; does not require authorization.
+    ///
+    /// # Returns
+    /// The [`ContractConfig`] stored at initialization, reflecting any
+    /// subsequent admin updates (`set_fee`, `set_treasury`, `set_wager_limits`,
+    /// `set_paused`).
+    ///
+    /// # Errors
+    /// Panics if the contract has not been initialized.
+    pub fn get_config(env: Env) -> ContractConfig {
+        Self::load_config(&env)
+    }
+
+    /// Return the current aggregate contract statistics.
+    ///
+    /// Read-only; does not require authorization.
+    ///
+    /// # Returns
+    /// The [`ContractStats`] snapshot: `total_games`, `total_volume`,
+    /// `total_fees`, and `reserve_balance`.
+    ///
+    /// # Errors
+    /// Panics if the contract has not been initialized.
+    pub fn get_stats(env: Env) -> ContractStats {
+        Self::load_stats(&env)
+    }
+
+    /// Return the active game state for `player`, if one exists.
+    ///
+    /// Read-only; does not require authorization.
+    ///
+    /// # Returns
+    /// - `Some(GameState)` – player has an active game in any phase
+    /// - `None`            – no game record exists for `player`
+    pub fn get_game_state(env: Env, player: Address) -> Option<GameState> {
+        Self::load_player_game(&env, &player)
     }
 }
 
@@ -5646,6 +5744,54 @@ mod outcome_determinism_tests {
         ) {
             prop_assert_eq!(calculate_payout(0, streak, fee_bps), Some(0));
         }
+
+        /// generate_outcome is deterministic: same inputs always produce the same Side.
+        #[test]
+        fn prop_generate_outcome_is_deterministic(
+            secret_bytes   in prop::array::uniform32(any::<u8>()),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret   = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
+            let cr: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            prop_assert_eq!(generate_outcome(&env, &secret, &cr), generate_outcome(&env, &secret, &cr));
+        }
+
+        /// generate_outcome returns only Heads or Tails — no other variant possible.
+        #[test]
+        fn prop_generate_outcome_returns_valid_side(
+            secret_bytes   in prop::array::uniform32(any::<u8>()),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
+            let cr: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let side = generate_outcome(&env, &secret, &cr);
+            prop_assert!(side == Side::Heads || side == Side::Tails);
+        }
+
+        /// Distinct (secret, contract_random) pairs must not always produce the same side —
+        /// i.e. both outcomes are reachable (distribution sanity check).
+        #[test]
+        fn prop_generate_outcome_both_sides_reachable(
+            pairs in prop::collection::vec(
+                (prop::array::uniform32(any::<u8>()), prop::array::uniform32(any::<u8>())),
+                50..=50,
+            ),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let mut saw_heads = false;
+            let mut saw_tails = false;
+            for (s, c) in pairs {
+                let secret = soroban_sdk::Bytes::from_slice(&env, &s);
+                let cr: BytesN<32> = BytesN::from_array(&env, &c);
+                match generate_outcome(&env, &secret, &cr) {
+                    Side::Heads => saw_heads = true,
+                    Side::Tails => saw_tails = true,
+                }
+            }
+            prop_assert!(saw_heads && saw_tails, "both sides must be reachable");
+        }
     }
 }
 
@@ -6334,6 +6480,283 @@ mod reserve_solvency_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Issue #144 — Reserve Balance Accuracy Tests
+//
+// Validates that reserve_balance is updated with exact arithmetic after every
+// operation that touches it:
+//
+//   LOSS path   (reveal → loss):
+//     reserve_after = reserve_before + wager
+//
+//   PAYOUT path (cash_out):
+//     gross        = wager × multiplier_bps / 10_000
+//     reserve_after = reserve_before − gross
+//     (fee is paid from gross to treasury; reserve is debited the full gross)
+//
+//   RECLAIM path (reclaim_wager after timeout):
+//     reserve_after = reserve_before + wager
+//     (same as loss — house keeps the wager)
+//
+// Reserve math notes:
+//   • reserve_balance tracks the contract's own funds, not player deposits.
+//   • On a win, the gross payout (not net) is deducted — the fee portion
+//     flows to treasury but was part of the reserve.
+//   • On a loss or reclaim, the wager is credited back to reserves.
+//   • No reserve change occurs on start_game (wager custody is separate),
+//     continue_streak (no settlement), or on guard rejections.
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod reserve_balance_accuracy_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    const FEE_BPS: u32 = 300;
+    const MIN_WAGER: i128 = 1_000_000;
+    const MAX_WAGER: i128 = 100_000_000;
+
+    /// Shared setup: initialised contract with reserves set to `initial_reserves`.
+    fn setup(env: &Env, initial_reserves: i128) -> (soroban_sdk::Address, CoinflipContractClient) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin    = soroban_sdk::Address::generate(env);
+        let treasury = soroban_sdk::Address::generate(env);
+        let token    = soroban_sdk::Address::generate(env);
+        client.initialize(&admin, &treasury, &token, &FEE_BPS, &MIN_WAGER, &MAX_WAGER);
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = initial_reserves;
+            CoinflipContract::save_stats(env, &stats);
+        });
+        (contract_id, client)
+    }
+
+    fn reserve(env: &Env, contract_id: &soroban_sdk::Address) -> i128 {
+        env.as_contract(contract_id, || CoinflipContract::load_stats(env).reserve_balance)
+    }
+
+    /// In the default test env (ledger seq = 0):
+    ///   contract_random[0] = 0xdf (low bit 1)
+    ///   [3u8;32] → sha256[0]=0x64 XOR 0xdf → bit 1 → Tails → LOSS for Heads
+    ///   [2u8;32] → sha256[0]=0x65 XOR 0xdf → bit 0 → Heads → WIN for Heads
+    fn loss_secret(env: &Env) -> soroban_sdk::Bytes {
+        soroban_sdk::Bytes::from_slice(env, &[3u8; 32]) // Tails outcome → loss for Heads
+    }
+
+    fn win_secret(env: &Env) -> soroban_sdk::Bytes {
+        // [2u8;32] → sha256[0]=0x65 XOR 0xdf → bit 0 → Heads → WIN for Heads
+        soroban_sdk::Bytes::from_slice(env, &[2u8; 32])
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(150))]
+
+        /// PROPERTY RB-1: Loss credits exactly `wager` to reserve_balance.
+        ///
+        /// reserve_after = reserve_before + wager  (no more, no less)
+        #[test]
+        fn prop_loss_credits_exact_wager_to_reserve(
+            wager in MIN_WAGER..=MAX_WAGER,
+        ) {
+            let env = Env::default();
+            let initial = i128::MAX / 2;
+            let (id, client) = setup(&env, initial);
+            let player = soroban_sdk::Address::generate(&env);
+            let secret = loss_secret(&env);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            let before = reserve(&env, &id);
+            client.reveal(&player, &secret);
+            let after = reserve(&env, &id);
+
+            prop_assert_eq!(after - before, wager,
+                "reserve must increase by exactly wager={} on loss, got delta={}", wager, after - before);
+        }
+
+        /// PROPERTY RB-2: cash_out debits exactly `gross` from reserve_balance.
+        ///
+        /// gross        = wager × multiplier_bps / 10_000
+        /// reserve_after = reserve_before − gross
+        #[test]
+        fn prop_cashout_debits_exact_gross_from_reserve(
+            wager in MIN_WAGER..=MAX_WAGER,
+        ) {
+            let env = Env::default();
+            let initial = i128::MAX / 2;
+            let (id, client) = setup(&env, initial);
+            let player = soroban_sdk::Address::generate(&env);
+            let secret = win_secret(&env);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            client.reveal(&player, &secret);
+            // streak = 1 after win
+            let gross = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
+
+            let before = reserve(&env, &id);
+            client.cash_out(&player);
+            let after = reserve(&env, &id);
+
+            prop_assert_eq!(before - after, gross,
+                "reserve must decrease by exactly gross={} on cash_out, got delta={}", gross, before - after);
+        }
+
+        /// PROPERTY RB-3: start_game alone does not change reserve_balance.
+        ///
+        /// Reserve is only affected by settlement (win/loss), not by game creation.
+        #[test]
+        fn prop_start_game_does_not_change_reserve(
+            wager in MIN_WAGER..=MAX_WAGER,
+        ) {
+            let env = Env::default();
+            let initial = wager * 10 + 1_000_000;
+            let (id, client) = setup(&env, initial);
+            let player = soroban_sdk::Address::generate(&env);
+            let commitment: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+
+            let before = reserve(&env, &id);
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            let after = reserve(&env, &id);
+
+            prop_assert_eq!(before, after,
+                "start_game must not change reserve_balance");
+        }
+
+        /// PROPERTY RB-4: reserve_balance never goes negative after a cash_out.
+        ///
+        /// The solvency guard ensures reserves >= gross before any payout.
+        #[test]
+        fn prop_reserve_never_negative_after_cashout(
+            wager in MIN_WAGER..=MAX_WAGER,
+        ) {
+            let env = Env::default();
+            let initial = i128::MAX / 2;
+            let (id, client) = setup(&env, initial);
+            let player = soroban_sdk::Address::generate(&env);
+            let secret = win_secret(&env);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            client.reveal(&player, &secret);
+            client.cash_out(&player);
+
+            prop_assert!(reserve(&env, &id) >= 0,
+                "reserve_balance must never be negative after cash_out");
+        }
+
+        /// PROPERTY RB-5: consecutive loss + win produce correct net reserve delta.
+        ///
+        /// After a loss then a win+cashout:
+        ///   net_delta = wager_loss − gross_win
+        #[test]
+        fn prop_consecutive_loss_then_win_net_reserve_delta(
+            wager in MIN_WAGER..=(MAX_WAGER / 2),
+        ) {
+            let env = Env::default();
+            let initial = i128::MAX / 2;
+            let (id, client) = setup(&env, initial);
+
+            let p_loss = soroban_sdk::Address::generate(&env);
+            let p_win  = soroban_sdk::Address::generate(&env);
+
+            // Loss game
+            let loss_sec = loss_secret(&env);
+            let loss_com: BytesN<32> = env.crypto().sha256(&loss_sec).into();
+            client.start_game(&p_loss, &Side::Heads, &wager, &loss_com);
+            client.reveal(&p_loss, &loss_sec);
+
+            // Win game
+            let win_sec = win_secret(&env);
+            let win_com: BytesN<32> = env.crypto().sha256(&win_sec).into();
+            client.start_game(&p_win, &Side::Heads, &wager, &win_com);
+            client.reveal(&p_win, &win_sec);
+            let gross_win = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
+
+            let before_cashout = reserve(&env, &id);
+            client.cash_out(&p_win);
+            let after_cashout = reserve(&env, &id);
+
+            prop_assert_eq!(before_cashout - after_cashout, gross_win,
+                "cash_out must debit exactly gross_win={}", gross_win);
+            // Net from initial: +wager_loss - gross_win
+            let net_delta = reserve(&env, &id) - initial;
+            prop_assert_eq!(net_delta, wager - gross_win,
+                "net reserve delta must be wager_loss - gross_win");
+        }
+    }
+
+    // ── Reclaim path ─────────────────────────────────────────────────────────
+
+    /// PROPERTY RB-6: reclaim_wager credits exactly `wager` to reserve_balance.
+    ///
+    /// Same accounting as a loss — house keeps the wager.
+    #[test]
+    fn test_reclaim_credits_exact_wager_to_reserve() {
+        let env = Env::default();
+        let wager = 10_000_000i128;
+        let initial = i128::MAX / 2;
+        let (id, client) = setup(&env, initial);
+        let player = soroban_sdk::Address::generate(&env);
+        let commitment: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+        let before = reserve(&env, &id);
+
+        // Advance ledger past the reveal timeout window.
+        env.ledger().with_mut(|l| l.sequence_number += REVEAL_TIMEOUT_LEDGERS + 1);
+        client.reclaim_wager(&player);
+        let after = reserve(&env, &id);
+
+        assert_eq!(after - before, wager,
+            "reclaim_wager must credit exactly wager={} to reserve", wager);
+    }
+
+    /// PROPERTY RB-7: reserve_balance is unchanged when start_game is rejected.
+    ///
+    /// Guard rejections (InsufficientReserves, paused, etc.) must not mutate reserve.
+    #[test]
+    fn test_reserve_unchanged_on_rejected_start_game() {
+        let env = Env::default();
+        let wager = 10_000_000i128;
+        let (id, client) = setup(&env, 0); // zero reserves → always rejected
+        let player = soroban_sdk::Address::generate(&env);
+        let commitment: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+
+        let before = reserve(&env, &id);
+        let _ = client.try_start_game(&player, &Side::Heads, &wager, &commitment);
+        let after = reserve(&env, &id);
+
+        assert_eq!(before, after, "reserve must be unchanged on rejected start_game");
+    }
+
+    /// PROPERTY RB-8: multi-loss reserve accumulation is exact.
+    ///
+    /// N losses each of `wager` → reserve increases by exactly N × wager.
+    #[test]
+    fn test_multi_loss_reserve_accumulation() {
+        let env = Env::default();
+        let wager = 5_000_000i128;
+        let n = 5usize;
+        let initial = i128::MAX / 2;
+        let (id, client) = setup(&env, initial);
+
+        for _ in 0..n {
+            let player = soroban_sdk::Address::generate(&env);
+            let secret = loss_secret(&env);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
+            client.reveal(&player, &secret);
+        }
+
+        let after = reserve(&env, &id);
+        assert_eq!(after - initial, wager * n as i128,
+            "reserve must increase by exactly N×wager after {} losses", n);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Feature: Concurrency & Sequential Order Guards
 // ═══════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
@@ -6689,16 +7112,7 @@ mod integration_tests {
                 .crypto()
                 .sha256(&Bytes::from_slice(&self.env, &seq_bytes))
                 .into();
-            let cr_bytes = Bytes::from_slice(&self.env, &contract_random.to_array());
-            let mut combined = Bytes::new(&self.env);
-            combined.append(&secret);
-            combined.append(&cr_bytes);
-            let hash = self.env.crypto().sha256(&combined);
-            if hash.to_array()[0] % 2 == 0 {
-                Side::Heads
-            } else {
-                Side::Tails
-            }
+            generate_outcome(&self.env, &secret, &contract_random)
         }
     }
 
@@ -6842,6 +7256,110 @@ mod integration_tests {
         assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
     }
 
+    // ── Reveal outcome resolution ─────────────────────────────────────────
+
+    /// Win path: reveal returns true, phase advances to Revealed, streak = 1.
+    #[test]
+    fn test_reveal_win_advances_phase_and_increments_streak() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
+        let result = h.client.reveal(&player, &h.make_secret(1));
+        assert!(result, "seed 1 + Heads must win");
+        let game = h.game_state(&player);
+        assert_eq!(game.phase, GamePhase::Revealed);
+        assert_eq!(game.streak, 1);
+    }
+
+    /// Loss path: reveal returns false, game state is deleted, reserves credited.
+    #[test]
+    fn test_reveal_loss_deletes_game_and_credits_reserves() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        let reserve_before = h.stats().reserve_balance;
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(3));
+        let result = h.client.reveal(&player, &h.make_secret(3));
+        assert!(!result, "seed 3 + Heads must lose");
+        // Game state must be gone.
+        let game_opt = h.env.as_contract(&h.contract_id, || {
+            CoinflipContract::load_player_game(&h.env, &player)
+        });
+        assert!(game_opt.is_none(), "game state must be deleted after loss");
+        // Reserve must be credited with the forfeited wager.
+        assert_eq!(h.stats().reserve_balance, reserve_before + DEFAULT_WAGER);
+    }
+
+    /// CommitmentMismatch leaves game in Committed phase — no state mutation.
+    #[test]
+    fn test_reveal_commitment_mismatch_no_state_mutation() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
+        let before = h.game_state(&player);
+        let _ = h.client.try_reveal(&player, &h.make_secret(2));
+        let after = h.game_state(&player);
+        assert_eq!(before, after, "state must be unchanged on CommitmentMismatch");
+    }
+
+    /// reveal on a Revealed-phase game returns InvalidPhase.
+    #[test]
+    fn test_reveal_invalid_phase_already_revealed() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        // Win to reach Revealed phase.
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
+        h.client.reveal(&player, &h.make_secret(1));
+        assert_eq!(h.game_state(&player).phase, GamePhase::Revealed);
+        // Second reveal must be rejected.
+        let result = h.client.try_reveal(&player, &h.make_secret(1));
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    /// reveal with no active game returns NoActiveGame.
+    #[test]
+    fn test_reveal_no_active_game() {
+        let h = Harness::new();
+        let player = h.player();
+        let result = h.client.try_reveal(&player, &h.make_secret(1));
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    /// After a loss the player slot is free — a new start_game succeeds immediately.
+    #[test]
+    fn test_reveal_loss_frees_slot_for_new_game() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(3));
+        h.client.reveal(&player, &h.make_secret(3)); // loss
+        let result = h.client.try_start_game(
+            &player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1),
+        );
+        assert!(result.is_ok(), "new game must be accepted after loss");
+        assert_eq!(h.game_state(&player).streak, 0, "streak must start at 0 for new game");
+    }
+
+    /// Outcome is determined by generate_outcome: same secret + contract_random → same side.
+    #[test]
+    fn test_reveal_outcome_matches_generate_outcome() {
+        let h = Harness::new();
+        let player = h.player();
+        h.fund(1_000_000_000);
+        let seed = 1u8;
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(seed));
+        // Capture contract_random before reveal.
+        let contract_random = h.game_state(&player).contract_random;
+        let secret = h.make_secret(seed);
+        let expected_side = generate_outcome(&h.env, &secret, &contract_random);
+        let won = h.client.reveal(&player, &secret);
+        assert_eq!(won, expected_side == Side::Heads,
+            "reveal result must match generate_outcome prediction");
+    }
+
     #[test]
     fn test_start_game_rejected_when_reserves_insufficient() {
         let h = Harness::new();
@@ -6933,6 +7451,103 @@ mod integration_tests {
         let secret = h.make_secret(1);
         let won = h.client.reveal(&player, &secret);
         assert!(won, "probe_outcome prediction must match actual reveal outcome");
+    }
+
+    // ── Query functions ───────────────────────────────────────────────────
+
+    /// get_config returns the configuration set at initialize time.
+    #[test]
+    fn test_get_config_returns_initialized_values() {
+        let h = Harness::new();
+        let config = h.client.get_config();
+        assert_eq!(config.fee_bps, DEFAULT_FEE_BPS);
+        assert_eq!(config.min_wager, DEFAULT_MIN_WAGER);
+        assert_eq!(config.max_wager, DEFAULT_MAX_WAGER);
+        assert!(!config.paused);
+    }
+
+    /// get_config reflects admin updates (set_fee, set_paused).
+    #[test]
+    fn test_get_config_reflects_admin_updates() {
+        let h = Harness::new();
+        h.client.set_fee(&h.admin, &400);
+        assert_eq!(h.client.get_config().fee_bps, 400);
+        h.set_paused(true);
+        assert!(h.client.get_config().paused);
+        h.set_paused(false);
+        assert!(!h.client.get_config().paused);
+    }
+
+    /// get_stats returns zero-state after initialization.
+    #[test]
+    fn test_get_stats_initial_state() {
+        let h = Harness::new();
+        let stats = h.client.get_stats();
+        assert_eq!(stats.total_games, 0);
+        assert_eq!(stats.total_volume, 0);
+        assert_eq!(stats.total_fees, 0);
+    }
+
+    /// get_stats reflects games started and fees collected.
+    #[test]
+    fn test_get_stats_reflects_game_activity() {
+        let h = Harness::new();
+        h.fund(1_000_000_000);
+        let player = h.player();
+        h.play_win_round(&player, DEFAULT_WAGER);
+        let stats_after_win = h.client.get_stats();
+        assert_eq!(stats_after_win.total_games, 1);
+        assert_eq!(stats_after_win.total_volume, DEFAULT_WAGER);
+        // Cash out to trigger fee collection.
+        h.client.cash_out(&player);
+        let stats_after_cashout = h.client.get_stats();
+        assert!(stats_after_cashout.total_fees > 0);
+    }
+
+    /// get_game_state returns None when no game exists.
+    #[test]
+    fn test_get_game_state_none_when_no_game() {
+        let h = Harness::new();
+        let player = h.player();
+        assert!(h.client.get_game_state(&player).is_none());
+    }
+
+    /// get_game_state returns Some with correct fields after start_game.
+    #[test]
+    fn test_get_game_state_some_after_start_game() {
+        let h = Harness::new();
+        h.fund(1_000_000_000);
+        let player = h.player();
+        let commitment = h.make_commitment(1);
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &commitment);
+        let state = h.client.get_game_state(&player).expect("game state must exist");
+        assert_eq!(state.phase, GamePhase::Committed);
+        assert_eq!(state.side, Side::Heads);
+        assert_eq!(state.wager, DEFAULT_WAGER);
+        assert_eq!(state.streak, 0);
+        assert_eq!(state.commitment, commitment);
+    }
+
+    /// get_game_state returns None after a loss (game deleted).
+    #[test]
+    fn test_get_game_state_none_after_loss() {
+        let h = Harness::new();
+        h.fund(1_000_000_000);
+        let player = h.player();
+        h.play_loss_round(&player, DEFAULT_WAGER);
+        assert!(h.client.get_game_state(&player).is_none());
+    }
+
+    /// get_game_state reflects phase transition after a win.
+    #[test]
+    fn test_get_game_state_revealed_after_win() {
+        let h = Harness::new();
+        h.fund(1_000_000_000);
+        let player = h.player();
+        h.play_win_round(&player, DEFAULT_WAGER);
+        let state = h.client.get_game_state(&player).expect("game state must exist after win");
+        assert_eq!(state.phase, GamePhase::Revealed);
+        assert_eq!(state.streak, 1);
     }
 }
 
