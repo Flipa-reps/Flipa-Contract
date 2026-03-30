@@ -1299,7 +1299,13 @@ impl CoinflipContract {
 mod multiplier_tests;
 
 #[cfg(test)]
-mod fee_calculation_tests;
+mod timeout_recovery_tests;
+
+#[cfg(test)]
+mod pause_tests;
+
+#[cfg(test)]
+mod statistics_tests;
 
 #[cfg(test)]
 mod tests {
