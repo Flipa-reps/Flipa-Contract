@@ -1,13 +1,33 @@
-# Task #341: Add property tests for fund conservation
+# Cross-Browser Compatibility Tests - Issue #377
 
-## Steps (1/6 complete)
+## Plan Progress
 
-### 1. [ ] Create branch: `git checkout -b add-property-tests-fund-conservation`
-### 2. [x] Add `prop_fund_conservation` property test to `contract/integration_tests.rs`
-### 3. [ ] `cargo test --lib integration` - verify passes 200+ cases
-### 4. [ ] Commit: `git add . && git commit -m "test: add property tests for fund conservation (#341)"`
-### 5. [ ] `gh pr create --title "Add property tests for fund conservation (#341)" --body "Implements Property 21 verifying total funds conserved across game lifecycle"`
-### 6. [ ] Verify PR tests pass
+✅ **Step 1**: Plan approved by user. Create TODO.md for tracking.
 
-**Property 21 verifies**: total_funds = player_balance + contract_reserve + treasury_balance remains constant through complete game lifecycles (start→reveal→cash_out/claim/continue) across randomized wagers/fees/streaks, 200+ iterations. ✓ Added to integration_tests.rs
+✅ **Step 2**: Create git branch `add-cross-browser-compatibility-tests`.
+
+⏳ **Step 3**: cd frontend && npm install -D @playwright/test && npx playwright install --with-deps.
+
+⏳ **Step 4**: Update frontend/package.json with Playwright scripts/deps.
+
+✅ **Step 5**: Create frontend/playwright.config.ts.
+
+✅ **Step 6**: Update frontend/vite.config.ts for baseURL.
+
+✅ **Step 7**: Create frontend/tests/e2e/ directory and tests:
+   - wallet.spec.ts (wallet connection)
+   - gameflow.spec.ts (wager/commit/reveal/cashout)
+   - responsive.spec.ts (mobile/desktop)
+
+⏳ **Step 8**: Update frontend/README.md or create CROSS_BROWSER_TESTS.md with instructions/report.
+
+⏳ **Step 9**: Run tests locally across browsers, verify screenshots/videos.
+
+⏳ **Step 10**: Commit changes with scoped messages, create PR referencing #377.
+
+**Notes**:
+- Testing Chrome, Firefox, Safari(WebKit), Edge, mobile emulations.
+- Use Playwright HTML reporter for cross-browser matrix.
+- Mock Stellar wallet SDK for tests.
+
 
