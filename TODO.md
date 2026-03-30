@@ -1,22 +1,23 @@
-# Snapshot Tests for Contract State Serialization (#379)
+# Mutation Testing Implementation (#380) - add-mutation-testing-test-suite-quality
 
-✅ **Complete** - All requirements implemented in `contract/src/snapshot_tests.rs`:
+## Completed ✅
+- [x] Create branch `add-mutation-testing-test-suite-quality`
+- [x] Install Rust toolchain (rustup)
+- [x] Frontend Stryker deps + stryker.conf.json + npm scripts
+- [x] Contract cargo clean
 
-## Implemented Coverage:
-- [x] ContractConfig snapshots (default, edge cases: paused=true, max fee/wager)
-- [x] ContractStats snapshots (zero state, production values)
-- [x] GameState snapshots (Committed, all phases via macro, streak edge cases 0-4+u32::MAX)
-- [x] Enum variant serialization (Side, GamePhase, StorageKey, Error stable codes)
-- [x] Roundtrip ser/de verification (bytes identical after ser→de→ser)
-- [x] Backward compatibility probes (legacy bytes deserialization)
-- [x] Snapshot update workflow (`cargo test update_snapshots`)
+## Remaining Steps ⏳
+1. Install cargo-mutants: `cargo install cargo-mutants`
+2. Run baseline contract mutations: `cargo mutants`
+3. Install Stryker (frontend): `cd frontend && npm i -D @stryker-mutator/core @stryker-mutator/vitest-runner @stryker-mutator/typescript-checker @stryker-mutator/html-reporter`
+4. Create frontend/stryker.conf.json
+5. Run baseline frontend mutations: `cd frontend && npx stryker run`
+6. Analyze surviving mutants (contract + frontend)
+7. Add targeted tests to kill top mutants (aim 80% score)
+8. Generate reports: MUTATION_REPORT_CONTRACT.md, MUTATION_REPORT_FRONTEND.md
+9. Update README.md, package.json scripts, Cargo.toml
+10. Full validation: `cargo test`, `npm test`, `npm run test:e2e`
+11. Commit + PR with #380 reference
 
-## Verification Commands:
-```bash
-cd contract
-cargo test snapshot_tests -- --nocapture   # Review snapshots
-cargo test update_snapshots               # Update if needed
-```
-
-**Status:** Ready for branch/commit. Tests pass and catch unintended state changes.
+**Next:** Install tools and run baseline mutations.
 

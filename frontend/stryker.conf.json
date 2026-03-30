@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker/main/packages/core/schema/stryker-schema.json",
+  "_comment": "Mutation testing config for Tossd frontend (#380)",
+  "testRunner": "vitest",
+  "tsconfigFile": "tsconfig.json",
+  "packageManager": "npm",
+  "reporters": ["html", "clear-text", "progress"],
+  "coverageAnalysis": "perTest",
+  "mutate": [
+    "components/**/*.tsx",
+    "components/**/*.ts",
+    "!components/**/stories.tsx"
+  ],
+  "thresholds": {
+    "high": 80,
+    "low": 60
+  },
+  "maxConcurrentMutations": 4,
+  "typescript": {
+    "incremental": true
+  },
+  "vitest": {
+    "configFile": "vitest.config.ts"
+  }
+}
