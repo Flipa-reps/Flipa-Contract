@@ -1299,6 +1299,15 @@ impl CoinflipContract {
 mod multiplier_tests;
 
 #[cfg(test)]
+mod timeout_recovery_tests;
+
+#[cfg(test)]
+mod pause_tests;
+
+#[cfg(test)]
+mod statistics_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;

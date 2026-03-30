@@ -1,5 +1,7 @@
 @import "../tokens/tossd.tokens.css";
 
+/* ── Header shell ───────────────────────────────────────────────────────────── */
+
 .header {
   position: sticky;
   top: 0;
@@ -10,17 +12,35 @@
   padding: var(--space-4) var(--space-8);
   background: var(--color-bg-surface);
   border-bottom: 1px solid var(--color-border-default);
+  /* Elevation transition on scroll */
+  box-shadow: none;
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
 }
+
+/* Elevated state — applied via JS when window.scrollY > 4 */
+.scrolled {
+  box-shadow: var(--shadow-card);
+  border-bottom-color: transparent;
+}
+
+/* ── Logo ───────────────────────────────────────────────────────────────────── */
 
 .logo {
   font-family: var(--font-display);
   font-size: var(--font-size-h3);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   color: var(--color-fg-primary);
   text-decoration: none;
 }
 
-/* Desktop nav */
+.logo:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ── Desktop nav ────────────────────────────────────────────────────────────── */
+
 .desktopNav {
   display: flex;
   align-items: center;
@@ -35,7 +55,10 @@
   transition: color var(--motion-fast) var(--ease-standard);
 }
 
-.navLink:hover,
+.navLink:hover {
+  color: var(--color-brand-accent);
+}
+
 .navLink:focus-visible {
   color: var(--color-brand-accent);
   outline: 2px solid var(--color-focus-ring);
@@ -43,28 +66,68 @@
   border-radius: var(--radius-sm);
 }
 
+/* ── Wallet button ──────────────────────────────────────────────────────────── */
+
+.walletBtn {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 var(--space-4);
+  background: transparent;
+  color: var(--color-fg-primary);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  font-family: var(--font-body);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  transition:
+    background var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
+}
+
+.walletBtn:hover {
+  background: var(--color-bg-subtle);
+}
+
+.walletBtn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Connected state */
+.walletConnected {
+  color: var(--color-state-success);
+  border-color: var(--color-state-success);
+  background: color-mix(in srgb, var(--color-state-success) 8%, transparent);
+}
+
+/* ── CTA button ─────────────────────────────────────────────────────────────── */
+
 .ctaBtn {
-  padding: var(--space-2) var(--space-4);
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 var(--space-4);
   background: var(--color-brand-ink);
   color: var(--color-bg-surface);
   font-family: var(--font-body);
   font-size: var(--font-size-sm);
-  font-weight: 500;
+  font-weight: var(--font-weight-medium);
   border-radius: var(--radius-md);
   text-decoration: none;
   transition: opacity var(--motion-fast) var(--ease-standard);
-  min-height: 44px;
-  display: inline-flex;
-  align-items: center;
 }
 
 .ctaBtn:hover { opacity: 0.85; }
+
 .ctaBtn:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
 
-/* Hamburger */
+/* ── Hamburger ──────────────────────────────────────────────────────────────── */
+
 .hamburger {
   display: none;
   flex-direction: column;
@@ -92,7 +155,8 @@
   border-radius: 2px;
 }
 
-/* Mobile menu internals */
+/* ── Mobile menu internals ──────────────────────────────────────────────────── */
+
 .closeBtn {
   display: flex;
   align-items: center;
@@ -124,7 +188,8 @@
 }
 
 .mobileNavLink {
-  display: block;
+  display: flex;
+  align-items: center;
   padding: var(--space-3) var(--space-2);
   font-family: var(--font-body);
   font-size: var(--font-size-body);
@@ -132,12 +197,34 @@
   text-decoration: none;
   border-radius: var(--radius-sm);
   min-height: 44px;
-  display: flex;
-  align-items: center;
 }
 
 .mobileNavLink:hover { background: var(--color-bg-subtle); }
+
 .mobileNavLink:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.mobileWalletBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  margin-top: var(--space-6);
+  min-height: 44px;
+  padding: 0 var(--space-4);
+  background: transparent;
+  color: var(--color-fg-primary);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  font-family: var(--font-body);
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.mobileWalletBtn:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
@@ -146,12 +233,12 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  margin-top: var(--space-8);
+  margin-top: var(--space-3);
   padding: var(--space-3) var(--space-6);
   background: var(--color-brand-ink);
   color: var(--color-bg-surface);
   font-family: var(--font-body);
-  font-weight: 500;
+  font-weight: var(--font-weight-medium);
   border-radius: var(--radius-md);
   text-decoration: none;
   min-height: 44px;
@@ -162,8 +249,10 @@
   outline-offset: 2px;
 }
 
-/* Responsive */
+/* ── Responsive ─────────────────────────────────────────────────────────────── */
+
 @media (max-width: 768px) {
+  .header { padding: var(--space-4); }
   .desktopNav { display: none; }
   .hamburger { display: flex; }
 }

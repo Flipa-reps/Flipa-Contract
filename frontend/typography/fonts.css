@@ -1,0 +1,68 @@
+/**
+ * Tossd Font Loading — frontend/typography/fonts.css
+ *
+ * Strategy: system-font fallbacks ship immediately; custom fonts load via
+ * Google Fonts CDN with font-display:swap so text is never invisible.
+ *
+ * Inter (body/UI) and JetBrains Mono (data/code) are widely available on
+ * Google Fonts. Ivar Display / Suisse Intl are proprietary — they fall back
+ * to the system serif/sans stack defined in the token font-family values.
+ *
+ * Usage: import this file once at the app entry point, before typography.css.
+ *   <link rel="preconnect" href="https://fonts.googleapis.com">
+ *   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+ *   @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap");
+ *
+ * For self-hosted fonts (Ivar Display, Suisse Intl), place .woff2 files in
+ * frontend/fonts/ and uncomment the @font-face blocks below.
+ */
+
+/*
+@font-face {
+  font-family: "Ivar Display";
+  src: url("../fonts/IvarDisplay-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Ivar Display";
+  src: url("../fonts/IvarDisplay-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Suisse Intl";
+  src: url("../fonts/SuisseIntl-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Suisse Intl";
+  src: url("../fonts/SuisseIntl-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Suisse Intl";
+  src: url("../fonts/SuisseIntl-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Suisse Intl";
+  src: url("../fonts/SuisseIntl-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+*/

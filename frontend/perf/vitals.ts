@@ -20,7 +20,7 @@ export type VitalMetric = {
 type ReportFn = (metric: VitalMetric) => void;
 
 // Thresholds per https://web.dev/vitals/
-const THRESHOLDS: Record<string, [number, number]> = {
+export const VITAL_THRESHOLDS: Record<string, [number, number]> = {
   LCP:  [2500, 4000],
   FID:  [100,  300],
   INP:  [200,  500],
@@ -29,8 +29,8 @@ const THRESHOLDS: Record<string, [number, number]> = {
   TTFB: [800,  1800],
 };
 
-function rate(name: string, value: number): VitalMetric["rating"] {
-  const t = THRESHOLDS[name];
+export function rateVital(name: string, value: number): VitalMetric["rating"] {
+  const t = VITAL_THRESHOLDS[name];
   if (!t) return "good";
   if (value <= t[0]) return "good";
   if (value <= t[1]) return "needs-improvement";
@@ -69,7 +69,7 @@ function observe(
     const po = new PerformanceObserver((list) => {
       const value = getValue(list.getEntries());
       if (value === null) return;
-      report({ name, value, rating: rate(name, value), delta: value, id: `${name}-${Date.now()}` });
+      report({ name, value, rating: rateVital(name, value), delta: value, id: `${name}-${Date.now()}` });
     });
     po.observe({ type, buffered: true });
   } catch {

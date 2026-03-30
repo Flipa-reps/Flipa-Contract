@@ -7,13 +7,13 @@
     "example": "examples"
   },
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "test": "vitest",
-    "test:e2e": "playwright test",
-    "test:browsers": "playwright test",
-    "playwright:install": "playwright install",
+    "test": "vitest run",
+    "test:unit": "vitest run",
+    "test:hooks": "vitest run tests/contract-hooks.integration.test.tsx",
+    "test:perf": "vitest run tests/performance.render.test.tsx",
+    "test:e2e": "playwright test --grep @e2e",
+    "test:visual": "playwright test --grep @visual",
+    "test:all": "npm run test:unit && npm run test:hooks && npm run test:perf && npm run test:e2e && npm run test:visual",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build",
     "test:ui": "vitest --ui"
@@ -28,7 +28,7 @@
     "react-dom": "^19.2.4"
   },
   "devDependencies": {
-    "@playwright/test": "^1.48.1",
+    "@playwright/test": "^1.54.2",
     "@storybook/addon-a11y": "^8.6.18",
     "@storybook/addon-essentials": "^8.6.14",
     "@storybook/react": "^8.6.18",

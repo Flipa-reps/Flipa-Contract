@@ -1,0 +1,129 @@
+/**
+ * Tossd Typography System — frontend/typography/typography.css
+ *
+ * Utility classes for the full type scale. All values reference tokens from
+ * tossd.tokens.css — never use raw values in components.
+ *
+ * Import order:
+ *   1. @import "../tokens/tossd.tokens.css";
+ *   2. @import "../typography/typography.css";
+ *
+ * Contrast audit (WCAG AA, 4.5:1 minimum for normal text):
+ *   --color-fg-primary   #171717 on #F7F6F3  → 16.9:1  ✓ AAA
+ *   --color-fg-secondary #4D4D4D on #F7F6F3  →  7.5:1  ✓ AA
+ *   --color-fg-muted     #757575 on #F7F6F3  →  4.6:1  ✓ AA
+ *   --color-fg-primary   #171717 on #FFFFFF  → 18.1:1  ✓ AAA
+ *   --color-fg-secondary #4D4D4D on #FFFFFF  →  8.0:1  ✓ AA
+ *   --color-fg-muted     #757575 on #FFFFFF  →  4.6:1  ✓ AA (large text only for muted)
+ */
+
+@import "../tokens/tossd.tokens.css";
+
+/* ── Base reset ─────────────────────────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-normal);
+  color: var(--color-fg-primary);
+  background-color: var(--color-bg-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Semantic heading elements ──────────────────────────────────────────────── */
+
+h1, .t-hero {
+  font-family: var(--font-display);
+  font-size: var(--font-size-hero);
+  font-weight: var(--font-weight-bold);
+  line-height: var(--line-height-tight);
+  color: var(--color-fg-primary);
+  margin: 0;
+}
+
+h1, .t-h1 {
+  font-family: var(--font-display);
+  font-size: var(--font-size-h1);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  color: var(--color-fg-primary);
+  margin: 0;
+}
+
+h2, .t-h2 {
+  font-family: var(--font-display);
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  color: var(--color-fg-primary);
+  margin: 0;
+}
+
+h3, .t-h3 {
+  font-family: var(--font-body);
+  font-size: var(--font-size-h3);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-normal);
+  color: var(--color-fg-primary);
+  margin: 0;
+}
+
+p {
+  font-family: var(--font-body);
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-relaxed);
+  color: var(--color-fg-primary);
+  margin: 0;
+}
+
+/* ── Type scale utilities ───────────────────────────────────────────────────── */
+
+/* Size */
+.t-hero  { font-size: var(--font-size-hero); }
+.t-h1    { font-size: var(--font-size-h1); }
+.t-h2    { font-size: var(--font-size-h2); }
+.t-h3    { font-size: var(--font-size-h3); }
+.t-body  { font-size: var(--font-size-body); }
+.t-sm    { font-size: var(--font-size-sm); }
+.t-xs    { font-size: var(--font-size-xs); }
+.t-mono  { font-size: var(--font-size-mono); }
+
+/* Family */
+.t-display { font-family: var(--font-display); }
+.t-sans    { font-family: var(--font-body); }
+.t-code    { font-family: var(--font-mono); }
+
+/* Weight */
+.t-regular  { font-weight: var(--font-weight-regular); }
+.t-medium   { font-weight: var(--font-weight-medium); }
+.t-semibold { font-weight: var(--font-weight-semibold); }
+.t-bold     { font-weight: var(--font-weight-bold); }
+
+/* Line height */
+.t-tight   { line-height: var(--line-height-tight); }
+.t-normal  { line-height: var(--line-height-normal); }
+.t-relaxed { line-height: var(--line-height-relaxed); }
+
+/* Color */
+.t-primary   { color: var(--color-fg-primary); }
+.t-secondary { color: var(--color-fg-secondary); }
+.t-muted     { color: var(--color-fg-muted); }
+.t-accent    { color: var(--color-brand-accent); }
+
+/* Numeric / data treatment */
+.t-numeric {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-mono);
+  font-weight: var(--font-weight-medium);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}

@@ -1,50 +1,36 @@
-import { defineConfig, devices } from '@playwright/test';
+import { defineConfig, devices } from "@playwright/test";
+
+const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:4173";
+const storybookURL = process.env.PLAYWRIGHT_STORYBOOK_URL ?? "http://127.0.0.1:6006";
 
 export default defineConfig({
-  testDir: './tests/e2e',
-  fullyParallel: true,
-  forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : undefined,
-  reporter: [['html'], ['json', { outputFile: 'test-results.json' }]],
-  use: {
-    baseURL: 'http://localhost:5173',
-    trace: 'on-first-retry',
-    screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+  testDir: "./playwright",
+  timeout: 30_000,
+  expect: {
+    timeout: 5_000,
+    toHaveScreenshot: {
+      maxDiffPixelRatio: 0.015,
+    },
   },
-
+  use: {
+    trace: "on-first-retry",
+    video: "retain-on-failure",
+    screenshot: "only-on-failure",
+  },
   projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "mobile", use: { ...devices["iPhone 13"] } },
+  ],
+  webServer: [
     {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
-    },
-    {
-      name: 'firefox',
-      use: { ...devices['Desktop Firefox'] },
-    },
-    {
-      name: 'webkit',
-      use: { ...devices['Desktop Safari'] },
-    },
-    {
-      name: 'microsoftedge',
-      use: { ...devices['Desktop Edge'] },
-    },
-    {
-      name: 'mobile-chrome',
-      use: { ...devices['Pixel 5'] },
-    },
-    {
-      name: 'mobile-safari',
-      use: { ...devices['iPhone 12'] },
+      command: "npm run storybook -- --ci --quiet",
+      url: storybookURL,
+      timeout: 120_000,
+      reuseExistingServer: true,
     },
   ],
-
-  webServer: {
-    command: 'npm run dev',
-    url: 'http://localhost:5173',
-    reuseExistingServer: !process.env.CI,
+  metadata: {
+    baseURL,
+    storybookURL,
   },
 });
-

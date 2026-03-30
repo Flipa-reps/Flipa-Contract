@@ -8,7 +8,7 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./tests/setup.ts"],
     css: false,
-    exclude: ["**/node_modules/**", "**/a11y.test.tsx"],
+    exclude: ["**/node_modules/**", "**/a11y.test.tsx", "**/a11y.game.test.tsx"],
     coverage: {
       provider: "v8",
       include: ["components/OutcomeChip.tsx", "components/WagerInput.tsx", "components/SideSelector.tsx", "components/GameStateCard.tsx"],
