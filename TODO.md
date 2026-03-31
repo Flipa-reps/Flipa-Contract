@@ -1,33 +1,23 @@
-# Cross-Browser Compatibility Tests - Issue #377
+# Mutation Testing Implementation (#380) - add-mutation-testing-test-suite-quality
 
-## Plan Progress
+## Completed ✅
+- [x] Create branch `add-mutation-testing-test-suite-quality`
+- [x] Install Rust toolchain (rustup)
+- [x] Frontend Stryker deps + stryker.conf.json + npm scripts
+- [x] Contract cargo clean
 
-✅ **Step 1**: Plan approved by user. Create TODO.md for tracking.
+## Remaining Steps ⏳
+1. Install cargo-mutants: `cargo install cargo-mutants`
+2. Run baseline contract mutations: `cargo mutants`
+3. Install Stryker (frontend): `cd frontend && npm i -D @stryker-mutator/core @stryker-mutator/vitest-runner @stryker-mutator/typescript-checker @stryker-mutator/html-reporter`
+4. Create frontend/stryker.conf.json
+5. Run baseline frontend mutations: `cd frontend && npx stryker run`
+6. Analyze surviving mutants (contract + frontend)
+7. Add targeted tests to kill top mutants (aim 80% score)
+8. Generate reports: MUTATION_REPORT_CONTRACT.md, MUTATION_REPORT_FRONTEND.md
+9. Update README.md, package.json scripts, Cargo.toml
+10. Full validation: `cargo test`, `npm test`, `npm run test:e2e`
+11. Commit + PR with #380 reference
 
-✅ **Step 2**: Create git branch `add-cross-browser-compatibility-tests`.
-
-⏳ **Step 3**: cd frontend && npm install -D @playwright/test && npx playwright install --with-deps.
-
-⏳ **Step 4**: Update frontend/package.json with Playwright scripts/deps.
-
-✅ **Step 5**: Create frontend/playwright.config.ts.
-
-✅ **Step 6**: Update frontend/vite.config.ts for baseURL.
-
-✅ **Step 7**: Create frontend/tests/e2e/ directory and tests:
-   - wallet.spec.ts (wallet connection)
-   - gameflow.spec.ts (wager/commit/reveal/cashout)
-   - responsive.spec.ts (mobile/desktop)
-
-⏳ **Step 8**: Update frontend/README.md or create CROSS_BROWSER_TESTS.md with instructions/report.
-
-⏳ **Step 9**: Run tests locally across browsers, verify screenshots/videos.
-
-⏳ **Step 10**: Commit changes with scoped messages, create PR referencing #377.
-
-**Notes**:
-- Testing Chrome, Firefox, Safari(WebKit), Edge, mobile emulations.
-- Use Playwright HTML reporter for cross-browser matrix.
-- Mock Stellar wallet SDK for tests.
-
+**Next:** Install tools and run baseline mutations.
 
