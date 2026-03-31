@@ -1,0 +1,134 @@
+@import "../tokens/tossd.tokens.css";
+
+/* ── Base ───────────────────────────────────────────────────────────────────── */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  /* 44px minimum touch target (WCAG 2.5.5) */
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  font-family: var(--font-body);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-normal);
+  white-space: nowrap;
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    background var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard),
+    opacity var(--motion-fast) var(--ease-standard);
+  /* Prevent text selection on rapid clicks */
+  user-select: none;
+}
+
+/* ── Size: sm ───────────────────────────────────────────────────────────────── */
+
+.sm {
+  min-height: 44px; /* keep touch target even at sm */
+  padding: 0 var(--space-3);
+  font-size: var(--font-size-xs);
+}
+
+/* ── Variant: primary ───────────────────────────────────────────────────────── */
+
+.primary {
+  background: var(--color-brand-ink);
+  color: var(--color-bg-surface);
+  border-color: var(--color-brand-ink);
+}
+
+.primary:hover:not(:disabled) {
+  background: #2a2a2a;
+  border-color: #2a2a2a;
+}
+
+.primary:active:not(:disabled) {
+  background: #3d3d3d;
+  border-color: #3d3d3d;
+}
+
+/* ── Variant: secondary ─────────────────────────────────────────────────────── */
+
+.secondary {
+  background: transparent;
+  color: var(--color-fg-primary);
+  border-color: var(--color-border-strong);
+}
+
+.secondary:hover:not(:disabled) {
+  background: var(--color-bg-subtle);
+}
+
+.secondary:active:not(:disabled) {
+  background: var(--color-border-default);
+}
+
+/* ── Variant: danger ────────────────────────────────────────────────────────── */
+
+.danger {
+  background: var(--color-state-danger);
+  color: var(--color-bg-surface);
+  border-color: var(--color-state-danger);
+}
+
+.danger:hover:not(:disabled) {
+  background: #8a2323;
+  border-color: #8a2323;
+}
+
+.danger:active:not(:disabled) {
+  background: #721d1d;
+  border-color: #721d1d;
+}
+
+/* ── Focus (all variants) ───────────────────────────────────────────────────── */
+
+.btn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* ── Disabled ───────────────────────────────────────────────────────────────── */
+
+.btn:disabled,
+.btn[aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* ── Loading ────────────────────────────────────────────────────────────────── */
+
+.loading {
+  cursor: wait;
+  pointer-events: none;
+}
+
+/* ── Icon + label layout ────────────────────────────────────────────────────── */
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.label {
+  /* Allows icon-only buttons (no children) to still meet min-width */
+  display: inline-block;
+}
+
+/* ── Spinner inside button ──────────────────────────────────────────────────── */
+
+.spinner {
+  /* Override LoadingSpinner default size to fit inline */
+  width: 16px !important;
+  height: 16px !important;
+}

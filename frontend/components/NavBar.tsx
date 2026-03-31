@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useRef, useState, useEffect } from "react";
 import { MobileMenu } from "./MobileMenu";
 import styles from "./NavBar.module.css";
 
@@ -9,15 +9,36 @@ const NAV_LINKS = [
   { label: "Audit Contract", href: "https://github.com/Tossd-Org/Tossd" },
 ];
 
-export function NavBar() {
+export interface NavBarProps {
+  /** Called when the wallet button is clicked. Swap for real wallet logic. */
+  onConnectWallet?: () => void;
+  /** When true the wallet button shows a connected state. */
+  walletConnected?: boolean;
+}
+
+export function NavBar({ onConnectWallet, walletConnected = false }: NavBarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
+
+  // Elevation change on scroll
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 4);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
 
   const open = () => setMenuOpen(true);
   const close = () => setMenuOpen(false);
 
+  const walletLabel = walletConnected ? "Connected" : "Connect Wallet";
+
   return (
-    <header className={styles.header} role="banner">
+    <header
+      className={[styles.header, scrolled ? styles.scrolled : ""].filter(Boolean).join(" ")}
+      role="banner"
+      data-scrolled={scrolled}
+    >
       <a href="/" className={styles.logo} aria-label="Tossd home">
         Tossd
       </a>
@@ -29,6 +50,16 @@ export function NavBar() {
             {l.label}
           </a>
         ))}
+        <button
+          className={[styles.walletBtn, walletConnected ? styles.walletConnected : ""]
+            .filter(Boolean)
+            .join(" ")}
+          onClick={onConnectWallet}
+          aria-label={walletLabel}
+          data-wallet-connected={walletConnected}
+        >
+          {walletLabel}
+        </button>
         <a href="#play" className={styles.ctaBtn}>Launch App</a>
       </nav>
 
@@ -67,6 +98,15 @@ export function NavBar() {
               ))}
             </ul>
           </nav>
+          <button
+            className={[styles.mobileWalletBtn, walletConnected ? styles.walletConnected : ""]
+              .filter(Boolean)
+              .join(" ")}
+            onClick={() => { onConnectWallet?.(); close(); }}
+            aria-label={walletLabel}
+          >
+            {walletLabel}
+          </button>
           <a href="#play" className={styles.mobileCta} onClick={close}>
             Launch App
           </a>

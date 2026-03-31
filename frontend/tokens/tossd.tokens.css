@@ -1,30 +1,47 @@
+/**
+ * Tossd Design Tokens — CSS Custom Properties
+ * Source of truth: frontend/tokens/tossd.tokens.json
+ * Style direction: webapp-02-japaneseswiss_light
+ *
+ * Usage: @import "../tokens/tossd.tokens.css";
+ * Never use raw hex/px values in components — reference these tokens only.
+ */
+
 :root {
+  /* ── Color: Backgrounds ─────────────────────────────────────────────────── */
   --color-bg-base: #F7F6F3;
   --color-bg-surface: #FFFFFF;
   --color-bg-subtle: #EFEDE8;
 
+  /* ── Color: Foregrounds ─────────────────────────────────────────────────── */
   --color-fg-primary: #171717;
   --color-fg-secondary: #4D4D4D;
-  --color-fg-muted: #757575;
+  --color-fg-muted: #6E6E6E;
 
+  /* ── Color: Borders ─────────────────────────────────────────────────────── */
   --color-border-default: #D8D5CF;
   --color-border-strong: #B9B5AE;
 
+  /* ── Color: Brand ───────────────────────────────────────────────────────── */
   --color-brand-ink: #111111;
   --color-brand-accent: #0F766E;
   --color-brand-accent-soft: #DDF3F0;
 
+  /* ── Color: Semantic States ─────────────────────────────────────────────── */
   --color-state-success: #1D7A45;
   --color-state-warning: #B5681D;
   --color-state-danger: #A12A2A;
   --color-state-info: #1F5FAF;
 
+  /* ── Color: Focus ───────────────────────────────────────────────────────── */
   --color-focus-ring: #0F766E;
 
+  /* ── Typography: Font Families ──────────────────────────────────────────── */
   --font-display: "Ivar Display", "Canela", "Times New Roman", serif;
   --font-body: "Suisse Intl", "Inter", "Helvetica Neue", sans-serif;
   --font-mono: "JetBrains Mono", "IBM Plex Mono", monospace;
 
+  /* ── Typography: Font Sizes ─────────────────────────────────────────────── */
   --font-size-hero: clamp(3rem, 8vw, 6.5rem);
   --font-size-h1: clamp(2rem, 4vw, 3.5rem);
   --font-size-h2: clamp(1.5rem, 3vw, 2.25rem);
@@ -34,10 +51,18 @@
   --font-size-xs: 0.75rem;
   --font-size-mono: 0.875rem;
 
+  /* ── Typography: Font Weights ───────────────────────────────────────────── */
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  /* ── Typography: Line Heights ───────────────────────────────────────────── */
   --line-height-tight: 1.2;
   --line-height-normal: 1.5;
   --line-height-relaxed: 1.7;
 
+  /* ── Spacing ────────────────────────────────────────────────────────────── */
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -47,21 +72,24 @@
   --space-12: 48px;
   --space-16: 64px;
 
+  /* ── Border Radius ──────────────────────────────────────────────────────── */
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 16px;
   --radius-pill: 999px;
 
+  /* ── Shadows ────────────────────────────────────────────────────────────── */
   --shadow-soft: 0 2px 10px rgba(0, 0, 0, 0.06);
   --shadow-card: 0 8px 30px rgba(0, 0, 0, 0.08);
 
+  /* ── Motion ─────────────────────────────────────────────────────────────── */
   --motion-fast: 140ms;
   --motion-base: 220ms;
   --motion-slow: 420ms;
   --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-/* Optional semantic aliases for component usage */
+/* ── Semantic Aliases (component-level shortcuts) ───────────────────────────── */
 :root {
   --surface-default: var(--color-bg-surface);
   --text-default: var(--color-fg-primary);
@@ -69,4 +97,13 @@
   --interactive-primary-bg: var(--color-brand-ink);
   --interactive-primary-fg: var(--color-bg-surface);
   --interactive-secondary-border: var(--color-border-strong);
+}
+
+/* ── Reduced Motion ─────────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+    --motion-slow: 0ms;
+  }
 }

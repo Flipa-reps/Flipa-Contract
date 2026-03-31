@@ -12,5 +12,5 @@
     "noEmit": true,
     "types": ["vite/client"]
   },
-  "include": ["components", "perf", "tests", ".storybook"]
+  "include": ["components", "hooks", "perf", "tests", "playwright", ".storybook", "playwright.config.ts"]
 }
