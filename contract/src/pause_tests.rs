@@ -108,11 +108,11 @@ fn test_set_paused_non_admin_does_not_mutate_config() {
     let (env, client, contract_id, _admin) = setup();
     let stranger = Address::generate(&env);
     let before: ContractConfig = env.as_contract(&contract_id, || {
-        env.storage().persistent().get(&StorageKey::Config).unwrap()
+        env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
     });
     let _ = client.try_set_paused(&stranger, &true);
     let after: ContractConfig = env.as_contract(&contract_id, || {
-        env.storage().persistent().get(&StorageKey::Config).unwrap()
+        env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
     });
     assert_eq!(before, after);
 }
@@ -153,15 +153,15 @@ fn test_start_game_rejected_when_paused_no_state_mutation() {
     client.set_paused(&admin, &true);
     let player = Address::generate(&env);
     let before_stats: ContractStats = env.as_contract(&contract_id, || {
-        env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
     });
     let _ = client.try_start_game(&player, &Side::Heads, &5_000_000, &make_commitment(&env, 1));
     let after_stats: ContractStats = env.as_contract(&contract_id, || {
-        env.storage().persistent().get(&StorageKey::Stats).unwrap()
+        env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
     });
     assert_eq!(before_stats, after_stats);
     let game = env.as_contract(&contract_id, || {
-        CoinflipContract::load_player_game(&env, &player)
+        CoinflipContract::load_player_game(&env, &player).unwrap()
     });
     assert!(game.is_none());
 }
@@ -179,7 +179,7 @@ fn test_reveal_succeeds_when_paused() {
     client.set_paused(&admin, &true);
     // reveal must still work
     let result = client.try_reveal(&player, &secret);
-    assert_eq!(result, Ok(Ok(true)));
+    assert_eq!(result, Ok(true));
     let game = env.as_contract(&contract_id, || {
         CoinflipContract::load_player_game(&env, &player).unwrap()
     });
@@ -269,12 +269,12 @@ fn test_full_game_lifecycle_while_paused() {
     client.set_paused(&admin, &true);
 
     // Reveal while paused
-    let won = client.reveal(&player, &secret).unwrap();
+    let won = client.reveal(&player, &secret);
     assert!(won);
 
     // Continue while paused
     let next_commitment = make_commitment(&env, 42);
-    client.continue_streak(&player, &next_commitment).unwrap();
+    client.continue_streak(&player, &next_commitment);
     let game = env.as_contract(&contract_id, || {
         CoinflipContract::load_player_game(&env, &player).unwrap()
     });
@@ -290,11 +290,11 @@ fn test_full_game_lifecycle_while_paused() {
     env.as_contract(&contract_id, || {
         CoinflipContract::save_player_game(&env, &player, &g);
     });
-    let won2 = client.reveal(&player, &secret2).unwrap();
+    let won2 = client.reveal(&player, &secret2);
     assert!(won2);
 
     // Cash out while paused
-    let payout = client.cash_out(&player).unwrap();
+    let payout = client.cash_out(&player);
     assert!(payout > 0);
 }
 

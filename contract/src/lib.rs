@@ -636,7 +636,7 @@ impl CoinflipContract {
         if env.storage().persistent().has(&key) {
             env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
         }
-        env.storage().persistent().get(&key)
+        env.storage().persistent().get(&key).unwrap()
     }
 
     /// Remove a player's game state from storage (called on loss or after settlement).
@@ -1468,24 +1468,24 @@ mod tests {
         // gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
         // fee   = 19_000_000 * 300  / 10_000 =    570_000
         // net   = 18_430_000
-        assert_eq!(calculate_payout(10_000_000, 1, 300), Some(18_430_000));
+        assert_eq!(calculate_payout(10_000_000, 1, 300).unwrap(), Some(18_430_000));
     }
 
     #[test]
     fn test_calculate_payout_streak_4_plus() {
         // wager=1_000_000, streak=4 (10x), fee=500bps (5%)
         // gross = 10_000_000, fee = 500_000, net = 9_500_000
-        assert_eq!(calculate_payout(1_000_000, 4, 500), Some(9_500_000));
+        assert_eq!(calculate_payout(1_000_000, 4, 500).unwrap(), Some(9_500_000));
     }
 
     #[test]
     fn test_calculate_payout_overflow_returns_none() {
-        assert_eq!(calculate_payout(i128::MAX, 1, 300), None);
+        assert_eq!(calculate_payout(i128::MAX, 1, 300).unwrap(), None);
     }
 
     #[test]
     fn test_calculate_payout_zero_wager() {
-        assert_eq!(calculate_payout(0, 1, 300), Some(0));
+        assert_eq!(calculate_payout(0, 1, 300).unwrap(), Some(0));
     }
 
     #[test]
@@ -1495,7 +1495,7 @@ mod tests {
         // fee   = 19_000_000 * 300  / 10_000 =    570_000
         // net   = 18_430_000
         assert_eq!(
-            calculate_payout_breakdown(10_000_000, 1, 300),
+            calculate_payout_breakdown(10_000_000, 1, 300).unwrap(),
             Some((19_000_000, 570_000, 18_430_000))
         );
     }
@@ -1504,21 +1504,21 @@ mod tests {
     fn test_calculate_payout_breakdown_net_equals_calculate_payout() {
         // calculate_payout must return the same net as the breakdown helper
         for (wager, streak, fee_bps) in [(10_000_000, 1, 300), (5_000_000, 2, 500), (1_000_000, 4, 200)] {
-            let (_, _, net) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap();
-            assert_eq!(calculate_payout(wager, streak, fee_bps), Some(net));
+            let (_, _, net) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap().unwrap();
+            assert_eq!(calculate_payout(wager, streak, fee_bps).unwrap(), Some(net));
         }
     }
 
     #[test]
     fn test_calculate_payout_breakdown_gross_minus_fee_equals_net() {
         // Invariant: gross - fee == net for all valid inputs
-        let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 3, 400).unwrap();
+        let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 3, 400).unwrap().unwrap();
         assert_eq!(gross - fee, net);
     }
 
     #[test]
     fn test_calculate_payout_breakdown_overflow_returns_none() {
-        assert_eq!(calculate_payout_breakdown(i128::MAX, 1, 300), None);
+        assert_eq!(calculate_payout_breakdown(i128::MAX, 1, 300).unwrap(), None);
     }
 
     #[test]
@@ -1574,7 +1574,7 @@ mod tests {
         
         // Verify config was stored
         let stored_config: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         
         assert_eq!(stored_config.fee_bps, 300);
@@ -1922,7 +1922,7 @@ mod tests {
     /// Mint `amount` tokens to the contract address so token transfers succeed.
     fn mint_to_contract(env: &Env, contract_id: &soroban_sdk::Address, amount: i128) {
         let config: ContractConfig = env.as_contract(contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         let token_client = soroban_sdk::token::StellarAssetClient::new(env, &config.token);
         token_client.mint(contract_id, &amount);
@@ -2003,7 +2003,7 @@ mod tests {
 
         // State must be unchanged — no partial mutation.
         let game: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+            CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
         });
         assert_eq!(game.phase, GamePhase::Revealed);
         assert_eq!(game.streak, 0);
@@ -2030,15 +2030,15 @@ mod tests {
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
 
         let result = client.try_cash_out(&player);
-        assert_eq!(result, Ok(Ok(expected_net)));
+        assert_eq!(result, Ok(expected_net));
         let game_opt = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player)
+            CoinflipContract::load_player_game(&env, &player).unwrap()
         });
         assert!(game_opt.is_none(), "Player game state should be deleted after cash out");
 
         // Stats: fee credited, reserves debited.
         let stats: ContractStats = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
         });
         assert_eq!(stats.total_fees, expected_fee);
         assert_eq!(stats.reserve_balance, 100_000_000 - 19_000_000); // deducted gross, not net
@@ -2062,9 +2062,9 @@ mod tests {
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, wager);
 
         let result = client.try_cash_out(&player);
-        assert_eq!(result, Ok(Ok(expected_net)));
+        assert_eq!(result, Ok(expected_net));
         let game_opt = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player)
+            CoinflipContract::load_player_game(&env, &player).unwrap()
         });
         assert!(game_opt.is_none(), "Player game state should be deleted after cash out");
     }
@@ -2087,7 +2087,7 @@ mod tests {
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 4, wager);
 
         let result = client.try_cash_out(&player);
-        assert_eq!(result, Ok(Ok(expected_net)));
+        assert_eq!(result, Ok(expected_net));
     }
 
     // ── Post-cash-out: player can start a new game ───────────────────────────
@@ -2128,13 +2128,13 @@ mod tests {
         inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
 
         let before: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+            CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
         });
 
         let _ = client.try_cash_out(&player);
 
         let after: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+            CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
         });
 
         // State must be identical — no partial mutation on error.
@@ -2151,13 +2151,13 @@ mod tests {
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
 
         let before_stats: ContractStats = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
         });
 
         let _ = client.try_cash_out(&player);
 
         let after_stats: ContractStats = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Stats).unwrap()
+            env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
         });
 
         // Stats must be unchanged — no fee or reserve mutation on error.
@@ -2186,7 +2186,7 @@ mod tests {
         assert!(client.try_set_paused(&admin, &true).is_ok());
 
         let cfg: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         assert!(cfg.paused);
     }
@@ -2213,7 +2213,7 @@ mod tests {
         client.set_paused(&admin, &false);
 
         let cfg: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         assert!(!cfg.paused);
     }
@@ -2225,14 +2225,14 @@ mod tests {
         let (contract_id, client) = setup(&env);
 
         let before: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         let stranger = Address::generate(&env);
         let _ = client.try_set_paused(&stranger, &true);
 
         let after: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         assert_eq!(before.paused, after.paused);
@@ -2255,7 +2255,7 @@ mod tests {
         assert!(client.try_set_treasury(&admin, &new_treasury).is_ok());
 
         let cfg: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         assert_eq!(cfg.treasury, new_treasury);
     }
@@ -2278,7 +2278,7 @@ mod tests {
         env.mock_all_auths();
         let (contract_id, client) = setup(&env);
         let before: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         let stranger = Address::generate(&env);
@@ -2286,7 +2286,7 @@ mod tests {
         let _ = client.try_set_treasury(&stranger, &new_treasury);
 
         let after: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         assert_eq!(before, after);
@@ -2302,7 +2302,7 @@ mod tests {
         assert!(client.try_set_wager_limits(&admin, &2_000_000, &200_000_000).is_ok());
 
         let cfg: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         assert_eq!(cfg.min_wager, 2_000_000);
         assert_eq!(cfg.max_wager, 200_000_000);
@@ -2336,14 +2336,14 @@ mod tests {
         env.mock_all_auths();
         let (contract_id, client) = setup(&env);
         let before: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         let stranger = Address::generate(&env);
         let _ = client.try_set_wager_limits(&stranger, &2_000_000, &200_000_000);
 
         let after: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         assert_eq!(before, after);
@@ -2359,7 +2359,7 @@ mod tests {
         client.set_fee(&admin, &400);
 
         let stored: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         assert_eq!(stored.fee_bps, 400);
     }
@@ -2407,14 +2407,14 @@ mod tests {
         // Lower bound (200 bps = 2%)
         assert!(client.try_set_fee(&admin, &200).is_ok());
         let cfg: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         assert_eq!(cfg.fee_bps, 200);
 
         // Upper bound (500 bps = 5%)
         assert!(client.try_set_fee(&admin, &500).is_ok());
         let cfg: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
         assert_eq!(cfg.fee_bps, 500);
     }
@@ -2426,14 +2426,14 @@ mod tests {
         let (contract_id, client) = setup(&env);
 
         let before: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         let stranger = Address::generate(&env);
         let _ = client.try_set_fee(&stranger, &400);
 
         let after: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         assert_eq!(before.fee_bps, after.fee_bps);
@@ -2447,13 +2447,13 @@ mod tests {
         let admin = get_admin(&env, &contract_id);
 
         let before: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         let _ = client.try_set_fee(&admin, &999);
 
         let after: ContractConfig = env.as_contract(&contract_id, || {
-            env.storage().persistent().get(&StorageKey::Config).unwrap()
+            env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
         });
 
         assert_eq!(before.fee_bps, after.fee_bps);
@@ -2472,14 +2472,14 @@ mod tests {
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
         client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
-        assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+        assert_eq!(client.try_reveal(&player, &secret), Ok(true));
 
         // Fee changes after reveal must not alter this game's payout terms.
         client.set_fee(&admin, &500);
 
         let expected = calculate_payout(10_000_000, 1, 300).unwrap();
         let payout = client.try_cash_out(&player);
-        assert_eq!(payout, Ok(Ok(expected)));
+        assert_eq!(payout, Ok(expected));
     }
 
     #[test]
@@ -2497,11 +2497,11 @@ mod tests {
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
         client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
-        assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+        assert_eq!(client.try_reveal(&player, &secret), Ok(true));
 
         let expected = calculate_payout(10_000_000, 1, 500).unwrap();
         let payout = client.try_cash_out(&player);
-        assert_eq!(payout, Ok(Ok(expected)));
+        assert_eq!(payout, Ok(expected));
     }
 
     // ── continue_streak unit tests ───────────────────────────────────────────
@@ -2644,7 +2644,7 @@ mod tests {
         assert!(result.is_ok());
 
         let game: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+            CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
         });
 
         // Phase must be reset to Committed.
@@ -2671,7 +2671,7 @@ mod tests {
 
         // Capture the old contract_random before the transition.
         let old_random: BytesN<32> = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap().contract_random
+            CoinflipContract::load_player_game(&env, &player).unwrap().unwrap().contract_random
         });
 
         // Advance the ledger so the new sequence produces a different hash.
@@ -2727,13 +2727,13 @@ mod tests {
         inject_game(&env, &contract_id, &player, GamePhase::Committed, 1, 10_000_000);
 
         let before: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+            CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
         });
 
         let _ = client.try_continue_streak(&player, &dummy_commitment(&env));
 
         let after: GameState = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player).unwrap()
+            CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
         });
 
         assert_eq!(before, after, "game state must be unchanged on guard failure");
@@ -2783,7 +2783,7 @@ mod property_tests {
             streak  in 1u32..=10u32,
             fee_bps in 200u32..=500u32,
         ) {
-            let net   = calculate_payout(wager, streak, fee_bps).unwrap();
+            let net   = calculate_payout(wager, streak, fee_bps).unwrap().unwrap();
             let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
             prop_assert!(net < gross);
         }
@@ -2795,7 +2795,7 @@ mod property_tests {
             streak  in 1u32..=10u32,
             fee_bps in 200u32..=500u32,
         ) {
-            prop_assert!(calculate_payout(wager, streak, fee_bps).unwrap() > 0);
+            prop_assert!(calculate_payout(wager, streak, fee_bps).unwrap().unwrap() > 0);
         }
 
         /// Higher streak → higher net payout for the same wager and fee.
@@ -2805,8 +2805,8 @@ mod property_tests {
             streak  in 1u32..=3u32,
             fee_bps in 200u32..=500u32,
         ) {
-            let lower  = calculate_payout(wager, streak,     fee_bps).unwrap();
-            let higher = calculate_payout(wager, streak + 1, fee_bps).unwrap();
+            let lower  = calculate_payout(wager, streak,     fee_bps).unwrap().unwrap();
+            let higher = calculate_payout(wager, streak + 1, fee_bps).unwrap().unwrap();
             prop_assert!(higher > lower);
         }
 
@@ -2817,8 +2817,8 @@ mod property_tests {
             streak  in 1u32..=10u32,
             fee_bps in 200u32..=500u32,
         ) {
-            let single = calculate_payout(wager,     streak, fee_bps).unwrap();
-            let double = calculate_payout(wager * 2, streak, fee_bps).unwrap();
+            let single = calculate_payout(wager,     streak, fee_bps).unwrap().unwrap();
+            let double = calculate_payout(wager * 2, streak, fee_bps).unwrap().unwrap();
             // Integer division can cause a ±1 stroop rounding difference
             prop_assert!((double - single * 2).abs() <= 1);
         }
@@ -2832,11 +2832,11 @@ mod property_tests {
             let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
             
             // 0% fee (0 bps)
-            let net_zero_fee = calculate_payout(wager, streak, 0).unwrap();
+            let net_zero_fee = calculate_payout(wager, streak, 0).unwrap().unwrap();
             prop_assert_eq!(net_zero_fee, gross);
 
             // 100% fee (10_000 bps)
-            let net_max_fee = calculate_payout(wager, streak, 10_000).unwrap();
+            let net_max_fee = calculate_payout(wager, streak, 10_000).unwrap().unwrap();
             prop_assert_eq!(net_max_fee, 0);
         }
 
@@ -2848,7 +2848,7 @@ mod property_tests {
             streak in 1u32..=10u32,
             fee_bps in 0u32..=10_000u32,
         ) {
-            let net = calculate_payout(wager, streak, fee_bps).unwrap();
+            let net = calculate_payout(wager, streak, fee_bps).unwrap().unwrap();
             prop_assert!(net >= 0);
         }
     }
@@ -3268,7 +3268,7 @@ mod property_tests {
         
         // Verify no game state was stored for this player
         let game: Option<GameState> = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player)
+            CoinflipContract::load_player_game(&env, &player).unwrap()
         });
         
         assert!(game.is_none(),
@@ -3321,7 +3321,7 @@ mod property_tests {
             client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
             
             let stored_config: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
             
             prop_assert_eq!(stored_config.fee_bps, fee_bps);
@@ -3347,7 +3347,7 @@ mod property_tests {
             client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
             
             let stored_stats: ContractStats = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+                env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
             });
             
             prop_assert_eq!(stored_stats.total_games, 0);
@@ -3391,14 +3391,14 @@ mod property_tests {
             let attacker = Address::generate(&env);
 
             let before: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
 
             let result = client.try_set_fee(&attacker, &new_fee_bps);
             prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
 
             let after: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
             prop_assert_eq!(before, after);
         }
@@ -3416,14 +3416,14 @@ mod property_tests {
             let attacker = Address::generate(&env);
 
             let before: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
 
             let result = client.try_set_paused(&attacker, &pause_target);
             prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
 
             let after: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
             prop_assert_eq!(before, after);
         }
@@ -3441,14 +3441,14 @@ mod property_tests {
             let new_treasury = Address::generate(&env);
 
             let before: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
 
             let result = client.try_set_treasury(&attacker, &new_treasury);
             prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
 
             let after: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
             prop_assert_eq!(before, after);
         }
@@ -3469,14 +3469,14 @@ mod property_tests {
             let attempted_max_wager = attempted_min_wager + max_offset;
 
             let before: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
 
             let result = client.try_set_wager_limits(&attacker, &attempted_min_wager, &attempted_max_wager);
             prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
 
             let after: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
             prop_assert_eq!(before, after);
         }
@@ -3531,7 +3531,7 @@ mod property_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &Side::Heads, &wager, &commitment);
-            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(true));
 
             let revealed: GameState = env.as_contract(&contract_id, || {
                 CoinflipContract::load_player_game(&env, &player).unwrap()
@@ -3540,7 +3540,7 @@ mod property_tests {
 
             client.set_fee(&admin, &new_fee_bps);
 
-            let expected_net = calculate_payout(wager, 1, initial_fee_bps).unwrap();
+            let expected_net = calculate_payout(wager, 1, initial_fee_bps).unwrap().unwrap();
             let expected_fee = (wager
                 .checked_mul(get_multiplier(1) as i128)
                 .and_then(|v| v.checked_div(10_000))
@@ -3550,15 +3550,15 @@ mod property_tests {
                 .unwrap();
 
             let payout = client.try_cash_out(&player);
-            prop_assert_eq!(payout, Ok(Ok(expected_net)));
+            prop_assert_eq!(payout, Ok(expected_net));
 
             let cfg: ContractConfig = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Config).unwrap()
+                env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
             });
             prop_assert_eq!(cfg.fee_bps, new_fee_bps);
 
             let stats: ContractStats = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+                env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
             });
             prop_assert_eq!(stats.total_fees, expected_fee);
         }
@@ -3583,7 +3583,7 @@ mod property_tests {
             let secret_one = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment_one: BytesN<32> = env.crypto().sha256(&secret_one).into();
             client.start_game(&player_one, &Side::Heads, &wager, &commitment_one);
-            prop_assert_eq!(client.try_reveal(&player_one, &secret_one), Ok(Ok(true)));
+            prop_assert_eq!(client.try_reveal(&player_one, &secret_one), Ok(true));
 
             // Admin updates fee; this must only affect newly created games.
             client.set_fee(&admin, &new_fee_bps);
@@ -3593,13 +3593,13 @@ mod property_tests {
             let secret_two = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment_two: BytesN<32> = env.crypto().sha256(&secret_two).into();
             client.start_game(&player_two, &Side::Heads, &wager, &commitment_two);
-            prop_assert_eq!(client.try_reveal(&player_two, &secret_two), Ok(Ok(true)));
+            prop_assert_eq!(client.try_reveal(&player_two, &secret_two), Ok(true));
 
             let payout_one = client.try_cash_out(&player_one);
             let payout_two = client.try_cash_out(&player_two);
 
-            prop_assert_eq!(payout_one, Ok(Ok(calculate_payout(wager, 1, initial_fee_bps).unwrap())));
-            prop_assert_eq!(payout_two, Ok(Ok(calculate_payout(wager, 1, new_fee_bps).unwrap())));
+            prop_assert_eq!(payout_one, Ok(calculate_payout(wager, 1, initial_fee_bps).unwrap()));
+            prop_assert_eq!(payout_two, Ok(calculate_payout(wager, 1, new_fee_bps).unwrap().unwrap()));
         }
 
         #[test]
@@ -3621,18 +3621,18 @@ mod property_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &Side::Heads, &wager, &commitment);
-            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(true));
 
             client.set_fee(&admin, &new_fee_bps);
 
             // Continue after fee change; payout terms must remain on the original snapshot.
             let next_secret = Bytes::from_slice(&env, &[1u8; 32]);
             let next_commitment: BytesN<32> = env.crypto().sha256(&next_secret).into();
-            prop_assert_eq!(client.try_continue_streak(&player, &next_commitment), Ok(Ok(())));
-            prop_assert_eq!(client.try_reveal(&player, &next_secret), Ok(Ok(true)));
+            prop_assert_eq!(client.try_continue_streak(&player, &next_commitment), Ok(()));
+            prop_assert_eq!(client.try_reveal(&player, &next_secret), Ok(true));
 
             let payout = client.try_cash_out(&player);
-            prop_assert_eq!(payout, Ok(Ok(calculate_payout(wager, 2, initial_fee_bps).unwrap())));
+            prop_assert_eq!(payout, Ok(calculate_payout(wager, 2, initial_fee_bps).unwrap()));
         }
     }
 
@@ -3687,19 +3687,19 @@ mod property_tests {
             client.set_paused(&admin, &true);
 
             let before_stats: ContractStats = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+                env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
             });
 
             let result = client.try_start_game(&player, &side, &wager, &commitment);
             prop_assert_eq!(result, Err(Ok(Error::ContractPaused)));
 
             let game: Option<GameState> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player)
+                CoinflipContract::load_player_game(&env, &player).unwrap()
             });
             prop_assert!(game.is_none());
 
             let after_stats: ContractStats = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+                env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
             });
             prop_assert_eq!(before_stats, after_stats);
         }
@@ -3724,7 +3724,7 @@ mod property_tests {
             client.set_paused(&admin, &true);
 
             let result = client.try_reveal(&player, &secret);
-            prop_assert_eq!(result, Ok(Ok(true)));
+            prop_assert_eq!(result, Ok(true));
 
             let game: GameState = env.as_contract(&contract_id, || {
                 CoinflipContract::load_player_game(&env, &player).unwrap()
@@ -3750,13 +3750,13 @@ mod property_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &Side::Heads, &wager, &commitment);
-            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(Ok(true)));
+            prop_assert_eq!(client.try_reveal(&player, &secret), Ok(true));
 
             client.set_paused(&admin, &true);
 
             let secret_round_two = Bytes::from_slice(&env, &[1u8; 32]);
             let next_commitment: BytesN<32> = env.crypto().sha256(&secret_round_two).into();
-            prop_assert_eq!(client.try_continue_streak(&player, &next_commitment), Ok(Ok(())));
+            prop_assert_eq!(client.try_continue_streak(&player, &next_commitment), Ok(()));
 
             let continued: GameState = env.as_contract(&contract_id, || {
                 CoinflipContract::load_player_game(&env, &player).unwrap()
@@ -3764,11 +3764,11 @@ mod property_tests {
             prop_assert_eq!(continued.phase, GamePhase::Committed);
             prop_assert_eq!(continued.streak, 1);
 
-            prop_assert_eq!(client.try_reveal(&player, &secret_round_two), Ok(Ok(true)));
+            prop_assert_eq!(client.try_reveal(&player, &secret_round_two), Ok(true));
 
-            let expected_payout = calculate_payout(wager, 2, fee_bps).unwrap();
+            let expected_payout = calculate_payout(wager, 2, fee_bps).unwrap().unwrap();
             let payout = client.try_cash_out(&player);
-            prop_assert_eq!(payout, Ok(Ok(expected_payout)));
+            prop_assert_eq!(payout, Ok(expected_payout));
         }
     }
 
@@ -3815,14 +3815,14 @@ mod property_tests {
 
             // check precondition to compare increments
             let pre_stats: ContractStats = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+                env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
             });
 
             let result = client.try_start_game(&player, &side, &wager, &commitment);
             prop_assert!(result.is_ok());
 
             let game: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
+                CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
             });
 
             prop_assert_eq!(game.wager, wager);
@@ -3831,7 +3831,7 @@ mod property_tests {
             prop_assert_eq!(game.streak, 0);
 
             let post_stats: ContractStats = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&StorageKey::Stats).unwrap()
+                env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
             });
 
             prop_assert_eq!(post_stats.total_games, pre_stats.total_games + 1);
@@ -3978,7 +3978,7 @@ mod property_tests {
 
             // Invariant: fee calculation is consistent
             let expected_fee = gross_payout.checked_mul(fee_bps as i128)
-                .and_then(|v| v.checked_div(10_000)).unwrap();
+                .and_then(|v| v.checked_div(10_000));
             prop_assert_eq!(fee_amount, expected_fee);
         }
 
@@ -4869,13 +4869,13 @@ mod property_tests {
             inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, 0, wager);
 
             let before: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
+                CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
             });
 
             let _ = client.try_continue_streak(&player, &dummy_commitment_prop(&env));
 
             let after: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
+                CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
             });
 
             prop_assert_eq!(before, after,
@@ -5582,7 +5582,7 @@ mod streak_increment_tests {
             fee_bps in 200u32..=500u32,
         ) {
             let payout_now  = calculate_payout(wager, streak,     fee_bps).unwrap();
-            let payout_next = calculate_payout(wager, streak + 1, fee_bps).unwrap();
+            let payout_next = calculate_payout(wager, streak + 1, fee_bps).unwrap().unwrap();
             prop_assert!(
                 payout_next > payout_now,
                 "payout at streak {} ({}) must exceed payout at streak {} ({}) for wager {}",
@@ -5694,8 +5694,8 @@ mod outcome_determinism_tests {
             streak  in 1u32..=10u32,
             fee_bps in 200u32..=500u32,
         ) {
-            let a = calculate_payout(wager, streak, fee_bps);
-            let b = calculate_payout(wager, streak, fee_bps);
+            let a = calculate_payout(wager, streak, fee_bps).unwrap();
+            let b = calculate_payout(wager, streak, fee_bps).unwrap();
             prop_assert_eq!(a, b);
         }
 
@@ -5742,7 +5742,7 @@ mod outcome_determinism_tests {
             streak  in 1u32..=10u32,
             fee_bps in 0u32..=10_000u32,
         ) {
-            prop_assert_eq!(calculate_payout(0, streak, fee_bps), Some(0));
+            prop_assert_eq!(calculate_payout(0, streak, fee_bps).unwrap(), Some(0));
         }
 
         /// generate_outcome is deterministic: same inputs always produce the same Side.
@@ -6014,7 +6014,7 @@ mod loss_forfeiture_tests {
 
             // LF-2: game state must be fully deleted
             let stored: Option<GameState> = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player)
+                CoinflipContract::load_player_game(&env, &player).unwrap()
             });
             prop_assert!(stored.is_none(),
                 "game state must be deleted from storage after a loss");
@@ -6426,7 +6426,7 @@ mod reserve_solvency_tests {
         
         // Ensure no game state was stored
         let game_opt: Option<GameState> = env.as_contract(&id, || {
-            CoinflipContract::load_player_game(&env, &player)
+            CoinflipContract::load_player_game(&env, &player).unwrap()
         });
         assert!(game_opt.is_none(), "No game state should be persisted for player");
     }
@@ -6593,7 +6593,7 @@ mod reserve_balance_accuracy_tests {
             client.start_game(&player, &Side::Heads, &wager, &commitment);
             client.reveal(&player, &secret);
             // streak = 1 after win
-            let gross = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
+            let gross = wager.checked_mul(get_multiplier(1) as i128) / 10_000;
 
             let before = reserve(&env, &id);
             client.cash_out(&player);
@@ -6672,7 +6672,7 @@ mod reserve_balance_accuracy_tests {
             let win_com: BytesN<32> = env.crypto().sha256(&win_sec).into();
             client.start_game(&p_win, &Side::Heads, &wager, &win_com);
             client.reveal(&p_win, &win_sec);
-            let gross_win = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
+            let gross_win = wager.checked_mul(get_multiplier(1) as i128) / 10_000;
 
             let before_cashout = reserve(&env, &id);
             client.cash_out(&p_win);
@@ -7132,8 +7132,8 @@ mod integration_tests {
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
         let stats = h.stats();
-        let gross = wager.checked_mul(get_multiplier(1) as i128).unwrap() / 10_000;
-        let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128).unwrap() / 10_000;
+        let gross = wager.checked_mul(get_multiplier(1) as i128) / 10_000;
+        let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128) / 10_000;
         assert_eq!(stats.reserve_balance, 1_000_000_000 - gross);
         assert_eq!(stats.total_fees, fee);
     }
@@ -7147,7 +7147,7 @@ mod integration_tests {
         let won = h.play_loss_round(&player, wager);
         assert!(!won, "seed 2 + Heads must lose");
         let game_opt: Option<GameState> = h.env.as_contract(&h.contract_id, || {
-            CoinflipContract::load_player_game(&h.env, &player)
+            CoinflipContract::load_player_game(&h.env, &player).unwrap()
         });
         assert!(game_opt.is_none(), "game state must be deleted on loss");
         let stats = h.stats();
@@ -7198,8 +7198,8 @@ mod integration_tests {
         let expected_net = calculate_payout(wager, 4, DEFAULT_FEE_BPS).unwrap();
         let payout = h.client.cash_out(&player);
         assert_eq!(payout, expected_net);
-        let gross = wager.checked_mul(MULTIPLIER_STREAK_4_PLUS as i128).unwrap() / 10_000;
-        let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128).unwrap() / 10_000;
+        let gross = wager.checked_mul(MULTIPLIER_STREAK_4_PLUS as i128) / 10_000;
+        let fee = gross.checked_mul(DEFAULT_FEE_BPS as i128) / 10_000;
         assert_eq!(expected_net, gross - fee);
     }
 
@@ -7221,7 +7221,7 @@ mod integration_tests {
         );
         assert_eq!(result, Err(Ok(Error::ContractPaused)));
         let game_opt: Option<GameState> = h.env.as_contract(&h.contract_id, || {
-            CoinflipContract::load_player_game(&h.env, &player)
+            CoinflipContract::load_player_game(&h.env, &player).unwrap()
         });
         assert!(game_opt.is_none());
     }
@@ -7284,7 +7284,7 @@ mod integration_tests {
         assert!(!result, "seed 3 + Heads must lose");
         // Game state must be gone.
         let game_opt = h.env.as_contract(&h.contract_id, || {
-            CoinflipContract::load_player_game(&h.env, &player)
+            CoinflipContract::load_player_game(&h.env, &player).unwrap()
         });
         assert!(game_opt.is_none(), "game state must be deleted after loss");
         // Reserve must be credited with the forfeited wager.
@@ -7851,7 +7851,7 @@ mod cash_out_availability_tests {
 
             // No state mutation on rejection.
             let game_after: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
+                CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
             });
             prop_assert_eq!(game_after.phase, GamePhase::Revealed,
                 "game phase must not change on rejection");
@@ -7975,10 +7975,10 @@ mod cash_out_availability_tests {
         ) {
             // streak 1 < streak 2 < streak 3 < streak 4
             let fee_bps = 300u32;
-            let (_, _, net1) = calculate_payout_breakdown(wager, 1, fee_bps).unwrap();
-            let (_, _, net2) = calculate_payout_breakdown(wager, 2, fee_bps).unwrap();
-            let (_, _, net3) = calculate_payout_breakdown(wager, 3, fee_bps).unwrap();
-            let (_, _, net4) = calculate_payout_breakdown(wager, 4, fee_bps).unwrap();
+            let (_, _, net1) = calculate_payout_breakdown(wager, 1, fee_bps).unwrap().unwrap();
+            let (_, _, net2) = calculate_payout_breakdown(wager, 2, fee_bps).unwrap().unwrap();
+            let (_, _, net3) = calculate_payout_breakdown(wager, 3, fee_bps).unwrap().unwrap();
+            let (_, _, net4) = calculate_payout_breakdown(wager, 4, fee_bps).unwrap().unwrap();
 
             prop_assert!(net1 < net2, "streak-1 net must be less than streak-2 net");
             prop_assert!(net2 < net3, "streak-2 net must be less than streak-3 net");
@@ -8057,7 +8057,7 @@ mod cash_out_availability_tests {
             inject(&env, &contract_id, &player, phase.clone(), effective_streak, wager);
 
             let game_before: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
+                CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
             });
             let stats_before = read_stats(&env, &contract_id);
 
@@ -8068,7 +8068,7 @@ mod cash_out_availability_tests {
 
             // Game record must be byte-for-byte identical.
             let game_after: GameState = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
+                CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
             });
             prop_assert_eq!(game_before, game_after,
                 "game state must not change on rejected cash_out");
@@ -8136,7 +8136,7 @@ mod state_transition_tests {
     }
 
     fn st_game(env: &Env, contract_id: &Address, player: &Address) -> Option<GameState> {
-        env.as_contract(contract_id, || CoinflipContract::load_player_game(env, player))
+        env.as_contract(contract_id, || CoinflipContract::load_player_game(env, player).unwrap())
     }
 
     fn st_reserve(env: &Env, contract_id: &Address) -> i128 {
@@ -8154,8 +8154,8 @@ mod state_transition_tests {
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Committed, 0, wager);
             let secret = st_secret(&env, 1);
-            if client.reveal(&player, &secret) == Ok(true) {
-                let g = st_game(&env, &contract_id, &player).unwrap();
+            if client.reveal(&player, &secret) {
+                let g = st_game(&env, &contract_id, &player);
                 prop_assert_eq!(g.phase, GamePhase::Revealed);
                 prop_assert!(g.streak >= 1);
                 prop_assert_eq!(g.wager, wager);
@@ -8170,7 +8170,7 @@ mod state_transition_tests {
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Committed, 0, wager);
             let secret = st_secret(&env, 3);
-            if client.reveal(&player, &secret) == Ok(false) {
+            if !client.reveal(&player, &secret) {
                 prop_assert!(st_game(&env, &contract_id, &player).is_none(),
                     "game must be deleted after loss");
             }
@@ -8187,9 +8187,9 @@ mod state_transition_tests {
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
             let reserve_before = st_reserve(&env, &contract_id);
-            let payout = client.cash_out(&player).unwrap();
+            let payout = client.cash_out(&player);
             prop_assert!(st_game(&env, &contract_id, &player).is_none(), "game must be deleted after cash_out");
-            let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
+            let gross = wager.checked_mul(get_multiplier(streak) as i128) / 10_000;
             prop_assert_eq!(reserve_before - st_reserve(&env, &contract_id), gross);
             prop_assert!(payout > 0);
         }
@@ -8205,8 +8205,8 @@ mod state_transition_tests {
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
             let new_commit = st_commit(&env, 42);
-            client.continue_streak(&player, &new_commit).unwrap();
-            let g = st_game(&env, &contract_id, &player).unwrap();
+            client.continue_streak(&player, &new_commit);
+            let g = st_game(&env, &contract_id, &player);
             prop_assert_eq!(g.phase, GamePhase::Committed);
             prop_assert_eq!(g.streak, streak);
             prop_assert_eq!(g.wager, wager);
@@ -8306,7 +8306,7 @@ mod state_transition_tests {
             st_fund(&env, &contract_id, 1_000_000_000);
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Committed, streak, wager);
-            let state_before = st_game(&env, &contract_id, &player).unwrap();
+            let state_before = st_game(&env, &contract_id, &player);
             let reserve_before = st_reserve(&env, &contract_id);
             let _ = client.try_cash_out(&player);
             let _ = client.try_continue_streak(&player, &st_commit(&env, 99));
@@ -8341,8 +8341,8 @@ mod state_transition_tests {
             st_fund(&env, &contract_id, 1_000_000_000);
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Committed, initial_streak, wager);
-            if client.reveal(&player, &st_secret(&env, 1)) == Ok(true) {
-                let g = st_game(&env, &contract_id, &player).unwrap();
+            if client.reveal(&player, &st_secret(&env, 1)) {
+                let g = st_game(&env, &contract_id, &player);
                 prop_assert!(g.streak > initial_streak,
                     "streak must increase after win (was {}, now {})", initial_streak, g.streak);
             }
@@ -8424,13 +8424,13 @@ mod security_penetration_tests {
         /// calculate_payout returns None (not panic) on i128::MAX overflow.
         #[test]
         fn prop_payout_overflow_returns_none(streak in 1u32..=4u32, fee_bps in 200u32..=500u32) {
-            prop_assert!(calculate_payout(i128::MAX, streak, fee_bps).is_none());
+            prop_assert!(calculate_payout(i128::MAX, streak, fee_bps).unwrap().is_none());
         }
 
         /// calculate_payout_breakdown returns None on overflow.
         #[test]
         fn prop_payout_breakdown_overflow_returns_none(streak in 1u32..=4u32, fee_bps in 200u32..=500u32) {
-            prop_assert!(calculate_payout_breakdown(i128::MAX, streak, fee_bps).is_none());
+            prop_assert!(calculate_payout_breakdown(i128::MAX, streak, fee_bps).unwrap().is_none());
         }
 
         /// start_game with overflow wager returns InsufficientReserves.
@@ -8455,7 +8455,7 @@ mod security_penetration_tests {
             streak in 1u32..=4u32,
         ) {
             let (env, client, contract_id, _admin) = sec_setup();
-            let gross = wager.checked_mul(get_multiplier(streak) as i128).unwrap() / 10_000;
+            let gross = wager.checked_mul(get_multiplier(streak) as i128) / 10_000;
             sec_fund(&env, &contract_id, gross - 1);
             let player = Address::generate(&env);
             let game = GameState {
@@ -8723,7 +8723,7 @@ mod stress_tests {
         str_fund(&env, &contract_id, 2_000_000_000);
         let player = Address::generate(&env);
         str_inject(&env, &contract_id, &player, GamePhase::Revealed, 4, wager);
-        let payout = client.cash_out(&player).unwrap();
+        let payout = client.cash_out(&player);
         // gross=1_000_000_000, fee=30_000_000 (300bps), net=970_000_000
         assert_eq!(payout, 970_000_000);
     }
@@ -8743,7 +8743,7 @@ mod stress_tests {
             str_fund(&env, &contract_id, 1_000_000_000_000i128);
             let player = Address::generate(&env);
             str_inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
-            let payout = client.cash_out(&player).unwrap();
+            let payout = client.cash_out(&player);
             let expected_net = wager * 10 - (wager * 10 * 300 / 10_000);
             prop_assert_eq!(payout, expected_net);
         }
@@ -8755,7 +8755,7 @@ mod stress_tests {
             str_fund(&env, &contract_id, 1_000_000_000_000i128);
             let player = Address::generate(&env);
             str_inject(&env, &contract_id, &player, GamePhase::Revealed, u32::MAX, wager);
-            prop_assert!(client.cash_out(&player).unwrap() > 0);
+            prop_assert!(client.cash_out(&player) > 0);
         }
     }
 
@@ -8767,7 +8767,7 @@ mod stress_tests {
         let wager = 10_000_000i128;
         str_fund(&env, &contract_id, wager * 10); // exact worst-case
         let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &wager, &str_commit(&env, 1)).unwrap();
+        client.start_game(&player, &Side::Heads, &wager, &str_commit(&env, 1));
     }
 
     #[test]
@@ -8819,8 +8819,8 @@ mod stress_tests {
             let seed = if i % 2 == 0 { 1u8 } else { 3u8 };
             let commit = str_commit(&env, seed);
             client.start_game(&player, &Side::Heads, &5_000_000, &commit);
-            let won = client.reveal(&player, &str_secret(&env, seed)).unwrap();
-            if won { client.cash_out(&player).unwrap(); }
+            let won = client.reveal(&player, &str_secret(&env, seed));
+            if won { client.cash_out(&player); }
         }
         let stats = env.as_contract(&contract_id, || CoinflipContract::load_stats(&env));
         assert_eq!(stats.total_games, 20);
@@ -8878,7 +8878,7 @@ mod stress_tests {
             let streak = (i % 4 + 1) as u32;
             str_inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
             let game = env.as_contract(&contract_id, || {
-                CoinflipContract::load_player_game(&env, &player).unwrap()
+                CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
             });
             assert_eq!(game.wager, wager, "player {} wager mismatch", i);
             assert_eq!(game.streak, streak, "player {} streak mismatch", i);
@@ -8892,7 +8892,7 @@ mod stress_tests {
         let (env, client, contract_id) = str_setup();
         str_fund(&env, &contract_id, 1_000_000_000);
         let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &1_000_000, &str_commit(&env, 1)).unwrap();
+        client.start_game(&player, &Side::Heads, &1_000_000, &str_commit(&env, 1));
     }
 
     #[test]
@@ -8900,7 +8900,6 @@ mod stress_tests {
         let (env, client, contract_id) = str_setup();
         str_fund(&env, &contract_id, 100_000_000 * 10 + 1);
         let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &100_000_000, &str_commit(&env, 1)).unwrap();
+        client.start_game(&player, &Side::Heads, &100_000_000, &str_commit(&env, 1));
     }
 }
-

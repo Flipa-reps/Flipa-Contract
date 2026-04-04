@@ -119,8 +119,8 @@ fn test_total_games_does_not_increment_on_reveal_or_cash_out() {
     let player = Address::generate(&env);
     client.start_game(&player, &Side::Heads, &5_000_000, &make_commitment(&env, 1));
     let before = load_stats(&env, &contract_id).total_games;
-    client.reveal(&player, &make_secret(&env, 1)).unwrap();
-    client.cash_out(&player).unwrap();
+    client.reveal(&player, &make_secret(&env, 1));
+    client.cash_out(&player);
     assert_eq!(load_stats(&env, &contract_id).total_games, before);
 }
 
@@ -162,8 +162,8 @@ fn test_total_volume_does_not_change_on_cash_out() {
     let player = Address::generate(&env);
     client.start_game(&player, &Side::Heads, &5_000_000, &make_commitment(&env, 1));
     let before = load_stats(&env, &contract_id).total_volume;
-    client.reveal(&player, &make_secret(&env, 1)).unwrap();
-    client.cash_out(&player).unwrap();
+    client.reveal(&player, &make_secret(&env, 1));
+    client.cash_out(&player);
     assert_eq!(load_stats(&env, &contract_id).total_volume, before);
 }
 
@@ -182,7 +182,7 @@ fn test_total_fees_accumulates_on_cash_out() {
     let wager = 10_000_000i128;
     let player = Address::generate(&env);
     inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
-    client.cash_out(&player).unwrap();
+    client.cash_out(&player);
     // gross=19_000_000, fee=570_000 (300bps)
     let expected_fee = 570_000i128;
     assert_eq!(load_stats(&env, &contract_id).total_fees, expected_fee);
@@ -199,7 +199,7 @@ fn test_total_fees_accumulates_across_multiple_settlements() {
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
         let (_gross, fee, _net) = calculate_payout_breakdown(wager, streak, 300).unwrap();
         expected_fees += fee;
-        client.cash_out(&player).unwrap();
+        client.cash_out(&player);
     }
     assert_eq!(load_stats(&env, &contract_id).total_fees, expected_fees);
 }
@@ -213,7 +213,7 @@ fn test_total_fees_does_not_accumulate_on_loss() {
     let secret = make_secret(&env, 3);
     let commitment = make_commitment(&env, 3);
     client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
-    client.reveal(&player, &secret).unwrap();
+    client.reveal(&player, &secret);
     assert_eq!(load_stats(&env, &contract_id).total_fees, 0);
 }
 
@@ -227,7 +227,7 @@ fn test_reserve_balance_decreases_by_gross_on_cash_out() {
     let wager = 10_000_000i128;
     let player = Address::generate(&env);
     inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
-    client.cash_out(&player).unwrap();
+    client.cash_out(&player);
     // gross = 10_000_000 * 1.9 = 19_000_000
     let expected_reserve = initial_reserve - 19_000_000;
     assert_eq!(load_stats(&env, &contract_id).reserve_balance, expected_reserve);
@@ -244,7 +244,7 @@ fn test_reserve_balance_increases_on_loss() {
     let secret = make_secret(&env, 3);
     let commitment = make_commitment(&env, 3);
     client.start_game(&player, &Side::Heads, &wager, &commitment);
-    client.reveal(&player, &secret).unwrap();
+    client.reveal(&player, &secret);
     assert_eq!(
         load_stats(&env, &contract_id).reserve_balance,
         initial_reserve + wager
@@ -258,7 +258,7 @@ fn test_reserve_balance_unchanged_on_continue_streak() {
     let player = Address::generate(&env);
     inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 5_000_000);
     let before = load_stats(&env, &contract_id).reserve_balance;
-    client.continue_streak(&player, &make_commitment(&env, 42)).unwrap();
+    client.continue_streak(&player, &make_commitment(&env, 42));
     assert_eq!(load_stats(&env, &contract_id).reserve_balance, before);
 }
 
@@ -300,7 +300,7 @@ fn test_total_fees_never_decreases() {
     for streak in 1u32..=4 {
         let player = Address::generate(&env);
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, streak, 5_000_000);
-        client.cash_out(&player).unwrap();
+        client.cash_out(&player);
         let current = load_stats(&env, &contract_id).total_fees;
         assert!(current >= prev_fees, "total_fees must never decrease");
         prev_fees = current;
@@ -322,7 +322,7 @@ proptest! {
         let before = load_stats(&env, &contract_id).total_games;
         let player = Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[42u8; 32]);
-        client.start_game(&player, &Side::Heads, &wager, &commitment).unwrap();
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
         let after = load_stats(&env, &contract_id).total_games;
         prop_assert_eq!(after, before + 1);
     }
@@ -337,7 +337,7 @@ proptest! {
         let before = load_stats(&env, &contract_id).total_volume;
         let player = Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[42u8; 32]);
-        client.start_game(&player, &Side::Heads, &wager, &commitment).unwrap();
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
         let after = load_stats(&env, &contract_id).total_volume;
         prop_assert_eq!(after, before + wager);
     }
@@ -371,7 +371,7 @@ proptest! {
             CoinflipContract::save_player_game(&env, &player, &game);
         });
         let before = load_stats(&env, &contract_id).total_fees;
-        client.cash_out(&player).unwrap();
+        client.cash_out(&player);
         let after = load_stats(&env, &contract_id).total_fees;
         let (_, expected_fee, _) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap();
         prop_assert_eq!(after, before + expected_fee);
@@ -400,7 +400,7 @@ proptest! {
             CoinflipContract::save_player_game(&env, &player, &game);
         });
         let before = load_stats(&env, &contract_id).reserve_balance;
-        client.cash_out(&player).unwrap();
+        client.cash_out(&player);
         let after = load_stats(&env, &contract_id).reserve_balance;
         let (gross, _, _) = calculate_payout_breakdown(wager, streak, 300).unwrap();
         prop_assert_eq!(after, before - gross);
@@ -421,9 +421,9 @@ proptest! {
             b
         };
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
-        client.start_game(&player, &Side::Heads, &wager, &commitment).unwrap();
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
         let before = load_stats(&env, &contract_id).reserve_balance;
-        let won = client.reveal(&player, &secret).unwrap();
+        let won = client.reveal(&player, &secret);
         prop_assume!(!won);
         let after = load_stats(&env, &contract_id).reserve_balance;
         prop_assert_eq!(after, before + wager);
@@ -442,7 +442,7 @@ proptest! {
         for i in 0..num_games {
             let player = Address::generate(&env);
             let commitment = BytesN::from_array(&env, &[i as u8 + 1; 32]);
-            client.start_game(&player, &Side::Heads, &wager, &commitment).unwrap();
+            client.start_game(&player, &Side::Heads, &wager, &commitment);
             let curr = load_stats(&env, &contract_id);
             prop_assert!(curr.total_games >= prev.total_games);
             prop_assert!(curr.total_volume >= prev.total_volume);

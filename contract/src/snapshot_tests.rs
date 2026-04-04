@@ -17,7 +17,7 @@ fn test_env() -> Env {
 // ── Utility: Serialize to hex ────────────────────────────────────────────────
 
 fn borsh_to_hex<T: soroban_sdk::contracttype::ContractType>(env: &Env, value: &T) -> String {
-    let bytes = env.bytes_from_object(value).unwrap();
+    let bytes = env.bytes_from_object(value).unwrap().unwrap();
     hex::encode(bytes.to_vec())
 }
 
@@ -89,9 +89,9 @@ fn contract_config_roundtrip() {
     };
 
     // Serialize → deserialize → reserialize → must match original bytes
-    let bytes = env.bytes_from_object(&original).unwrap();
-    let roundtrip: ContractConfig = env.bytes_to_object(&bytes).unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap();
+    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
+    let roundtrip: ContractConfig = env.bytes_to_object(&bytes).unwrap().unwrap();
+    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
 
     assert_eq!(bytes, roundtrip_bytes);
     assert_eq!(original, roundtrip); // Field equality
@@ -133,9 +133,9 @@ fn contract_stats_roundtrip() {
         reserve_balance: 1_000_000_000,
     };
 
-    let bytes = env.bytes_from_object(&original).unwrap();
-    let roundtrip: ContractStats = env.bytes_to_object(&bytes).unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap();
+    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
+    let roundtrip: ContractStats = env.bytes_to_object(&bytes).unwrap().unwrap();
+    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
 
     assert_eq!(bytes, roundtrip_bytes);
     assert_eq!(original, roundtrip);
@@ -215,9 +215,9 @@ fn game_state_roundtrip() {
         start_ledger: 12345,
     };
 
-    let bytes = env.bytes_from_object(&original).unwrap();
-    let roundtrip: GameState = env.bytes_to_object(&bytes).unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap();
+    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
+    let roundtrip: GameState = env.bytes_to_object(&bytes).unwrap().unwrap();
+    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
 
     assert_eq!(bytes, roundtrip_bytes);
     assert_eq!(original, roundtrip);
@@ -264,6 +264,6 @@ fn legacy_game_state_deserializes() {
     // Embed known-good legacy Borsh bytes (update when format changes intentionally)
     let env = test_env();
     let legacy_bytes = hex::decode("...").unwrap(); // TODO: capture from mainnet/deployed
-    let _legacy_game: GameState = env.bytes_to_object(&env.bytes_object(&legacy_bytes)).unwrap();
+    let _legacy_game: GameState = env.bytes_to_object(&env.bytes_object(&legacy_bytes).unwrap().unwrap()).unwrap();
     // Will fail-fast if fields reordered/renamed/added incompatibly
 }

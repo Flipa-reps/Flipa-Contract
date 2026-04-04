@@ -162,7 +162,7 @@ fn test_reclaim_wager_at_exact_timeout_succeeds() {
     // Advance to exactly the timeout boundary
     advance_ledger(&env, TIMEOUT);
     let result = client.try_reclaim_wager(&player);
-    assert_eq!(result, Ok(Ok(wager)));
+    assert_eq!(result, Ok(wager));
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn test_reclaim_wager_after_timeout_succeeds() {
     inject_committed_game(&env, &contract_id, &player, wager, start);
     advance_ledger(&env, TIMEOUT + 50);
     let result = client.try_reclaim_wager(&player);
-    assert_eq!(result, Ok(Ok(wager)));
+    assert_eq!(result, Ok(wager));
 }
 
 // ── State cleanup after reclaim ───────────────────────────────────────────────
@@ -188,9 +188,9 @@ fn test_reclaim_wager_deletes_game_state() {
     let start = env.ledger().sequence();
     inject_committed_game(&env, &contract_id, &player, 5_000_000, start);
     advance_ledger(&env, TIMEOUT);
-    client.reclaim_wager(&player).unwrap();
+    client.reclaim_wager(&player);
     let game = env.as_contract(&contract_id, || {
-        CoinflipContract::load_player_game(&env, &player)
+        CoinflipContract::load_player_game(&env, &player).unwrap()
     });
     assert!(game.is_none(), "game state must be deleted after reclaim");
 }
@@ -205,7 +205,7 @@ fn test_reclaim_wager_credits_reserve_balance() {
     let start = env.ledger().sequence();
     inject_committed_game(&env, &contract_id, &player, wager, start);
     advance_ledger(&env, TIMEOUT);
-    client.reclaim_wager(&player).unwrap();
+    client.reclaim_wager(&player);
     let stats = env.as_contract(&contract_id, || CoinflipContract::load_stats(&env));
     assert_eq!(
         stats.reserve_balance,
@@ -222,7 +222,7 @@ fn test_reclaim_wager_allows_new_game_after_cleanup() {
     let start = env.ledger().sequence();
     inject_committed_game(&env, &contract_id, &player, 5_000_000, start);
     advance_ledger(&env, TIMEOUT);
-    client.reclaim_wager(&player).unwrap();
+    client.reclaim_wager(&player);
     // Player should be able to start a new game after reclaim
     let result = client.try_start_game(
         &player,
@@ -257,7 +257,7 @@ fn test_reveal_before_timeout_prevents_reclaim() {
     let commitment = make_commitment(&env, 1);
     client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
     // Reveal before timeout
-    client.reveal(&player, &secret).unwrap();
+    client.reveal(&player, &secret);
     // Advance past timeout
     advance_ledger(&env, TIMEOUT + 10);
     // Game is now in Revealed phase — reclaim must be rejected
@@ -286,7 +286,7 @@ proptest! {
         inject_committed_game(&env, &contract_id, &player, wager, start);
         advance_ledger(&env, TIMEOUT + extra_ledgers);
         let result = client.try_reclaim_wager(&player);
-        prop_assert_eq!(result, Ok(Ok(wager)));
+        prop_assert_eq!(result, Ok(wager));
     }
 
     /// PROPERTY 26b: reclaim_wager always fails before the timeout window expires.
@@ -317,7 +317,7 @@ proptest! {
         let start = env.ledger().sequence();
         inject_committed_game(&env, &contract_id, &player, wager, start);
         advance_ledger(&env, TIMEOUT);
-        client.reclaim_wager(&player).unwrap();
+        client.reclaim_wager(&player);
         let stats = env.as_contract(&contract_id, || CoinflipContract::load_stats(&env));
         prop_assert_eq!(stats.reserve_balance, initial_reserve + wager);
     }
@@ -333,9 +333,9 @@ proptest! {
         let start = env.ledger().sequence();
         inject_committed_game(&env, &contract_id, &player, wager, start);
         advance_ledger(&env, TIMEOUT);
-        client.reclaim_wager(&player).unwrap();
+        client.reclaim_wager(&player);
         let game = env.as_contract(&contract_id, || {
-            CoinflipContract::load_player_game(&env, &player)
+            CoinflipContract::load_player_game(&env, &player).unwrap()
         });
         prop_assert!(game.is_none());
     }

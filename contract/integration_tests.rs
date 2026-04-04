@@ -93,7 +93,7 @@ mod integration_tests {
             let commitment = self.make_commitment(seed);
             self.client.start_game(&player.clone(), &side, &wager, &commitment);
             let secret = self.make_secret(seed);
-            self.client.reveal(&player.clone(), &secret).unwrap()
+            self.client.reveal(&player.clone(), &secret)
         }
 
         pub fn play_win_round(&self, player: &Address, wager: i128) -> bool {
@@ -107,7 +107,7 @@ mod integration_tests {
         pub fn probe_outcome(&self, seed: u8) -> Side {
             let seq_bytes = self.env.ledger().sequence().to_be_bytes();
             let cr_bytes = Bytes::from_slice(&self.env, &seq_bytes);
-            let cr_hash: BytesN<32> = self.env.crypto().sha256(&cr_bytes).try_into().unwrap();
+            let cr_hash: BytesN<32> = self.env.crypto().sha256(&cr_bytes).try_into();
             let cr_array = cr_hash.to_array();
             let secret = self.make_secret(seed);
             let mut combined = Bytes::new(&self.env);
@@ -159,7 +159,7 @@ mod integration_tests {
             // Reserves unchanged, game persists (simulates "loss at streak" - no settlement)
             let post_stats = h.stats();
             assert_eq!(pre_stats.reserve_balance, post_stats.reserve_balance);
-            let game = h.game_state(&player).unwrap();
+            let game = h.game_state(&player);
             assert_eq!(game.streak, streak);
             assert_eq!(game.phase, GamePhase::Revealed);
         }
@@ -179,13 +179,13 @@ mod integration_tests {
             assert_eq!(game.phase, GamePhase::Revealed);
             if game.streak < 4 {
                 let commit = h.make_commitment(42);
-                h.client.continue_streak(&player, &commit).unwrap();
+                h.client.continue_streak(&player, &commit);
             }
         }
 
         // Cash out at streak 4 (10x)
         let pre_stats = h.stats();
-        let payout = h.client.cash_out(&player).unwrap();
+        let payout = h.client.cash_out(&player);
         let expected_gross = wager * 10; // 10x
         let expected_fee = expected_gross / 333; // ~3% = 300bps
         let expected_net = expected_gross - expected_fee;
@@ -213,7 +213,7 @@ mod integration_tests {
 
         // Repeat for streak 2
         h.play_win_round(&player, wager);
-        h.client.continue_streak(&player, &h.make_commitment(42)).unwrap();
+        h.client.continue_streak(&player, &h.make_commitment(42));
         assert!(h.play_win_round(&player, wager));
         let pre_loss_stats = h.stats();
         h.inject_game(&player, GamePhase::Revealed, 0, wager);
@@ -246,7 +246,7 @@ mod integration_tests {
         let fee = gross * 3 / 100;
         let net = gross - fee;
 
-        h.client.claim_winnings(&player).unwrap();
+        h.client.claim_winnings(&player);
 
         assert_eq!(token_client.balance(&contract_id), pre_contract - gross);
         assert_eq!(token_client.balance(&player), pre_player + net);
@@ -314,13 +314,13 @@ mod integration_tests {
                 }
                 
                 // Win: choose settlement or continue based on probability
-                let game = h.game_state(&player).unwrap();
+                let game = h.game_state(&player);
                 let streak = game.streak;
                 
                 if rand::random::<f64>() < continue_chance && streak < 4 {
                     // Continue streak (no funds move)
                     let next_commitment = h.make_commitment(42u8);
-                    h.client.continue_streak(&player, &next_commitment).unwrap();
+                    h.client.continue_streak(&player, &next_commitment);
                     // Double wager for next round risk
                     current_wager = current_wager * 2;
                     prop_assert_eq!(h.total_funds(&player), initial_total,
@@ -328,9 +328,9 @@ mod integration_tests {
                 } else {
                     // Settle: cash_out or claim_winnings
                     if use_claim_winnings {
-                        h.client.claim_winnings(&player).unwrap();
+                        h.client.claim_winnings(&player);
                     } else {
-                        h.client.cash_out(&player).unwrap();
+                        h.client.cash_out(&player);
                     }
                     // Reset wager for next game
                     current_wager = base_wager;

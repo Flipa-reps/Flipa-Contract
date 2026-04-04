@@ -1,6 +1,6 @@
-# Tossd Contract
+# Tossd
 
-Soroban smart contract for Tossd, a provably fair coinflip game on Stellar with a streak-based payout system.
+Soroban smart contract and frontend for Tossd, a provably fair coinflip game on Stellar with a streak-based payout system.
 
 ## Current Status
 
@@ -34,31 +34,40 @@ The source of truth for planned work is:
 
 ```text
 Tossd-contract/
-├── Cargo.toml
-├── README.md
-└── src/
-    └── lib.rs
+├── contract/
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rs
+└── frontend/
+    ├── package.json
+    └── components/
 ```
 
-## Build
+## Contract Build
 
 ```bash
-cargo build
+cargo build --manifest-path contract/Cargo.toml
 ```
 
 For a release build:
 
 ```bash
-cargo build --target wasm32-unknown-unknown --release
+cargo build --manifest-path contract/Cargo.toml --target wasm32-unknown-unknown --release
 ```
 
-## Test
+## Contract Test
 
 ```bash
-cargo test
+cargo test --manifest-path contract/Cargo.toml
 ```
 
 Current test coverage is limited to setup, initialization, and early storage behavior. It does not yet cover the full game flow.
+
+## Frontend Start
+
+```bash
+npm --prefix frontend start
+```
 
 ## Implemented Contract Surface
 
