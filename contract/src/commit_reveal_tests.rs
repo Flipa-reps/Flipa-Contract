@@ -119,6 +119,216 @@ proptest! {
             heads_pct * 100.0, heads_count, trials);
     }
 }
+
+// ── Commitment security tests ────────────────────────────────────────────────
+
+#[test]
+fn test_commitment_verification_with_valid_secret() {
+    let env = Env::default();
+    let secret = gen_secret(&env, 32);
+    let commitment = compute_commitment(&env, &secret);
+    assert!(verify_commitment(&env, &secret, &commitment));
+}
+
+#[test]
+fn test_commitment_verification_rejects_invalid_secret() {
+    let env = Env::default();
+    let secret = gen_secret(&env, 32);
+    let commitment = compute_commitment(&env, &secret);
+    
+    // Create a different secret
+    let mut wrong_secret = Bytes::new(&env);
+    for i in 0..32 {
+        wrong_secret.push_back((i as u8).wrapping_add(99));
+    }
+    
+    assert!(!verify_commitment(&env, &wrong_secret, &commitment));
+}
+
+#[test]
+fn test_commitment_verification_with_empty_secret() {
+    let env = Env::default();
+    let secret = Bytes::new(&env);
+    let commitment = compute_commitment(&env, &secret);
+    assert!(verify_commitment(&env, &secret, &commitment));
+}
+
+#[test]
+fn test_commitment_verification_with_max_size_secret() {
+    let env = Env::default();
+    let mut secret = Bytes::new(&env);
+    for i in 0..256 {
+        secret.push_back((i as u8).wrapping_add(42));
+    }
+    let commitment = compute_commitment(&env, &secret);
+    assert!(verify_commitment(&env, &secret, &commitment));
+}
+
+#[test]
+fn test_commitment_uniqueness_across_games() {
+    let env = Env::default();
+    
+    // Generate 100 different secrets and verify each produces unique commitment
+    let mut commitments = Vec::new();
+    for i in 0u8..100 {
+        let secret = gen_secret(&env, (i as usize % 64) + 1);
+        let commitment = compute_commitment(&env, &secret);
+        
+        // Verify this commitment hasn't been seen before
+        for prev_commitment in &commitments {
+            assert_ne!(&commitment, prev_commitment, "Commitment collision detected!");
+        }
+        commitments.push(commitment);
+    }
+}
+
+#[test]
+fn test_commitment_hash_collision_resistance() {
+    let env = Env::default();
+    
+    // Test that different secrets produce different commitments
+    let secret1 = gen_secret(&env, 32);
+    let secret2 = gen_secret(&env, 32);
+    
+    let commitment1 = compute_commitment(&env, &secret1);
+    let commitment2 = compute_commitment(&env, &secret2);
+    
+    // These should be different (with overwhelming probability)
+    assert_ne!(commitment1, commitment2);
+}
+
+#[test]
+fn test_commitment_determinism() {
+    let env = Env::default();
+    let secret = gen_secret(&env, 32);
+    
+    // Same secret should always produce same commitment
+    let commitment1 = compute_commitment(&env, &secret);
+    let commitment2 = compute_commitment(&env, &secret);
+    
+    assert_eq!(commitment1, commitment2);
+}
+
+#[test]
+fn test_commitment_with_various_secret_formats() {
+    let env = Env::default();
+    
+    // Test with different secret lengths
+    for len in [1, 8, 16, 32, 64, 128, 256] {
+        let secret = gen_secret(&env, len);
+        let commitment = compute_commitment(&env, &secret);
+        assert!(verify_commitment(&env, &secret, &commitment));
+    }
+}
+
+#[test]
+fn test_commitment_verification_100_plus_pairs() {
+    let env = Env::default();
+    
+    // Test 100+ valid/invalid pairs
+    for i in 0u8..100 {
+        let secret = gen_secret(&env, (i as usize % 64) + 1);
+        let commitment = compute_commitment(&env, &secret);
+        
+        // Valid pair should verify
+        assert!(verify_commitment(&env, &secret, &commitment));
+        
+        // Invalid pair should not verify
+        let mut wrong_secret = secret.clone();
+        if wrong_secret.len() > 0 {
+            wrong_secret.set(0, wrong_secret.get(0).unwrap().wrapping_add(1));
+        } else {
+            wrong_secret.push_back(42);
+        }
+        assert!(!verify_commitment(&env, &wrong_secret, &commitment));
+    }
+}
+
+#[test]
+fn test_commitment_no_false_positives() {
+    let env = Env::default();
+    
+    // Generate a commitment and verify it doesn't match random secrets
+    let secret = gen_secret(&env, 32);
+    let commitment = compute_commitment(&env, &secret);
+    
+    // Try 50 random secrets - none should match
+    for i in 0u8..50 {
+        let mut random_secret = Bytes::new(&env);
+        for j in 0..32 {
+            random_secret.push_back((i as u8).wrapping_add(j).wrapping_mul(7));
+        }
+        assert!(!verify_commitment(&env, &random_secret, &commitment));
+    }
+}
+
+#[test]
+fn test_commitment_no_false_negatives() {
+    let env = Env::default();
+    
+    // Generate 50 secrets and verify each matches its own commitment
+    for i in 0u8..50 {
+        let secret = gen_secret(&env, (i as usize % 64) + 1);
+        let commitment = compute_commitment(&env, &secret);
+        assert!(verify_commitment(&env, &secret, &commitment));
+    }
+}
+
+#[test]
+fn test_commitment_edge_case_single_byte_secret() {
+    let env = Env::default();
+    let mut secret = Bytes::new(&env);
+    secret.push_back(42);
+    let commitment = compute_commitment(&env, &secret);
+    assert!(verify_commitment(&env, &secret, &commitment));
+}
+
+#[test]
+fn test_commitment_edge_case_all_zeros() {
+    let env = Env::default();
+    let mut secret = Bytes::new(&env);
+    for _ in 0..32 {
+        secret.push_back(0);
+    }
+    let commitment = compute_commitment(&env, &secret);
+    assert!(verify_commitment(&env, &secret, &commitment));
+}
+
+#[test]
+fn test_commitment_edge_case_all_ones() {
+    let env = Env::default();
+    let mut secret = Bytes::new(&env);
+    for _ in 0..32 {
+        secret.push_back(255);
+    }
+    let commitment = compute_commitment(&env, &secret);
+    assert!(verify_commitment(&env, &secret, &commitment));
+}
+
+#[test]
+fn test_commitment_security_properties_documented() {
+    // This test documents the security properties of the commitment scheme:
+    // 1. SHA-256 is cryptographically secure
+    // 2. Collision resistance: finding two inputs with same hash is computationally infeasible
+    // 3. Preimage resistance: given a hash, finding the input is computationally infeasible
+    // 4. Second preimage resistance: given an input and hash, finding another input with same hash is infeasible
+    // 5. Determinism: same input always produces same hash
+    // 6. Avalanche effect: small input change produces completely different hash
+    
+    let env = Env::default();
+    
+    // Property 1: Determinism
+    let secret = gen_secret(&env, 32);
+    let c1 = compute_commitment(&env, &secret);
+    let c2 = compute_commitment(&env, &secret);
+    assert_eq!(c1, c2);
+    
+    // Property 2: Avalanche effect
+    let mut secret2 = secret.clone();
+    secret2.set(0, secret2.get(0).unwrap().wrapping_add(1));
+    let c3 = compute_commitment(&env, &secret2);
+    assert_ne!(c1, c3);
+}
 ```
 
 Added 3 new property tests (6,7,8) for commit-reveal randomness to contract/src/commit_reveal_tests.rs:
