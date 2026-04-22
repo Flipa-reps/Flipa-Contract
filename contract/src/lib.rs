@@ -1406,6 +1406,12 @@ mod pause_tests;
 mod statistics_tests;
 
 #[cfg(test)]
+mod fee_calculation_tests;
+
+#[cfg(test)]
+mod reserve_stress_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
