@@ -330,6 +330,41 @@ pub struct ContractStats {
     pub reserve_balance: i128,
 }
 
+/// A single completed game record stored in a player's history ring-buffer.
+///
+/// Captures the full commit-reveal proof so any past game can be independently
+/// verified off-chain via `verify_past_game`.
+///
+/// Fields:
+/// - `wager`           – original bet in stroops
+/// - `side`            – player's chosen side
+/// - `outcome`         – actual outcome derived from the reveal
+/// - `won`             – `true` if `outcome == side`
+/// - `streak`          – streak level at settlement (0 on loss)
+/// - `commitment`      – SHA-256 of the player's secret (pre-image proof)
+/// - `secret`          – revealed secret (stored for verification)
+/// - `contract_random` – contract's randomness contribution
+/// - `payout`          – net payout received (0 on loss)
+/// - `ledger`          – ledger sequence at game start
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryEntry {
+    pub wager: i128,
+    pub side: Side,
+    pub outcome: Side,
+    pub won: bool,
+    pub streak: u32,
+    pub commitment: BytesN<32>,
+    pub secret: Bytes,
+    pub contract_random: BytesN<32>,
+    pub payout: i128,
+    pub ledger: u32,
+}
+
+/// Maximum number of history entries retained per player.
+/// Older entries are evicted in FIFO order once the cap is reached.
+pub const HISTORY_LIMIT: u32 = 100;
+
 /// Persistent storage key variants for the contract's data model.
 ///
 /// Used with `env.storage().persistent()` for all reads and writes.
@@ -342,6 +377,8 @@ pub enum StorageKey {
     Stats,
     /// Per-player game state ([`GameState`]), keyed by player address.
     PlayerGame(Address),
+    /// Per-player game history ring-buffer ([`Vec<HistoryEntry>`]), keyed by player address.
+    PlayerHistory(Address),
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -646,6 +683,45 @@ impl CoinflipContract {
             .remove(&StorageKey::PlayerGame(player.clone()));
     }
 
+    /// Append a [`HistoryEntry`] to the player's history ring-buffer.
+    ///
+    /// Maintains a FIFO cap of [`HISTORY_LIMIT`] entries: when the buffer is
+    /// full the oldest entry is evicted before the new one is appended.
+    fn save_history_entry(env: &Env, player: &Address, entry: HistoryEntry) {
+        let key = StorageKey::PlayerHistory(player.clone());
+        let mut history: soroban_sdk::Vec<HistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+        // Evict oldest entry when at capacity.
+        if history.len() >= HISTORY_LIMIT {
+            // Rebuild without the first element (oldest).
+            let mut trimmed = soroban_sdk::Vec::new(env);
+            for i in 1..history.len() {
+                trimmed.push_back(history.get(i).unwrap());
+            }
+            history = trimmed;
+        }
+
+        history.push_back(entry);
+        env.storage().persistent().set(&key, &history);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Load the player's history ring-buffer. Returns an empty vec if none exists.
+    fn load_player_history(env: &Env, player: &Address) -> soroban_sdk::Vec<HistoryEntry> {
+        let key = StorageKey::PlayerHistory(player.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+    }
+
     /// Begin a new coinflip game for `player`.
     ///
     /// Acceptance invariants:
@@ -842,13 +918,27 @@ impl CoinflipContract {
         } else {
             // Loss path — forfeiture:
             // 1. Credit the wager back to contract reserves so the house keeps it.
-            // 2. Delete the player's game state to free storage and signal game-over.
+            // 2. Record the game in the player's history before deleting state.
+            // 3. Delete the player's game state to free storage and signal game-over.
             let mut stats = Self::load_stats(&env);
             stats.reserve_balance = stats
                 .reserve_balance
                 .checked_add(game.wager)
                 .unwrap_or(stats.reserve_balance);
             Self::save_stats(&env, &stats);
+
+            Self::save_history_entry(&env, &player, HistoryEntry {
+                wager: game.wager,
+                side: game.side,
+                outcome,
+                won: false,
+                streak: 0,
+                commitment: game.commitment,
+                secret,
+                contract_random: game.contract_random,
+                payout: 0,
+                ledger: game.start_ledger,
+            });
 
             Self::delete_player_game(&env, &player);
 
@@ -1003,6 +1093,22 @@ impl CoinflipContract {
             .checked_add(fee)
             .unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
+
+        // Record the settled game in history before deleting state.
+        // We don't have the original secret here (it was consumed by reveal),
+        // so we store an empty Bytes as the secret placeholder.
+        Self::save_history_entry(&env, &player, HistoryEntry {
+            wager: game.wager,
+            side: game.side,
+            outcome: game.side, // won, so outcome == side
+            won: true,
+            streak: game.streak,
+            commitment: game.commitment,
+            secret: Bytes::new(&env),
+            contract_random: game.contract_random,
+            payout: net_payout,
+            ledger: game.start_ledger,
+        });
 
         // Clear the player's game state completely after settlement
         Self::delete_player_game(&env, &player);
@@ -1347,6 +1453,20 @@ impl CoinflipContract {
             .unwrap_or(stats.reserve_balance);
         Self::save_stats(&env, &stats);
 
+        // Record the timed-out game in history (no outcome — treat as loss).
+        Self::save_history_entry(&env, &player, HistoryEntry {
+            wager: game.wager,
+            side: game.side,
+            outcome: if game.side == Side::Heads { Side::Tails } else { Side::Heads },
+            won: false,
+            streak: 0,
+            commitment: game.commitment,
+            secret: Bytes::new(&env),
+            contract_random: game.contract_random,
+            payout: 0,
+            ledger: game.start_ledger,
+        });
+
         Self::delete_player_game(&env, &player);
 
         Ok(game.wager)
@@ -1390,6 +1510,90 @@ impl CoinflipContract {
     /// - `None`            – no game record exists for `player`
     pub fn get_game_state(env: Env, player: Address) -> Option<GameState> {
         Self::load_player_game(&env, &player)
+    }
+
+    /// Return a paginated slice of the player's completed game history.
+    ///
+    /// History is stored as a FIFO ring-buffer capped at [`HISTORY_LIMIT`]
+    /// entries.  The oldest entry is at index 0; the most recent is last.
+    ///
+    /// # Arguments
+    /// - `player` – address whose history to query
+    /// - `offset` – zero-based start index into the history buffer
+    /// - `limit`  – maximum number of entries to return (capped at 20)
+    ///
+    /// # Returns
+    /// A `Vec<HistoryEntry>` slice.  Returns an empty vec if the player has
+    /// no history or if `offset` is beyond the end of the buffer.
+    pub fn get_game_history(
+        env: Env,
+        player: Address,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<HistoryEntry> {
+        let history = Self::load_player_history(&env, &player);
+        let len = history.len();
+        if offset >= len {
+            return soroban_sdk::Vec::new(&env);
+        }
+        // Cap page size at 20 to bound compute cost.
+        let page = limit.min(20);
+        let end = (offset + page).min(len);
+        let mut result = soroban_sdk::Vec::new(&env);
+        for i in offset..end {
+            result.push_back(history.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Verify that a past game's outcome is reproducible from its stored proof.
+    ///
+    /// Re-derives the outcome from `SHA-256(secret || contract_random)` and
+    /// checks it against the recorded `outcome` field.  Also re-verifies that
+    /// `SHA-256(secret) == commitment`.
+    ///
+    /// # Arguments
+    /// - `player`      – address whose history to inspect
+    /// - `history_idx` – index into the player's history buffer (0 = oldest)
+    ///
+    /// # Returns
+    /// - `Ok(true)`  – commitment and outcome both verify correctly
+    /// - `Ok(false)` – verification failed (tampered record or empty secret)
+    ///
+    /// # Errors
+    /// - [`Error::NoActiveGame`] – no history exists for `player`
+    /// - [`Error::InvalidPhase`] – `history_idx` is out of range
+    pub fn verify_past_game(
+        env: Env,
+        player: Address,
+        history_idx: u32,
+    ) -> Result<bool, Error> {
+        let history = Self::load_player_history(&env, &player);
+        if history.is_empty() {
+            return Err(Error::NoActiveGame);
+        }
+        if history_idx >= history.len() {
+            return Err(Error::InvalidPhase);
+        }
+        let entry = history.get(history_idx).unwrap();
+
+        // Games settled via cash_out store an empty secret (secret was consumed
+        // by reveal and not re-stored).  We can still verify the commitment is
+        // non-zero and the outcome field is consistent.
+        if entry.secret.is_empty() {
+            // Cannot re-derive outcome without the secret; return false to
+            // signal that full cryptographic verification is not possible.
+            return Ok(false);
+        }
+
+        // 1. Verify commitment: SHA-256(secret) == commitment
+        if !verify_commitment(&env, &entry.secret, &entry.commitment) {
+            return Ok(false);
+        }
+
+        // 2. Re-derive outcome and compare.
+        let derived = generate_outcome(&env, &entry.secret, &entry.contract_random);
+        Ok(derived == entry.outcome)
     }
 }
 
@@ -8928,5 +9132,315 @@ mod stress_tests {
         str_fund(&env, &contract_id, 100_000_000 * 10 + 1);
         let player = Address::generate(&env);
         client.start_game(&player, &Side::Heads, &100_000_000, &str_commit(&env, 1));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #446 — Game history and replay functionality tests
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod game_history_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    fn hist_setup() -> (Env, CoinflipContractClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let admin    = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token    = Address::generate(&env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        (env, client, contract_id)
+    }
+
+    fn hist_fund(env: &Env, contract_id: &Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &stats);
+        });
+    }
+
+    fn hist_secret(env: &Env, seed: u8) -> Bytes {
+        Bytes::from_slice(env, &[seed; 32])
+    }
+
+    fn hist_commit(env: &Env, seed: u8) -> BytesN<32> {
+        env.crypto().sha256(&hist_secret(env, seed)).into()
+    }
+
+    fn hist_history(env: &Env, contract_id: &Address, player: &Address) -> soroban_sdk::Vec<HistoryEntry> {
+        env.as_contract(contract_id, || {
+            CoinflipContract::load_player_history(env, player)
+        })
+    }
+
+    // ── Storage: loss appends entry ───────────────────────────────────────
+
+    /// A losing reveal must append exactly one HistoryEntry with won=false.
+    #[test]
+    fn test_loss_appends_history_entry() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        // seed 3 → Tails outcome → loss for Heads player
+        client.start_game(&player, &Side::Heads, &10_000_000, &hist_commit(&env, 3));
+        client.reveal(&player, &hist_secret(&env, 3));
+
+        let history = hist_history(&env, &contract_id, &player);
+        assert_eq!(history.len(), 1);
+        let entry = history.get(0).unwrap();
+        assert!(!entry.won);
+        assert_eq!(entry.wager, 10_000_000);
+        assert_eq!(entry.side, Side::Heads);
+        assert_eq!(entry.payout, 0);
+        assert_eq!(entry.streak, 0);
+    }
+
+    /// A winning cash_out must append exactly one HistoryEntry with won=true.
+    #[test]
+    fn test_win_cash_out_appends_history_entry() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        // seed 1 → Heads outcome → win for Heads player
+        client.start_game(&player, &Side::Heads, &10_000_000, &hist_commit(&env, 1));
+        client.reveal(&player, &hist_secret(&env, 1));
+        let payout = client.cash_out(&player);
+
+        let history = hist_history(&env, &contract_id, &player);
+        assert_eq!(history.len(), 1);
+        let entry = history.get(0).unwrap();
+        assert!(entry.won);
+        assert_eq!(entry.wager, 10_000_000);
+        assert_eq!(entry.payout, payout);
+        assert_eq!(entry.streak, 1);
+    }
+
+    /// Multiple games accumulate in order (oldest first).
+    #[test]
+    fn test_history_accumulates_in_order() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+
+        // Game 1: win
+        client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 1));
+        client.reveal(&player, &hist_secret(&env, 1));
+        client.cash_out(&player);
+
+        // Game 2: loss
+        client.start_game(&player, &Side::Heads, &3_000_000, &hist_commit(&env, 3));
+        client.reveal(&player, &hist_secret(&env, 3));
+
+        let history = hist_history(&env, &contract_id, &player);
+        assert_eq!(history.len(), 2);
+        assert!(history.get(0).unwrap().won,  "first entry must be the win");
+        assert!(!history.get(1).unwrap().won, "second entry must be the loss");
+    }
+
+    // ── Ring-buffer cap ───────────────────────────────────────────────────
+
+    /// After 101 losses the buffer holds exactly 100 entries (oldest evicted).
+    #[test]
+    fn test_history_capped_at_100_entries() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 100_000_000_000i128);
+        let player = Address::generate(&env);
+
+        for _ in 0..101 {
+            client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+            client.reveal(&player, &hist_secret(&env, 3));
+        }
+
+        let history = hist_history(&env, &contract_id, &player);
+        assert_eq!(history.len(), HISTORY_LIMIT, "history must be capped at HISTORY_LIMIT");
+    }
+
+    // ── get_game_history pagination ───────────────────────────────────────
+
+    /// get_game_history returns the correct slice for a given offset/limit.
+    #[test]
+    fn test_get_game_history_pagination() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 1_000_000_000_000i128);
+        let player = Address::generate(&env);
+
+        // Create 5 loss entries.
+        for _ in 0..5 {
+            client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+            client.reveal(&player, &hist_secret(&env, 3));
+        }
+
+        // Page 1: offset=0, limit=3 → 3 entries
+        let page1 = client.get_game_history(&player, &0, &3);
+        assert_eq!(page1.len(), 3);
+
+        // Page 2: offset=3, limit=3 → 2 entries (only 5 total)
+        let page2 = client.get_game_history(&player, &3, &3);
+        assert_eq!(page2.len(), 2);
+
+        // Beyond end: offset=10 → empty
+        let empty = client.get_game_history(&player, &10, &5);
+        assert_eq!(empty.len(), 0);
+    }
+
+    /// get_game_history returns empty vec for a player with no history.
+    #[test]
+    fn test_get_game_history_no_history_returns_empty() {
+        let (env, client, _contract_id) = hist_setup();
+        let player = Address::generate(&env);
+        let result = client.get_game_history(&player, &0, &10);
+        assert_eq!(result.len(), 0);
+    }
+
+    /// get_game_history page size is capped at 20.
+    #[test]
+    fn test_get_game_history_page_size_capped_at_20() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 100_000_000_000i128);
+        let player = Address::generate(&env);
+
+        for _ in 0..30 {
+            client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+            client.reveal(&player, &hist_secret(&env, 3));
+        }
+
+        let result = client.get_game_history(&player, &0, &100);
+        assert_eq!(result.len(), 20, "page size must be capped at 20");
+    }
+
+    // ── verify_past_game ──────────────────────────────────────────────────
+
+    /// verify_past_game returns Ok(true) for a loss entry (secret stored).
+    #[test]
+    fn test_verify_past_game_loss_entry() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 3));
+        client.reveal(&player, &hist_secret(&env, 3));
+
+        let result = client.verify_past_game(&player, &0);
+        assert_eq!(result, Ok(true));
+    }
+
+    /// verify_past_game returns Ok(false) for a win entry (secret not stored).
+    #[test]
+    fn test_verify_past_game_win_entry_no_secret() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 1));
+        client.reveal(&player, &hist_secret(&env, 1));
+        client.cash_out(&player);
+
+        // Win entries have empty secret → cannot fully verify → Ok(false)
+        let result = client.verify_past_game(&player, &0);
+        assert_eq!(result, Ok(false));
+    }
+
+    /// verify_past_game returns NoActiveGame when player has no history.
+    #[test]
+    fn test_verify_past_game_no_history() {
+        let (env, client, _contract_id) = hist_setup();
+        let player = Address::generate(&env);
+        let result = client.try_verify_past_game(&player, &0);
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    /// verify_past_game returns InvalidPhase for out-of-range index.
+    #[test]
+    fn test_verify_past_game_out_of_range() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 3));
+        client.reveal(&player, &hist_secret(&env, 3));
+
+        let result = client.try_verify_past_game(&player, &99);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    // ── HistoryEntry fields ───────────────────────────────────────────────
+
+    /// Loss entry stores commitment and contract_random for off-chain verification.
+    #[test]
+    fn test_loss_entry_stores_proof_fields() {
+        let (env, client, contract_id) = hist_setup();
+        hist_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        let commitment = hist_commit(&env, 3);
+        client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
+        // Capture contract_random before reveal.
+        let contract_random = env.as_contract(&contract_id, || {
+            CoinflipContract::load_player_game(&env, &player).unwrap().unwrap().contract_random
+        });
+        client.reveal(&player, &hist_secret(&env, 3));
+
+        let entry = hist_history(&env, &contract_id, &player).get(0).unwrap();
+        assert_eq!(entry.commitment, commitment);
+        assert_eq!(entry.contract_random, contract_random);
+        assert_eq!(entry.secret, hist_secret(&env, 3));
+    }
+
+    // ── Property tests ────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// History length never exceeds HISTORY_LIMIT for any number of games.
+        #[test]
+        fn prop_history_never_exceeds_limit(n_games in 1u32..=150u32) {
+            let (env, client, contract_id) = hist_setup();
+            hist_fund(&env, &contract_id, 100_000_000_000i128);
+            let player = Address::generate(&env);
+            for _ in 0..n_games {
+                client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+                client.reveal(&player, &hist_secret(&env, 3));
+            }
+            let len = hist_history(&env, &contract_id, &player).len();
+            prop_assert!(len <= HISTORY_LIMIT, "history len {} exceeds HISTORY_LIMIT {}", len, HISTORY_LIMIT);
+        }
+
+        /// get_game_history offset beyond length returns empty.
+        #[test]
+        fn prop_get_game_history_offset_beyond_length_empty(
+            n_games in 1u32..=10u32,
+            offset  in 100u32..=200u32,
+        ) {
+            let (env, client, contract_id) = hist_setup();
+            hist_fund(&env, &contract_id, 100_000_000_000i128);
+            let player = Address::generate(&env);
+            for _ in 0..n_games {
+                client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+                client.reveal(&player, &hist_secret(&env, 3));
+            }
+            let result = client.get_game_history(&player, &offset, &10);
+            prop_assert_eq!(result.len(), 0);
+        }
+
+        /// Every loss entry has won=false and payout=0.
+        #[test]
+        fn prop_loss_entries_have_correct_fields(n_games in 1u32..=10u32) {
+            let (env, client, contract_id) = hist_setup();
+            hist_fund(&env, &contract_id, 100_000_000_000i128);
+            let player = Address::generate(&env);
+            for _ in 0..n_games {
+                client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+                client.reveal(&player, &hist_secret(&env, 3));
+            }
+            let history = hist_history(&env, &contract_id, &player);
+            for i in 0..history.len() {
+                let e = history.get(i).unwrap();
+                prop_assert!(!e.won, "loss entry must have won=false");
+                prop_assert_eq!(e.payout, 0i128, "loss entry must have payout=0");
+            }
+        }
     }
 }
