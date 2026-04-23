@@ -93,7 +93,7 @@ fn multiplier_always_greater_than_1x() {
 /// net   = 18_430_000
 #[test]
 fn payout_streak_1_fee_300() {
-    assert_eq!(calculate_payout(10_000_000, 1, 300).unwrap(), Some(18_430_000));
+    assert_eq!(calculate_payout(10_000_000, 1, 300).unwrap(), 18_430_000);
 }
 
 /// Streak 2, fee 300 bps (3%).
@@ -102,7 +102,7 @@ fn payout_streak_1_fee_300() {
 /// net   = 33_950_000
 #[test]
 fn payout_streak_2_fee_300() {
-    assert_eq!(calculate_payout(10_000_000, 2, 300).unwrap(), Some(33_950_000));
+    assert_eq!(calculate_payout(10_000_000, 2, 300).unwrap(), 33_950_000);
 }
 
 /// Streak 3, fee 300 bps (3%).
@@ -111,7 +111,7 @@ fn payout_streak_2_fee_300() {
 /// net   = 58_200_000
 #[test]
 fn payout_streak_3_fee_300() {
-    assert_eq!(calculate_payout(10_000_000, 3, 300).unwrap(), Some(58_200_000));
+    assert_eq!(calculate_payout(10_000_000, 3, 300).unwrap(), 58_200_000);
 }
 
 /// Streak 4, fee 300 bps (3%).
@@ -120,7 +120,7 @@ fn payout_streak_3_fee_300() {
 /// net   = 97_000_000
 #[test]
 fn payout_streak_4_fee_300() {
-    assert_eq!(calculate_payout(10_000_000, 4, 300).unwrap(), Some(97_000_000));
+    assert_eq!(calculate_payout(10_000_000, 4, 300).unwrap(), 97_000_000);
 }
 
 /// Streak 5 must produce the same result as streak 4 (same multiplier cap).
@@ -142,7 +142,7 @@ fn payout_streak_5_equals_streak_4() {
 /// net   = 18_620_000
 #[test]
 fn payout_streak_1_fee_min_200() {
-    assert_eq!(calculate_payout(10_000_000, 1, 200).unwrap(), Some(18_620_000));
+    assert_eq!(calculate_payout(10_000_000, 1, 200).unwrap(), 18_620_000);
 }
 
 /// Maximum valid fee: 500 bps (5%).
@@ -151,7 +151,7 @@ fn payout_streak_1_fee_min_200() {
 /// net   = 18_050_000
 #[test]
 fn payout_streak_1_fee_max_500() {
-    assert_eq!(calculate_payout(10_000_000, 1, 500).unwrap(), Some(18_050_000));
+    assert_eq!(calculate_payout(10_000_000, 1, 500).unwrap(), 18_050_000);
 }
 
 /// Higher fee must always produce a lower net payout for the same wager and streak.
