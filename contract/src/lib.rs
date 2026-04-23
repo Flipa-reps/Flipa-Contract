@@ -365,6 +365,28 @@ pub struct HistoryEntry {
 /// Older entries are evicted in FIFO order once the cap is reached.
 pub const HISTORY_LIMIT: u32 = 100;
 
+/// Batch configuration update payload for [`CoinflipContract::update_config`].
+///
+/// Each field is optional; `None` means "leave unchanged".
+/// All provided values are validated before any field is written — if any
+/// validation fails the entire update is rolled back (no partial writes).
+///
+/// Settable fields:
+/// - `fee_bps`    – protocol fee in basis points (200–500)
+/// - `min_wager`  – inclusive lower wager bound in stroops
+/// - `max_wager`  – inclusive upper wager bound in stroops
+/// - `treasury`   – fee collection address
+/// - `paused`     – emergency pause flag
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ConfigUpdate {
+    pub fee_bps:   Option<u32>,
+    pub min_wager: Option<i128>,
+    pub max_wager: Option<i128>,
+    pub treasury:  Option<Address>,
+    pub paused:    Option<bool>,
+}
+
 /// Persistent storage key variants for the contract's data model.
 ///
 /// Used with `env.storage().persistent()` for all reads and writes.
@@ -1388,6 +1410,64 @@ impl CoinflipContract {
         }
 
         config.fee_bps = fee_bps;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
+
+    /// Atomically update multiple configuration parameters in a single call.
+    ///
+    /// All fields in `update` are validated before any change is written.
+    /// If any validation fails the entire update is rolled back — the stored
+    /// config remains byte-for-byte identical to its pre-call state.
+    ///
+    /// # Validation rules (applied to the merged result)
+    /// - `fee_bps`  must be in `[200, 500]`
+    /// - `min_wager` must be strictly less than `max_wager`
+    ///
+    /// # Arguments
+    /// - `admin`  – must authorize and match `config.admin`
+    /// - `update` – [`ConfigUpdate`] with the fields to change (`None` = keep current)
+    ///
+    /// # Errors
+    /// | Error                   | Condition                                  |
+    /// |-------------------------|--------------------------------------------|
+    /// | `Unauthorized`          | caller is not the configured admin         |
+    /// | `InvalidFeePercentage`  | merged `fee_bps` outside `[200, 500]`      |
+    /// | `InvalidWagerLimits`    | merged `min_wager >= max_wager`            |
+    pub fn update_config(
+        env: Env,
+        admin: Address,
+        update: ConfigUpdate,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Merge updates into a candidate config (no writes yet).
+        let candidate_fee     = update.fee_bps.unwrap_or(config.fee_bps);
+        let candidate_min     = update.min_wager.unwrap_or(config.min_wager);
+        let candidate_max     = update.max_wager.unwrap_or(config.max_wager);
+        let candidate_treasury = update.treasury.unwrap_or(config.treasury.clone());
+        let candidate_paused  = update.paused.unwrap_or(config.paused);
+
+        // Validate all fields before touching storage.
+        if candidate_fee < 200 || candidate_fee > 500 {
+            return Err(Error::InvalidFeePercentage);
+        }
+        if candidate_min >= candidate_max {
+            return Err(Error::InvalidWagerLimits);
+        }
+
+        // All valid — apply atomically.
+        config.fee_bps   = candidate_fee;
+        config.min_wager = candidate_min;
+        config.max_wager = candidate_max;
+        config.treasury  = candidate_treasury;
+        config.paused    = candidate_paused;
         Self::save_config(&env, &config);
 
         Ok(())
@@ -9441,6 +9521,259 @@ mod game_history_tests {
                 prop_assert!(!e.won, "loss entry must have won=false");
                 prop_assert_eq!(e.payout, 0i128, "loss entry must have payout=0");
             }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #448 — Batch admin configuration update tests
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod batch_admin_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn ba_setup() -> (Env, CoinflipContractClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let admin    = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token    = Address::generate(&env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        (env, client, contract_id, admin)
+    }
+
+    fn ba_config(env: &Env, contract_id: &Address) -> ContractConfig {
+        env.as_contract(contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        })
+    }
+
+    fn empty_update() -> ConfigUpdate {
+        ConfigUpdate { fee_bps: None, min_wager: None, max_wager: None, treasury: None, paused: None }
+    }
+
+    // ── Happy path ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_update_config_single_fee() {
+        let (env, client, contract_id, admin) = ba_setup();
+        client.update_config(&admin, &ConfigUpdate { fee_bps: Some(400), ..empty_update() });
+        assert_eq!(ba_config(&env, &contract_id).fee_bps, 400);
+    }
+
+    #[test]
+    fn test_update_config_single_wager_limits() {
+        let (env, client, contract_id, admin) = ba_setup();
+        client.update_config(&admin, &ConfigUpdate { min_wager: Some(2_000_000), max_wager: Some(200_000_000), ..empty_update() });
+        let cfg = ba_config(&env, &contract_id);
+        assert_eq!(cfg.min_wager, 2_000_000);
+        assert_eq!(cfg.max_wager, 200_000_000);
+    }
+
+    #[test]
+    fn test_update_config_treasury() {
+        let (env, client, contract_id, admin) = ba_setup();
+        let new_treasury = Address::generate(&env);
+        client.update_config(&admin, &ConfigUpdate { treasury: Some(new_treasury.clone()), ..empty_update() });
+        assert_eq!(ba_config(&env, &contract_id).treasury, new_treasury);
+    }
+
+    #[test]
+    fn test_update_config_paused() {
+        let (env, client, contract_id, admin) = ba_setup();
+        client.update_config(&admin, &ConfigUpdate { paused: Some(true), ..empty_update() });
+        assert!(ba_config(&env, &contract_id).paused);
+    }
+
+    #[test]
+    fn test_update_config_all_fields_atomically() {
+        let (env, client, contract_id, admin) = ba_setup();
+        let new_treasury = Address::generate(&env);
+        client.update_config(&admin, &ConfigUpdate {
+            fee_bps:   Some(500),
+            min_wager: Some(2_000_000),
+            max_wager: Some(50_000_000),
+            treasury:  Some(new_treasury.clone()),
+            paused:    Some(true),
+        });
+        let cfg = ba_config(&env, &contract_id);
+        assert_eq!(cfg.fee_bps,   500);
+        assert_eq!(cfg.min_wager, 2_000_000);
+        assert_eq!(cfg.max_wager, 50_000_000);
+        assert_eq!(cfg.treasury,  new_treasury);
+        assert!(cfg.paused);
+    }
+
+    #[test]
+    fn test_update_config_empty_is_noop() {
+        let (env, client, contract_id, admin) = ba_setup();
+        let before = ba_config(&env, &contract_id);
+        client.update_config(&admin, &empty_update());
+        assert_eq!(before, ba_config(&env, &contract_id));
+    }
+
+    // ── Rollback on validation failure ────────────────────────────────────
+
+    #[test]
+    fn test_update_config_rollback_on_invalid_fee() {
+        let (env, client, contract_id, admin) = ba_setup();
+        let before = ba_config(&env, &contract_id);
+        // fee invalid — entire update must be rolled back
+        let result = client.try_update_config(&admin, &ConfigUpdate {
+            fee_bps:   Some(999),
+            min_wager: Some(2_000_000),
+            max_wager: Some(50_000_000),
+            ..empty_update()
+        });
+        assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
+        assert_eq!(before, ba_config(&env, &contract_id));
+    }
+
+    #[test]
+    fn test_update_config_rollback_on_invalid_wager_limits() {
+        let (env, client, contract_id, admin) = ba_setup();
+        let before = ba_config(&env, &contract_id);
+        // min >= max — entire update must be rolled back
+        let result = client.try_update_config(&admin, &ConfigUpdate {
+            fee_bps:   Some(400),
+            min_wager: Some(50_000_000),
+            max_wager: Some(50_000_000),
+            ..empty_update()
+        });
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+        assert_eq!(before, ba_config(&env, &contract_id));
+    }
+
+    #[test]
+    fn test_update_config_rollback_min_greater_than_max() {
+        let (env, client, contract_id, admin) = ba_setup();
+        let before = ba_config(&env, &contract_id);
+        let result = client.try_update_config(&admin, &ConfigUpdate {
+            min_wager: Some(90_000_000),
+            max_wager: Some(10_000_000),
+            ..empty_update()
+        });
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+        assert_eq!(before, ba_config(&env, &contract_id));
+    }
+
+    // ── Validation uses merged values (not just the provided ones) ────────
+
+    #[test]
+    fn test_update_config_validates_merged_min_against_existing_max() {
+        let (env, client, contract_id, admin) = ba_setup();
+        // existing max = 100_000_000; setting min above it must fail
+        let result = client.try_update_config(&admin, &ConfigUpdate {
+            min_wager: Some(200_000_000),
+            ..empty_update()
+        });
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+    }
+
+    #[test]
+    fn test_update_config_validates_merged_max_against_existing_min() {
+        let (env, client, contract_id, admin) = ba_setup();
+        // existing min = 1_000_000; setting max below it must fail
+        let result = client.try_update_config(&admin, &ConfigUpdate {
+            max_wager: Some(500_000),
+            ..empty_update()
+        });
+        assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+    }
+
+    // ── Authorization ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_update_config_rejects_non_admin() {
+        let (env, client, _contract_id, _admin) = ba_setup();
+        let attacker = Address::generate(&env);
+        let result = client.try_update_config(&attacker, &ConfigUpdate { fee_bps: Some(400), ..empty_update() });
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_update_config_no_mutation_on_unauthorized() {
+        let (env, client, contract_id, _admin) = ba_setup();
+        let before = ba_config(&env, &contract_id);
+        let attacker = Address::generate(&env);
+        let _ = client.try_update_config(&attacker, &ConfigUpdate { fee_bps: Some(400), ..empty_update() });
+        assert_eq!(before, ba_config(&env, &contract_id));
+    }
+
+    // ── Property tests ────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Valid batch updates always succeed and are reflected in config.
+        #[test]
+        fn prop_valid_batch_update_applied(
+            fee_bps   in 200u32..=500u32,
+            min_wager in 1_000_000i128..=10_000_000i128,
+            max_wager in 10_000_001i128..=200_000_000i128,
+        ) {
+            let (env, client, contract_id, admin) = ba_setup();
+            let result = client.try_update_config(&admin, &ConfigUpdate {
+                fee_bps:   Some(fee_bps),
+                min_wager: Some(min_wager),
+                max_wager: Some(max_wager),
+                ..empty_update()
+            });
+            prop_assert!(result.is_ok());
+            let cfg = ba_config(&env, &contract_id);
+            prop_assert_eq!(cfg.fee_bps,   fee_bps);
+            prop_assert_eq!(cfg.min_wager, min_wager);
+            prop_assert_eq!(cfg.max_wager, max_wager);
+        }
+
+        /// Invalid fee always rolls back the entire update.
+        #[test]
+        fn prop_invalid_fee_rolls_back(
+            fee_bps in prop_oneof![0u32..200u32, 501u32..10_000u32],
+        ) {
+            let (env, client, contract_id, admin) = ba_setup();
+            let before = ba_config(&env, &contract_id);
+            let result = client.try_update_config(&admin, &ConfigUpdate {
+                fee_bps: Some(fee_bps),
+                ..empty_update()
+            });
+            prop_assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
+            prop_assert_eq!(before, ba_config(&env, &contract_id));
+        }
+
+        /// Invalid wager limits always roll back the entire update.
+        #[test]
+        fn prop_invalid_wager_limits_rolls_back(
+            wager in 1_000_000i128..=100_000_000i128,
+        ) {
+            let (env, client, contract_id, admin) = ba_setup();
+            let before = ba_config(&env, &contract_id);
+            // min == max → invalid
+            let result = client.try_update_config(&admin, &ConfigUpdate {
+                min_wager: Some(wager),
+                max_wager: Some(wager),
+                ..empty_update()
+            });
+            prop_assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
+            prop_assert_eq!(before, ba_config(&env, &contract_id));
+        }
+
+        /// Non-admin can never update config regardless of payload.
+        #[test]
+        fn prop_non_admin_always_rejected(fee_bps in 200u32..=500u32) {
+            let (env, client, contract_id, _admin) = ba_setup();
+            let before = ba_config(&env, &contract_id);
+            let attacker = Address::generate(&env);
+            let result = client.try_update_config(&attacker, &ConfigUpdate {
+                fee_bps: Some(fee_bps),
+                ..empty_update()
+            });
+            prop_assert_eq!(result, Err(Ok(Error::Unauthorized)));
+            prop_assert_eq!(before, ba_config(&env, &contract_id));
         }
     }
 }
