@@ -1397,6 +1397,18 @@ impl CoinflipContract {
 mod multiplier_tests;
 
 #[cfg(test)]
+mod wager_limit_tests;
+
+#[cfg(test)]
+mod phase_transition_tests;
+
+#[cfg(test)]
+mod streak_tests;
+
+#[cfg(test)]
+mod ttl_tests;
+
+#[cfg(test)]
 mod timeout_recovery_tests;
 
 #[cfg(test)]
