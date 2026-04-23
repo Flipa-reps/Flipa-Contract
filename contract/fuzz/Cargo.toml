@@ -1,0 +1,32 @@
+[package]
+name = "coinflip-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+soroban-sdk = "22.0.0"
+
+[[bin]]
+name = "fuzz_commit_reveal"
+path = "fuzz/fuzz_commit_reveal.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_commitment_collision"
+path = "fuzz/fuzz_commitment_collision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ledger_sequence"
+path = "fuzz/fuzz_ledger_sequence.rs"
+test = false
+doc = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
