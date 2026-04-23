@@ -206,6 +206,35 @@ pub enum Error {
     /// Returned by: `initialize`.
     /// Code: 51 — see [`error_codes::ALREADY_INITIALIZED`]
     AlreadyInitialized = 51,
+
+    /// Side bet amount is below the minimum or above the maximum wager.
+    /// Returned by: `place_side_bet`.
+    /// Code: 52
+    InvalidSideBetAmount = 52,
+
+    /// A side bet is already attached to the active game.
+    /// Returned by: `place_side_bet`.
+    /// Code: 53
+    SideBetAlreadyPlaced = 53,
+}
+
+/// Optional side bet a player may attach to an active game.
+///
+/// - `None`              – no side bet (default)
+/// - `ExactStreak(n)`    – bet that the streak will reach exactly `n` wins;
+///                         pays `10 × n × side_bet_amount` on success
+/// - `Sequence(n)`       – bet on winning `n` consecutive flips from the
+///                         current streak; pays `5 × n × side_bet_amount`
+///                         on success
+///
+/// Both types are settled at `cash_out` time.  A loss on the main game
+/// forfeits the side bet amount to reserves.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SideBet {
+    None,
+    ExactStreak(u32),
+    Sequence(u32),
 }
 
 /// The player's chosen side for a coinflip.
@@ -276,6 +305,10 @@ pub struct GameState {
     pub phase: GamePhase,
     /// Ledger sequence at game creation; used for timeout enforcement.
     pub start_ledger: u32,
+    /// Optional side bet attached to this game.
+    pub side_bet: SideBet,
+    /// Amount wagered on the side bet in stroops (0 when `side_bet == SideBet::None`).
+    pub side_bet_amount: i128,
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -480,6 +513,49 @@ pub fn calculate_payout_breakdown(wager: i128, streak: u32, fee_bps: u32) -> Opt
 /// - `fee_bps` – protocol fee in basis points (200–500)
 pub fn calculate_payout(wager: i128, streak: u32, fee_bps: u32) -> Option<i128> {
     calculate_payout_breakdown(wager, streak, fee_bps).map(|(_, _, net)| net)
+}
+
+/// Calculate the side bet payout for a given bet type and achieved streak.
+///
+/// Returns `Some(payout)` when the side bet condition is met, `Some(0)` when
+/// the condition is not met (side bet lost), or `None` on arithmetic overflow.
+///
+/// Payout formulas:
+/// - `ExactStreak(n)`: pays `10 × n × amount` when `streak == n`
+/// - `Sequence(n)`:    pays `5 × n × amount`  when `streak >= n`
+/// - `None`:           always `0`
+///
+/// Side bets carry no protocol fee — the full payout goes to the player.
+pub fn calculate_side_bet_payout(bet: &SideBet, streak: u32, amount: i128) -> Option<i128> {
+    match bet {
+        SideBet::None => Some(0),
+        SideBet::ExactStreak(n) => {
+            if streak == *n {
+                (10i128).checked_mul(*n as i128)?.checked_mul(amount)
+            } else {
+                Some(0)
+            }
+        }
+        SideBet::Sequence(n) => {
+            if streak >= *n {
+                (5i128).checked_mul(*n as i128)?.checked_mul(amount)
+            } else {
+                Some(0)
+            }
+        }
+    }
+}
+
+/// Worst-case side bet payout for reserve solvency checks.
+///
+/// Uses `ExactStreak(n)` formula (higher multiplier) as the upper bound.
+/// Returns `None` on overflow.
+pub fn max_side_bet_payout(bet: &SideBet, amount: i128) -> Option<i128> {
+    match bet {
+        SideBet::None => Some(0),
+        SideBet::ExactStreak(n) => (10i128).checked_mul(*n as i128)?.checked_mul(amount),
+        SideBet::Sequence(n)    => (5i128).checked_mul(*n as i128)?.checked_mul(amount),
+    }
 }
 
 /// Helper to verify a player's commitment hash.
@@ -829,6 +905,8 @@ impl CoinflipContract {
             fee_bps: config.fee_bps,
             phase: GamePhase::Committed,
             start_ledger: env.ledger().sequence(),
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
         };
 
         Self::save_player_game(&env, &player, &game);
@@ -917,13 +995,15 @@ impl CoinflipContract {
             Ok(true)
         } else {
             // Loss path — forfeiture:
-            // 1. Credit the wager back to contract reserves so the house keeps it.
+            // 1. Credit the wager + side bet amount to reserves (house keeps both).
             // 2. Record the game in the player's history before deleting state.
             // 3. Delete the player's game state to free storage and signal game-over.
             let mut stats = Self::load_stats(&env);
+            let forfeited = game.wager.checked_add(game.side_bet_amount)
+                .unwrap_or(game.wager);
             stats.reserve_balance = stats
                 .reserve_balance
-                .checked_add(game.wager)
+                .checked_add(forfeited)
                 .unwrap_or(stats.reserve_balance);
             Self::save_stats(&env, &stats);
 
@@ -1010,9 +1090,15 @@ impl CoinflipContract {
             calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
                 .ok_or(Error::InsufficientReserves)?;
 
-        // Check sufficient reserves
+        // Settle side bet
+        let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount)
+            .ok_or(Error::InsufficientReserves)?;
+
+        // Check sufficient reserves for main payout + side bet payout
+        let total_gross = gross_payout.checked_add(side_bet_payout)
+            .ok_or(Error::InsufficientReserves)?;
         let stats = Self::load_stats(&env);
-        if stats.reserve_balance < gross_payout {
+        if stats.reserve_balance < total_gross {
             return Err(Error::InsufficientReserves);
         }
 
@@ -1022,6 +1108,16 @@ impl CoinflipContract {
         let mut stats = stats;
         stats.reserve_balance = stats.reserve_balance.checked_sub(gross_payout)
             .ok_or(Error::InsufficientReserves)?;
+        // Settle side bet reserves: deduct payout or credit forfeited amount.
+        if side_bet_payout > 0 {
+            stats.reserve_balance = stats.reserve_balance
+                .checked_sub(side_bet_payout)
+                .ok_or(Error::InsufficientReserves)?;
+        } else if game.side_bet_amount > 0 {
+            stats.reserve_balance = stats.reserve_balance
+                .checked_add(game.side_bet_amount)
+                .unwrap_or(stats.reserve_balance);
+        }
         stats.total_fees = stats.total_fees.checked_add(fee_amount).unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
 
@@ -1029,8 +1125,11 @@ impl CoinflipContract {
         game.phase = GamePhase::Completed;
         Self::save_player_game(&env, &player, &game);
 
-        // Transfer net payout to player
-        token_client.transfer(&env.current_contract_address(), &player, &net_payout);
+        let total_net = net_payout.checked_add(side_bet_payout)
+            .ok_or(Error::InsufficientReserves)?;
+
+        // Transfer net payout (main + side bet) to player
+        token_client.transfer(&env.current_contract_address(), &player, &total_net);
 
         // Transfer fee to treasury
         token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
@@ -1085,14 +1184,33 @@ impl CoinflipContract {
             calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
                 .ok_or(Error::InsufficientReserves)?;
 
+        // Settle side bet: compute payout (0 if condition not met).
+        let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount)
+            .ok_or(Error::InsufficientReserves)?;
+
         let mut stats = Self::load_stats(&env);
+        // Deduct main payout from reserves.
         stats.reserve_balance = stats.reserve_balance
             .checked_sub(gross)
             .ok_or(Error::InsufficientReserves)?;
+        // Settle side bet: deduct payout or credit forfeited amount to reserves.
+        if side_bet_payout > 0 {
+            stats.reserve_balance = stats.reserve_balance
+                .checked_sub(side_bet_payout)
+                .ok_or(Error::InsufficientReserves)?;
+        } else if game.side_bet_amount > 0 {
+            // Side bet condition not met — house keeps the side bet amount.
+            stats.reserve_balance = stats.reserve_balance
+                .checked_add(game.side_bet_amount)
+                .unwrap_or(stats.reserve_balance);
+        }
         stats.total_fees = stats.total_fees
             .checked_add(fee)
             .unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
+
+        let total_payout = net_payout.checked_add(side_bet_payout)
+            .ok_or(Error::InsufficientReserves)?;
 
         // Record the settled game in history before deleting state.
         // We don't have the original secret here (it was consumed by reveal),
@@ -1106,14 +1224,14 @@ impl CoinflipContract {
             commitment: game.commitment,
             secret: Bytes::new(&env),
             contract_random: game.contract_random,
-            payout: net_payout,
+            payout: total_payout,
             ledger: game.start_ledger,
         });
 
         // Clear the player's game state completely after settlement
         Self::delete_player_game(&env, &player);
 
-        Ok(net_payout)
+        Ok(total_payout)
     }
 
     /// Continue to the next streak level after a confirmed win.
@@ -1472,6 +1590,73 @@ impl CoinflipContract {
         Ok(game.wager)
     }
 
+    /// Attach a side bet to the player's current `Committed` game.
+    ///
+    /// A side bet is an optional additional wager on a specific outcome
+    /// condition.  It must be placed after `start_game` and before `reveal`.
+    /// Only one side bet may be attached per game.
+    ///
+    /// # Side bet types
+    /// - `SideBet::ExactStreak(n)` – pays `10 × n × amount` if streak reaches exactly `n`
+    /// - `SideBet::Sequence(n)`    – pays `5 × n × amount` if streak reaches at least `n`
+    ///
+    /// # Reserve check
+    /// Reserves must cover the existing worst-case main payout **plus** the
+    /// worst-case side bet payout before the bet is accepted.
+    ///
+    /// # Errors
+    /// | Error                  | Condition                                          |
+    /// |------------------------|----------------------------------------------------|
+    /// | `NoActiveGame`         | No game in `Committed` phase for `player`          |
+    /// | `InvalidPhase`         | Game is not in `Committed` phase                   |
+    /// | `SideBetAlreadyPlaced` | A side bet is already attached to this game        |
+    /// | `InvalidSideBetAmount` | `amount` is outside `[min_wager, max_wager]`       |
+    /// | `InsufficientReserves` | Reserves cannot cover the additional payout        |
+    pub fn place_side_bet(
+        env: Env,
+        player: Address,
+        bet: SideBet,
+        amount: i128,
+    ) -> Result<(), Error> {
+        player.require_auth();
+
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        if game.phase != GamePhase::Committed {
+            return Err(Error::InvalidPhase);
+        }
+
+        if game.side_bet != SideBet::None {
+            return Err(Error::SideBetAlreadyPlaced);
+        }
+
+        let config = Self::load_config(&env);
+        if amount < config.min_wager || amount > config.max_wager {
+            return Err(Error::InvalidSideBetAmount);
+        }
+
+        // Reserve check: existing main payout + new side bet payout.
+        let stats = Self::load_stats(&env);
+        let main_worst = game.wager
+            .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        let side_worst = max_side_bet_payout(&bet, amount)
+            .ok_or(Error::InsufficientReserves)?;
+        let total_worst = main_worst.checked_add(side_worst)
+            .ok_or(Error::InsufficientReserves)?;
+        if stats.reserve_balance < total_worst {
+            return Err(Error::InsufficientReserves);
+        }
+
+        game.side_bet = bet;
+        game.side_bet_amount = amount;
+        Self::save_player_game(&env, &player, &game);
+
+        Ok(())
+    }
+
     /// Return the current contract configuration.
     ///
     /// Read-only; does not require authorization.
@@ -1632,6 +1817,9 @@ mod pause_tests;
 
 #[cfg(test)]
 mod statistics_tests;
+
+#[cfg(test)]
+mod side_bet_tests;
 
 #[cfg(test)]
 mod admin_security_tests;
@@ -1933,6 +2121,8 @@ mod tests {
                     fee_bps,
                     phase: GamePhase::Revealed,
                     start_ledger: 0,
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
                 };
                 CoinflipContract::save_player_game(env, &player, &game);
             });
@@ -2135,6 +2325,8 @@ mod tests {
             fee_bps: 300,
             phase,
             start_ledger: 0,
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -2844,6 +3036,8 @@ mod tests {
                 fee_bps: 300,
                 phase: GamePhase::Revealed,
                 start_ledger: 0,
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
             };
             CoinflipContract::save_player_game(&env, &player, &game);
         });
@@ -4419,6 +4613,8 @@ mod property_tests {
             fee_bps: 300,
             phase,
             start_ledger: 0,
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -5378,6 +5574,8 @@ mod cumulative_fee_tests {
             fee_bps,
             phase: GamePhase::Revealed,
             start_ledger: 0,
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -7275,6 +7473,8 @@ mod integration_tests {
                 fee_bps: DEFAULT_FEE_BPS,
                 phase,
                 start_ledger: 0,
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
             };
             self.env.as_contract(&self.contract_id, || {
                 CoinflipContract::save_player_game(&self.env, player, &game);
@@ -7853,6 +8053,8 @@ mod cash_out_availability_tests {
             fee_bps: 300,
             phase,
             start_ledger: 0,
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -8360,6 +8562,8 @@ mod state_transition_tests {
             contract_random: st_commit(env, 2),
             fee_bps: 300, phase,
             start_ledger: env.ledger().sequence(),
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -8635,6 +8839,8 @@ mod security_penetration_tests {
             contract_random: sec_commit(&env, 2),
             fee_bps: 300, phase: GamePhase::Revealed,
             start_ledger: env.ledger().sequence(),
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
         };
         env.as_contract(&contract_id, || {
             CoinflipContract::save_player_game(&env, &player, &game);
@@ -8695,6 +8901,8 @@ mod security_penetration_tests {
                 contract_random: sec_commit(&env, 2),
                 fee_bps: 300, phase: GamePhase::Revealed,
                 start_ledger: env.ledger().sequence(),
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
             };
             env.as_contract(&contract_id, || {
                 CoinflipContract::save_player_game(&env, &player, &game);
@@ -8755,6 +8963,8 @@ mod security_penetration_tests {
                 contract_random: sec_commit(&env, 2),
                 fee_bps: 300, phase: GamePhase::Committed,
                 start_ledger: env.ledger().sequence(),
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
             };
             env.as_contract(&contract_id, || {
                 CoinflipContract::save_player_game(&env, &victim, &game);
@@ -8786,6 +8996,8 @@ mod security_penetration_tests {
                 contract_random: sec_commit(&env, 2),
                 fee_bps: 300, phase: GamePhase::Committed,
                 start_ledger: env.ledger().sequence(),
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
             };
             env.as_contract(&contract_id, || {
                 CoinflipContract::save_player_game(&env, &player, &game);
@@ -8811,6 +9023,8 @@ mod security_penetration_tests {
                 contract_random: sec_commit(&env, 2),
                 fee_bps: 300, phase: GamePhase::Revealed,
                 start_ledger: env.ledger().sequence(),
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
             };
             env.as_contract(&contract_id, || {
                 CoinflipContract::save_player_game(&env, &player, &game);
@@ -8926,6 +9140,8 @@ mod stress_tests {
             contract_random: str_commit(env, 2),
             fee_bps: 300, phase,
             start_ledger: env.ledger().sequence(),
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
