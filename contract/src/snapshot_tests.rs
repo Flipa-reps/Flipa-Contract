@@ -38,6 +38,7 @@ fn contract_config_default() {
         min_wager: 1_000_000,
         max_wager: 100_000_000,
         paused: false,
+        shutdown_mode: false,
     };
 
     assert_snapshot!(borsh_to_hex(&env, &config), @r###"
@@ -66,6 +67,7 @@ fn contract_config_edge_cases() {
         min_wager: 1_000_000,
         max_wager: i128::MAX / 10, // near max
         paused: true,
+        shutdown_mode: false,
     };
 
     assert_snapshot!(borsh_to_hex(&env, &config_paused));
@@ -86,6 +88,7 @@ fn contract_config_roundtrip() {
         min_wager: 1_000_000,
         max_wager: 100_000_000,
         paused: false,
+        shutdown_mode: false,
     };
 
     // Serialize → deserialize → reserialize → must match original bytes
