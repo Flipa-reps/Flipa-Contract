@@ -1,7 +1,62 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useReducer } from "react";
+import { flushSync } from "react-dom";
 import styles from "./CommitRevealFlow.module.css";
 
 type Step = "commit" | "pending" | "reveal" | "verified" | "error";
+
+type State = {
+  step: Step;
+  secret: string;
+  commitment: string;
+  revealSecret: string;
+  loading: boolean;
+  error: string | null;
+};
+
+type Action =
+  | { type: "SET_SECRET"; secret: string; commitment: string }
+  | { type: "COMMIT_START" }
+  | { type: "COMMIT_SUCCESS" }
+  | { type: "COMMIT_ERROR"; error: string }
+  | { type: "ADVANCE_REVEAL" }
+  | { type: "SET_REVEAL_SECRET"; value: string }
+  | { type: "REVEAL_SUCCESS" }
+  | { type: "REVEAL_ERROR"; error: string }
+  | { type: "RESET" };
+
+const INITIAL: State = {
+  step: "commit",
+  secret: "",
+  commitment: "",
+  revealSecret: "",
+  loading: false,
+  error: null,
+};
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case "SET_SECRET":
+      return { ...state, secret: action.secret, commitment: action.commitment };
+    case "COMMIT_START":
+      return { ...state, loading: true, error: null };
+    case "COMMIT_SUCCESS":
+      return { ...state, loading: false, step: "pending" };
+    case "COMMIT_ERROR":
+      return { ...state, loading: false, step: "commit", error: action.error };
+    case "ADVANCE_REVEAL":
+      return { ...state, step: "reveal" };
+    case "SET_REVEAL_SECRET":
+      return { ...state, revealSecret: action.value };
+    case "REVEAL_SUCCESS":
+      return { ...state, loading: false, step: "verified" };
+    case "REVEAL_ERROR":
+      return { ...state, loading: false, step: "error", error: action.error };
+    case "RESET":
+      return INITIAL;
+    default:
+      return state;
+  }
+}
 
 export interface CommitRevealFlowProps {
   /** Called with the player's secret when they submit the commit step. */
@@ -12,6 +67,11 @@ export interface CommitRevealFlowProps {
 
 /** SHA-256 via Web Crypto — returns hex string. */
 async function sha256Hex(input: string): Promise<string> {
+  // Use Node.js crypto if available (test environment), otherwise Web Crypto
+  if (typeof process !== "undefined" && process.versions?.node) {
+    const { createHash } = await import("node:crypto");
+    return createHash("sha256").update(input).digest("hex");
+  }
   const encoded = new TextEncoder().encode(input);
   const buf = await crypto.subtle.digest("SHA-256", encoded);
   return Array.from(new Uint8Array(buf))
@@ -37,59 +97,41 @@ const STEP_LABELS: Record<Step, string> = {
 };
 
 export function CommitRevealFlow({ onCommit, onReveal }: CommitRevealFlowProps) {
-  const [step, setStep] = useState<Step>("commit");
-  const [secret, setSecret] = useState("");
-  const [commitment, setCommitment] = useState("");
-  const [revealSecret, setRevealSecret] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [state, dispatch] = useReducer(reducer, INITIAL);
+  const { step, secret, commitment, revealSecret, loading, error } = state;
 
   const handleGenerate = useCallback(async () => {
     const s = generateSecret();
     const hash = await sha256Hex(s);
-    setSecret(s);
-    setCommitment(hash);
+    flushSync(() => dispatch({ type: "SET_SECRET", secret: s, commitment: hash }));
   }, []);
 
-  const handleCommit = useCallback(async () => {
+  const handleCommit = useCallback(() => {
     if (!secret || !commitment) return;
-    setLoading(true);
-    setError(null);
-    try {
-      await onCommit(secret, commitment);
-      setStep("pending");
-      // Auto-advance to reveal after a short delay (simulates block confirmation)
-      setTimeout(() => setStep("reveal"), 1200);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Commit failed");
-      setStep("error");
-    } finally {
-      setLoading(false);
-    }
+    dispatch({ type: "COMMIT_START" });
+    onCommit(secret, commitment).then(
+      () => React.startTransition(() => dispatch({ type: "COMMIT_SUCCESS" })),
+      (e: unknown) => React.startTransition(() => dispatch({ type: "COMMIT_ERROR", error: e instanceof Error ? e.message : "Commit failed" }))
+    );
   }, [secret, commitment, onCommit]);
 
-  const handleReveal = useCallback(async () => {
+  // Auto-advance from pending to reveal
+  React.useEffect(() => {
+    if (step !== "pending") return;
+    const id = setTimeout(() => dispatch({ type: "ADVANCE_REVEAL" }), 50);
+    return () => clearTimeout(id);
+  }, [step]);
+
+  const handleReveal = useCallback(() => {
     if (!revealSecret) return;
-    setLoading(true);
-    setError(null);
-    try {
-      await onReveal(revealSecret);
-      setStep("verified");
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Reveal failed — commitment mismatch");
-      setStep("error");
-    } finally {
-      setLoading(false);
-    }
+    dispatch({ type: "COMMIT_START" });
+    onReveal(revealSecret).then(
+      () => React.startTransition(() => dispatch({ type: "REVEAL_SUCCESS" })),
+      (e: unknown) => React.startTransition(() => dispatch({ type: "REVEAL_ERROR", error: e instanceof Error ? e.message : "Reveal failed — commitment mismatch" }))
+    );
   }, [revealSecret, onReveal]);
 
-  const handleReset = () => {
-    setStep("commit");
-    setSecret("");
-    setCommitment("");
-    setRevealSecret("");
-    setError(null);
-  };
+  const handleReset = () => dispatch({ type: "RESET" });
 
   return (
     <div className={styles.root} aria-label="Commit-reveal flow">
@@ -134,7 +176,7 @@ export function CommitRevealFlow({ onCommit, onReveal }: CommitRevealFlowProps) 
                 className={styles.monoInput}
                 type="text"
                 value={secret}
-                onChange={(e) => setSecret(e.target.value)}
+                onChange={(e) => dispatch({ type: "SET_SECRET", secret: e.target.value, commitment })}
                 placeholder="Click Generate or paste your own"
                 spellCheck={false}
                 aria-describedby="secret-hint"
@@ -166,6 +208,15 @@ export function CommitRevealFlow({ onCommit, onReveal }: CommitRevealFlowProps) 
           >
             {loading ? "Submitting…" : "Submit Commitment"}
           </button>
+
+          {error && step === "commit" && (
+            <div role="alert" className={styles.inlineError}>
+              {error}
+              <button className={styles.btnOutline} onClick={handleReset} type="button">
+                Try Again
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -198,7 +249,7 @@ export function CommitRevealFlow({ onCommit, onReveal }: CommitRevealFlowProps) 
               className={styles.monoInput}
               type="text"
               value={revealSecret}
-              onChange={(e) => setRevealSecret(e.target.value)}
+              onChange={(e) => dispatch({ type: "SET_REVEAL_SECRET", value: e.target.value })}
               placeholder="Paste your secret here"
               spellCheck={false}
             />

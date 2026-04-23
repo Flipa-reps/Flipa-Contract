@@ -373,3 +373,319 @@ proptest! {
         prop_assert!(result.is_ok(), "start_game must succeed after unpause (wager={})", wager);
     }
 }
+
+
+// ── Pause security validation (Issue #411) ────────────────────────────────────
+
+/// Test unauthorized pause attempts are rejected.
+#[test]
+fn test_unauthorized_pause_attempt_rejected() {
+    let (env, client, _contract_id, _admin) = setup();
+    let unauthorized = Address::generate(&env);
+    let result = client.try_set_paused(&unauthorized, &true);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)),
+        "unauthorized caller should not be able to pause");
+}
+
+/// Test unauthorized unpause attempts are rejected.
+#[test]
+fn test_unauthorized_unpause_attempt_rejected() {
+    let (env, client, contract_id, admin) = setup();
+    client.set_paused(&admin, &true);
+    
+    let unauthorized = Address::generate(&env);
+    let result = client.try_set_paused(&unauthorized, &false);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)),
+        "unauthorized caller should not be able to unpause");
+    
+    // Verify pause state unchanged
+    assert!(is_paused(&env, &contract_id));
+}
+
+/// Test that multiple unauthorized attempts don't affect pause state.
+#[test]
+fn test_multiple_unauthorized_attempts_dont_mutate_state() {
+    let (env, client, contract_id, admin) = setup();
+    let initial_paused = is_paused(&env, &contract_id);
+    
+    for _ in 0..5 {
+        let unauthorized = Address::generate(&env);
+        let _ = client.try_set_paused(&unauthorized, &true);
+        let _ = client.try_set_paused(&unauthorized, &false);
+    }
+    
+    let final_paused = is_paused(&env, &contract_id);
+    assert_eq!(initial_paused, final_paused,
+        "unauthorized attempts should not change pause state");
+}
+
+/// Test start_game rejection when paused with various wagers.
+#[test]
+fn test_start_game_rejection_various_wagers_when_paused() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 10_000_000_000);
+    client.set_paused(&admin, &true);
+    
+    for wager in [1_000_000, 10_000_000, 50_000_000, 100_000_000] {
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &Side::Heads,
+            &wager,
+            &make_commitment(&env, 1),
+        );
+        assert_eq!(result, Err(Ok(Error::ContractPaused)),
+            "start_game should be rejected for wager {wager} when paused");
+    }
+}
+
+/// Test start_game rejection when paused with both sides.
+#[test]
+fn test_start_game_rejection_both_sides_when_paused() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 10_000_000_000);
+    client.set_paused(&admin, &true);
+    
+    for side in [Side::Heads, Side::Tails] {
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player,
+            &side,
+            &10_000_000,
+            &make_commitment(&env, 1),
+        );
+        assert_eq!(result, Err(Ok(Error::ContractPaused)),
+            "start_game should be rejected for side {side:?} when paused");
+    }
+}
+
+/// Test reveal succeeds when paused (existing game can continue).
+#[test]
+fn test_reveal_succeeds_when_paused_existing_game() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    
+    let player = Address::generate(&env);
+    let secret = make_secret(&env, 1);
+    let commitment = make_commitment(&env, 1);
+    
+    client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
+    client.set_paused(&admin, &true);
+    
+    let result = client.try_reveal(&player, &secret);
+    assert!(result.is_ok(), "reveal should succeed when paused");
+    
+    let game = env.as_contract(&contract_id, || {
+        CoinflipContract::load_player_game(&env, &player).unwrap()
+    });
+    assert_eq!(game.phase, GamePhase::Revealed);
+}
+
+/// Test cash_out succeeds when paused (existing game can settle).
+#[test]
+fn test_cash_out_succeeds_when_paused_existing_game() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    
+    let player = Address::generate(&env);
+    inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, 5_000_000);
+    
+    client.set_paused(&admin, &true);
+    
+    let result = client.try_cash_out(&player);
+    assert!(result.is_ok(), "cash_out should succeed when paused");
+    
+    let payout = result.unwrap();
+    assert!(payout > 0, "payout should be positive");
+}
+
+/// Test continue_streak succeeds when paused (existing game can continue).
+#[test]
+fn test_continue_streak_succeeds_when_paused_existing_game() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    
+    let player = Address::generate(&env);
+    inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 5_000_000);
+    
+    client.set_paused(&admin, &true);
+    
+    let result = client.try_continue_streak(&player, &make_commitment(&env, 42));
+    assert!(result.is_ok(), "continue_streak should succeed when paused");
+    
+    let game = env.as_contract(&contract_id, || {
+        CoinflipContract::load_player_game(&env, &player).unwrap()
+    });
+    assert_eq!(game.phase, GamePhase::Committed);
+    assert_eq!(game.streak, 1);
+}
+
+/// Test pause state persistence across multiple operations.
+#[test]
+fn test_pause_state_persistence_across_operations() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    
+    // Pause
+    client.set_paused(&admin, &true);
+    assert!(is_paused(&env, &contract_id));
+    
+    // Try to start game (should fail)
+    let player1 = Address::generate(&env);
+    let result1 = client.try_start_game(
+        &player1,
+        &Side::Heads,
+        &5_000_000,
+        &make_commitment(&env, 1),
+    );
+    assert_eq!(result1, Err(Ok(Error::ContractPaused)));
+    
+    // Pause state should still be true
+    assert!(is_paused(&env, &contract_id));
+    
+    // Try another start_game (should also fail)
+    let player2 = Address::generate(&env);
+    let result2 = client.try_start_game(
+        &player2,
+        &Side::Heads,
+        &5_000_000,
+        &make_commitment(&env, 2),
+    );
+    assert_eq!(result2, Err(Ok(Error::ContractPaused)));
+    
+    // Pause state should still be true
+    assert!(is_paused(&env, &contract_id));
+}
+
+/// Test pause state recovery after unpause.
+#[test]
+fn test_pause_state_recovery_after_unpause() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    
+    // Pause
+    client.set_paused(&admin, &true);
+    assert!(is_paused(&env, &contract_id));
+    
+    // Unpause
+    client.set_paused(&admin, &false);
+    assert!(!is_paused(&env, &contract_id));
+    
+    // start_game should now succeed
+    let player = Address::generate(&env);
+    let result = client.try_start_game(
+        &player,
+        &Side::Heads,
+        &5_000_000,
+        &make_commitment(&env, 1),
+    );
+    assert!(result.is_ok(), "start_game should succeed after unpause");
+}
+
+/// Test pause state consistency with config storage.
+#[test]
+fn test_pause_state_consistency_with_config() {
+    let (env, client, contract_id, admin) = setup();
+    
+    // Get initial config
+    let config_before: ContractConfig = env.as_contract(&contract_id, || {
+        env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
+    });
+    assert!(!config_before.paused);
+    
+    // Pause
+    client.set_paused(&admin, &true);
+    
+    // Get config after pause
+    let config_after: ContractConfig = env.as_contract(&contract_id, || {
+        env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
+    });
+    assert!(config_after.paused);
+    
+    // Verify other fields unchanged
+    assert_eq!(config_before.admin, config_after.admin);
+    assert_eq!(config_before.treasury, config_after.treasury);
+    assert_eq!(config_before.token, config_after.token);
+    assert_eq!(config_before.fee_bps, config_after.fee_bps);
+    assert_eq!(config_before.min_wager, config_after.min_wager);
+    assert_eq!(config_before.max_wager, config_after.max_wager);
+}
+
+/// Test that pause doesn't affect existing game state.
+#[test]
+fn test_pause_doesnt_affect_existing_game_state() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    
+    let player = Address::generate(&env);
+    inject_game(&env, &contract_id, &player, GamePhase::Revealed, 2, 5_000_000);
+    
+    let game_before = env.as_contract(&contract_id, || {
+        CoinflipContract::load_player_game(&env, &player).unwrap()
+    });
+    
+    client.set_paused(&admin, &true);
+    
+    let game_after = env.as_contract(&contract_id, || {
+        CoinflipContract::load_player_game(&env, &player).unwrap()
+    });
+    
+    assert_eq!(game_before, game_after,
+        "pause should not affect existing game state");
+}
+
+/// Test full game lifecycle with pause/unpause cycles.
+#[test]
+fn test_full_game_lifecycle_with_pause_unpause_cycles() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    
+    let player = Address::generate(&env);
+    let secret = make_secret(&env, 1);
+    let commitment = make_commitment(&env, 1);
+    
+    // Start game
+    client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
+    
+    // Pause
+    client.set_paused(&admin, &true);
+    
+    // Reveal while paused
+    let won = client.reveal(&player, &secret);
+    assert!(won);
+    
+    // Unpause
+    client.set_paused(&admin, &false);
+    
+    // Cash out after unpause
+    let payout = client.cash_out(&player);
+    assert!(payout > 0);
+    
+    // Verify game is completed
+    let game = env.as_contract(&contract_id, || {
+        CoinflipContract::load_player_game(&env, &player)
+    });
+    assert!(game.is_none(), "game should be deleted after cash_out");
+}
+
+/// Test authorization enforcement is independent of pause state.
+#[test]
+fn test_authorization_enforcement_independent_of_pause() {
+    let (env, client, _contract_id, admin) = setup();
+    let unauthorized = Address::generate(&env);
+    
+    // Try to pause as unauthorized (should fail)
+    let result1 = client.try_set_paused(&unauthorized, &true);
+    assert_eq!(result1, Err(Ok(Error::Unauthorized)));
+    
+    // Pause as admin
+    client.set_paused(&admin, &true);
+    
+    // Try to unpause as unauthorized (should still fail)
+    let result2 = client.try_set_paused(&unauthorized, &false);
+    assert_eq!(result2, Err(Ok(Error::Unauthorized)));
+    
+    // Unpause as admin (should succeed)
+    let result3 = client.try_set_paused(&admin, &false);
+    assert!(result3.is_ok());
+}

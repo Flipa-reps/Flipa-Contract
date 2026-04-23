@@ -135,6 +135,22 @@ mod integration_tests {
             
             player_balance + treasury_balance + reserve_balance
         }
+
+        /// Fund a specific player with tokens
+        pub fn fund_player(&self, player: &Address, amount: i128) {
+            let contract_id = self.env.current_contract_address();
+            let token_id: Address = self.env.as_contract(&contract_id, || {
+                CoinflipContract::load_config(&self.env).token.clone()
+            });
+            let token_client = soroban_sdk::token::StellarAssetClient::new(&self.env, &token_id);
+            let admin = Address::generate(&self.env);
+            token_client.mint(&admin, player, &amount);
+        }
+
+        /// Try to start a game (returns Result for error testing)
+        pub fn try_start_game(&self, player: &Address, commitment: &BytesN<32>, side: &Side, wager: &i128) -> Result<(), soroban_sdk::Error> {
+            self.client.try_start_game(player, commitment, side, wager)
+        }
     }
 
     #[test]
@@ -343,6 +359,158 @@ mod integration_tests {
             // Final verification after all rounds
             prop_assert_eq!(h.total_funds(&player), initial_total,
                 "Funds mismatch after {} complete rounds", num_rounds);
+        }
+    }
+
+    /// Concurrent player integration tests
+    #[test]
+    fn test_concurrent_10_players_simultaneous_games() {
+        let h = Harness::new();
+        let players: Vec<_> = (0..10).map(|_| h.player()).collect();
+        
+        // Fund all players
+        for player in &players {
+            h.fund_player(player, 1_000_000_000);
+        }
+        
+        // All players start games simultaneously
+        for player in &players {
+            let commitment = h.make_commitment(1);
+            h.client.start_game(player, &commitment, &Side::Heads, &10_000_000);
+        }
+        
+        // Verify all games are in Committed phase
+        for player in &players {
+            let game = h.game_state(player);
+            assert_eq!(game.phase, GamePhase::Committed);
+        }
+        
+        // All players reveal simultaneously
+        for player in &players {
+            let secret = h.make_secret(1);
+            h.client.reveal(player, &secret);
+        }
+        
+        // Verify all games are in Revealed phase
+        for player in &players {
+            let game = h.game_state(player);
+            assert_eq!(game.phase, GamePhase::Revealed);
+        }
+    }
+
+    /// Test reserve depletion with concurrent games
+    #[test]
+    fn test_concurrent_reserve_depletion_50_players() {
+        let h = Harness::new();
+        let players: Vec<_> = (0..50).map(|_| h.player()).collect();
+        
+        // Fund all players
+        for player in &players {
+            h.fund_player(player, 100_000_000);
+        }
+        
+        // All players start games with large wagers
+        for (i, player) in players.iter().enumerate() {
+            let commitment = h.make_commitment((i % 256) as u8);
+            h.client.start_game(player, &commitment, &Side::Heads, &50_000_000);
+        }
+        
+        // Verify reserve balance is consistent
+        let stats = h.stats();
+        let expected_reserve = 50_000_000 * 50; // All wagers locked
+        assert!(stats.reserve >= expected_reserve);
+    }
+
+    /// Test pause/unpause with active concurrent games
+    #[test]
+    fn test_pause_unpause_with_active_games() {
+        let h = Harness::new();
+        let admin = Address::generate(&h.env);
+        let players: Vec<_> = (0..20).map(|_| h.player()).collect();
+        
+        // Fund and start games
+        for player in &players {
+            h.fund_player(player, 100_000_000);
+            let commitment = h.make_commitment(1);
+            h.client.start_game(player, &commitment, &Side::Heads, &10_000_000);
+        }
+        
+        // Pause contract
+        h.client.set_paused(&admin, &true);
+        
+        // Verify new games cannot start
+        let new_player = h.player();
+        h.fund_player(&new_player, 100_000_000);
+        let commitment = h.make_commitment(1);
+        let result = h.client.try_start_game(&new_player, &commitment, &Side::Heads, &10_000_000);
+        assert!(result.is_err());
+        
+        // Unpause contract
+        h.client.set_paused(&admin, &false);
+        
+        // Verify new games can start again
+        let result = h.client.try_start_game(&new_player, &commitment, &Side::Heads, &10_000_000);
+        assert!(result.is_ok());
+    }
+
+    /// Test state consistency across 100 concurrent operations
+    #[test]
+    fn test_state_consistency_100_concurrent_ops() {
+        let h = Harness::new();
+        let players: Vec<_> = (0..100).map(|_| h.player()).collect();
+        
+        // Fund all players
+        for player in &players {
+            h.fund_player(player, 100_000_000);
+        }
+        
+        // Start games for all players
+        for (i, player) in players.iter().enumerate() {
+            let commitment = h.make_commitment((i % 256) as u8);
+            h.client.start_game(player, &commitment, &Side::Heads, &5_000_000);
+        }
+        
+        // Reveal for all players
+        for (i, player) in players.iter().enumerate() {
+            let secret = h.make_secret((i % 256) as u8);
+            h.client.reveal(player, &secret);
+        }
+        
+        // Verify all games are in Revealed phase
+        for player in &players {
+            let game = h.game_state(player);
+            assert_eq!(game.phase, GamePhase::Revealed);
+        }
+        
+        // Verify reserve balance is consistent
+        let stats = h.stats();
+        assert!(stats.reserve >= 0);
+    }
+
+    /// Test concurrent cash_out operations
+    #[test]
+    fn test_concurrent_cash_out_operations() {
+        let h = Harness::new();
+        let players: Vec<_> = (0..30).map(|_| h.player()).collect();
+        
+        // Fund, start, and reveal for all players
+        for (i, player) in players.iter().enumerate() {
+            h.fund_player(player, 100_000_000);
+            let commitment = h.make_commitment((i % 256) as u8);
+            h.client.start_game(player, &commitment, &Side::Heads, &10_000_000);
+            let secret = h.make_secret((i % 256) as u8);
+            h.client.reveal(player, &secret);
+        }
+        
+        // All players cash out simultaneously
+        for player in &players {
+            h.client.cash_out(player);
+        }
+        
+        // Verify all games are in Completed phase
+        for player in &players {
+            let game = h.game_state(player);
+            assert_eq!(game.phase, GamePhase::Completed);
         }
     }
 }

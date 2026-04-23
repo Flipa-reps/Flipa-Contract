@@ -1394,16 +1394,31 @@ impl CoinflipContract {
 }
 
 #[cfg(test)]
+mod arithmetic_tests;
+
+#[cfg(test)]
+mod error_tests;
+
+#[cfg(test)]
+mod gas_tests;
+
+#[cfg(test)]
 mod multiplier_tests;
 
 #[cfg(test)]
 mod timeout_recovery_tests;
 
 #[cfg(test)]
+mod timeout_attack_tests;
+
+#[cfg(test)]
 mod pause_tests;
 
 #[cfg(test)]
 mod statistics_tests;
+
+#[cfg(test)]
+mod admin_security_tests;
 
 #[cfg(test)]
 mod tests {
