@@ -450,3 +450,165 @@ proptest! {
         }
     }
 }
+
+// ── Concurrent statistics update tests ─────────────────────────────────────────
+
+#[test]
+fn test_concurrent_games_accumulate_statistics() {
+    let (env, client, contract_id) = setup();
+    fund(&env, &contract_id, 1_000_000_000_000);
+    
+    // Start multiple games concurrently
+    let mut players = Vec::new();
+    let mut wagers = Vec::new();
+    for i in 0u8..10 {
+        let player = Address::generate(&env);
+        let wager = 1_000_000i128 * (i as i128 + 1);
+        wagers.push(wager);
+        client.start_game(&player, &Side::Heads, &wager, &make_commitment(&env, i + 1));
+        players.push(player);
+    }
+    
+    // Verify total_games incremented correctly
+    assert_eq!(load_stats(&env, &contract_id).total_games, 10);
+    
+    // Verify total_volume is sum of all wagers
+    let expected_volume: i128 = wagers.iter().sum();
+    assert_eq!(load_stats(&env, &contract_id).total_volume, expected_volume);
+}
+
+#[test]
+fn test_concurrent_settlements_accumulate_fees() {
+    let (env, client, contract_id) = setup();
+    fund(&env, &contract_id, 1_000_000_000_000);
+    
+    // Create multiple games in Revealed phase
+    let mut expected_fees = 0i128;
+    for i in 0u32..5 {
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+        let streak = (i % 4) + 1;
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+        let (_gross, fee, _net) = calculate_payout_breakdown(wager, streak, 300).unwrap();
+        expected_fees += fee;
+    }
+    
+    // Cash out all games
+    for i in 0u32..5 {
+        let player = Address::generate(&env);
+        let wager = 10_000_000i128;
+        let streak = (i % 4) + 1;
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
+        client.cash_out(&player);
+    }
+    
+    // Verify total_fees accumulated correctly
+    assert_eq!(load_stats(&env, &contract_id).total_fees, expected_fees);
+}
+
+#[test]
+fn test_concurrent_wins_and_losses_update_reserve() {
+    let (env, client, contract_id) = setup();
+    let initial_reserve = 1_000_000_000i128;
+    fund(&env, &contract_id, initial_reserve);
+    
+    let mut net_change = 0i128;
+    
+    // Create 3 winning games
+    for i in 0u8..3 {
+        let player = Address::generate(&env);
+        let wager = 5_000_000i128;
+        inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, wager);
+        let (gross, _fee, _net) = calculate_payout_breakdown(wager, 1, 300).unwrap();
+        net_change -= gross;
+        client.cash_out(&player);
+    }
+    
+    // Create 2 losing games
+    for i in 0u8..2 {
+        let player = Address::generate(&env);
+        let wager = 5_000_000i128;
+        let secret = make_secret(&env, 3);
+        let commitment = make_commitment(&env, 3);
+        client.start_game(&player, &Side::Heads, &wager, &commitment);
+        client.reveal(&player, &secret);
+        net_change += wager;
+    }
+    
+    // Verify reserve_balance reflects all changes
+    let expected_reserve = initial_reserve + net_change;
+    assert_eq!(load_stats(&env, &contract_id).reserve_balance, expected_reserve);
+}
+
+#[test]
+fn test_statistics_consistency_with_mixed_operations() {
+    let (env, client, contract_id) = setup();
+    fund(&env, &contract_id, 1_000_000_000_000);
+    
+    // Mix of operations: start, reveal wins, reveal losses, continue
+    let player1 = Address::generate(&env);
+    let player2 = Address::generate(&env);
+    let player3 = Address::generate(&env);
+    
+    // Player 1: start and win
+    client.start_game(&player1, &Side::Heads, &10_000_000, &make_commitment(&env, 1));
+    client.reveal(&player1, &make_secret(&env, 1));
+    client.cash_out(&player1);
+    
+    // Player 2: start and lose
+    let secret2 = make_secret(&env, 3);
+    let commitment2 = make_commitment(&env, 3);
+    client.start_game(&player2, &Side::Heads, &5_000_000, &commitment2);
+    client.reveal(&player2, &secret2);
+    
+    // Player 3: start, win, continue
+    client.start_game(&player3, &Side::Heads, &7_000_000, &make_commitment(&env, 2));
+    client.reveal(&player3, &make_secret(&env, 2));
+    client.continue_streak(&player3, &make_commitment(&env, 42));
+    
+    // Verify statistics
+    let stats = load_stats(&env, &contract_id);
+    assert_eq!(stats.total_games, 3); // 3 start_game calls
+    assert_eq!(stats.total_volume, 22_000_000); // 10M + 5M + 7M
+    assert!(stats.total_fees > 0); // Player 1 won
+    assert!(stats.reserve_balance > 0); // House has reserves
+}
+
+#[test]
+fn test_statistics_never_become_negative() {
+    let (env, client, contract_id) = setup();
+    fund(&env, &contract_id, 1_000_000_000_000);
+    
+    // Perform various operations
+    for i in 0u8..10 {
+        let player = Address::generate(&env);
+        client.start_game(&player, &Side::Heads, &1_000_000, &make_commitment(&env, i + 1));
+    }
+    
+    // Verify all statistics are non-negative
+    let stats = load_stats(&env, &contract_id);
+    assert!(stats.total_games >= 0);
+    assert!(stats.total_volume >= 0);
+    assert!(stats.total_fees >= 0);
+    assert!(stats.reserve_balance >= 0);
+}
+
+#[test]
+fn test_statistics_with_large_number_of_games() {
+    let (env, client, contract_id) = setup();
+    fund(&env, &contract_id, 10_000_000_000_000);
+    
+    // Create 100 games
+    let mut total_wager = 0i128;
+    for i in 0u8..100 {
+        let player = Address::generate(&env);
+        let wager = 1_000_000i128;
+        total_wager += wager;
+        client.start_game(&player, &Side::Heads, &wager, &make_commitment(&env, i));
+    }
+    
+    // Verify statistics
+    let stats = load_stats(&env, &contract_id);
+    assert_eq!(stats.total_games, 100);
+    assert_eq!(stats.total_volume, total_wager);
+}

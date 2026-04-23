@@ -1418,6 +1418,9 @@ mod pause_tests;
 mod statistics_tests;
 
 #[cfg(test)]
+mod admin_security_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
