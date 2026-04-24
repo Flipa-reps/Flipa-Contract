@@ -379,6 +379,53 @@ pub enum StorageKey {
     PlayerGame(Address),
     /// Per-player game history ring-buffer ([`Vec<HistoryEntry>`]), keyed by player address.
     PlayerHistory(Address),
+    /// Leaderboard tracking top 100 players ([`Leaderboard`]).
+    Leaderboard,
+    /// Per-player leaderboard stats ([`PlayerLeaderboardStats`]), keyed by player address.
+    PlayerLeaderboardStats(Address),
+    /// Referral code to player address mapping.
+    ReferralCode(Bytes),
+    /// Per-player referral stats ([`ReferralStats`]), keyed by player address.
+    PlayerReferralStats(Address),
+    /// Jackpot balance (i128).
+    Jackpot,
+    /// Configurable reveal timeout in ledgers (u32).
+    RevealTimeout,
+}
+
+/// Leaderboard entry for a single player.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaderboardEntry {
+    pub player: Address,
+    pub total_winnings: i128,
+    pub longest_streak: u32,
+    pub total_games: u64,
+}
+
+/// Top 100 players leaderboard.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Leaderboard {
+    pub entries: soroban_sdk::Vec<LeaderboardEntry>,
+}
+
+/// Per-player leaderboard statistics.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerLeaderboardStats {
+    pub total_winnings: i128,
+    pub longest_streak: u32,
+    pub total_games: u64,
+}
+
+/// Per-player referral statistics.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralStats {
+    pub referrer: Option<Address>,
+    pub total_referral_rewards: i128,
+    pub referrals_count: u32,
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -417,6 +464,21 @@ const TTL_EXTEND_TO: u32 = 500_000;
 /// Number of ledgers a player has to call `reveal` before the wager can be
 /// reclaimed via `reclaim_wager`.  At ~5 s/ledger this is roughly 8 minutes.
 const REVEAL_TIMEOUT_LEDGERS: u32 = 100;
+
+/// Maximum number of players tracked in the leaderboard.
+const LEADERBOARD_SIZE: u32 = 100;
+
+/// Jackpot accumulation percentage from fees (10%).
+const JACKPOT_FEE_PERCENTAGE: u32 = 1_000; // 10% in basis points
+
+/// Minimum streak to trigger jackpot payout.
+const JACKPOT_STREAK_THRESHOLD: u32 = 10;
+
+/// Jackpot payout percentage when threshold is reached (50%).
+const JACKPOT_PAYOUT_PERCENTAGE: u32 = 5_000; // 50% in basis points
+
+/// Referral reward percentage (1% of wager).
+const REFERRAL_REWARD_PERCENTAGE: u32 = 100; // 1% in basis points
 
 /// Returns the gross payout multiplier (in basis points, 10_000 = 1x)
 /// for the given win `streak` level.
@@ -532,6 +594,30 @@ pub fn generate_outcome(env: &Env, player_secret: &Bytes, contract_random: &Byte
     combined.append(&cr_bytes);
     let hash = env.crypto().sha256(&combined);
     if hash.to_array()[0] % 2 == 0 { Side::Heads } else { Side::Tails }
+}
+
+/// Generate a referral code from a player address.
+fn generate_referral_code(env: &Env, player: &Address) -> Bytes {
+    let player_bytes = player.to_xdr(env);
+    env.crypto().sha256(&player_bytes).into()
+}
+
+/// Calculate jackpot accumulation from a fee amount.
+fn calculate_jackpot_accumulation(fee: i128) -> Option<i128> {
+    fee.checked_mul(JACKPOT_FEE_PERCENTAGE as i128)?
+        .checked_div(10_000)
+}
+
+/// Calculate jackpot payout amount.
+fn calculate_jackpot_payout(jackpot_balance: i128) -> Option<i128> {
+    jackpot_balance.checked_mul(JACKPOT_PAYOUT_PERCENTAGE as i128)?
+        .checked_div(10_000)
+}
+
+/// Calculate referral reward from a wager.
+fn calculate_referral_reward(wager: i128) -> Option<i128> {
+    wager.checked_mul(REFERRAL_REWARD_PERCENTAGE as i128)?
+        .checked_div(10_000)
 }
 
 /// Provably fair coinflip game contract for the Stellar/Soroban platform.
@@ -721,6 +807,132 @@ impl CoinflipContract {
             .get(&key)
             .unwrap_or_else(|| soroban_sdk::Vec::new(env))
     }
+
+    // ── Leaderboard storage helpers ─────────────────────────────────────────
+
+    fn save_leaderboard(env: &Env, leaderboard: &Leaderboard) {
+        env.storage().persistent().set(&StorageKey::Leaderboard, leaderboard);
+        env.storage().persistent().extend_ttl(&StorageKey::Leaderboard, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_leaderboard(env: &Env) -> Leaderboard {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Leaderboard)
+            .unwrap_or_else(|| Leaderboard {
+                entries: soroban_sdk::Vec::new(env),
+            })
+    }
+
+    fn save_player_leaderboard_stats(env: &Env, player: &Address, stats: &PlayerLeaderboardStats) {
+        let key = StorageKey::PlayerLeaderboardStats(player.clone());
+        env.storage().persistent().set(&key, stats);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_player_leaderboard_stats(env: &Env, player: &Address) -> PlayerLeaderboardStats {
+        let key = StorageKey::PlayerLeaderboardStats(player.clone());
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(PlayerLeaderboardStats {
+                total_winnings: 0,
+                longest_streak: 0,
+                total_games: 0,
+            })
+    }
+
+    fn update_leaderboard(env: &Env, player: &Address, stats: &PlayerLeaderboardStats) {
+        let mut leaderboard = Self::load_leaderboard(env);
+        
+        // Find or create entry
+        let mut found = false;
+        for i in 0..leaderboard.entries.len() {
+            if let Some(entry) = leaderboard.entries.get(i) {
+                if entry.player == *player {
+                    leaderboard.entries.set(i, LeaderboardEntry {
+                        player: player.clone(),
+                        total_winnings: stats.total_winnings,
+                        longest_streak: stats.longest_streak,
+                        total_games: stats.total_games,
+                    });
+                    found = true;
+                    break;
+                }
+            }
+        }
+        
+        if !found && leaderboard.entries.len() < LEADERBOARD_SIZE {
+            leaderboard.entries.push_back(LeaderboardEntry {
+                player: player.clone(),
+                total_winnings: stats.total_winnings,
+                longest_streak: stats.longest_streak,
+                total_games: stats.total_games,
+            });
+        }
+        
+        Self::save_leaderboard(env, &leaderboard);
+    }
+
+    // ── Referral storage helpers ────────────────────────────────────────────
+
+    fn save_referral_stats(env: &Env, player: &Address, stats: &ReferralStats) {
+        let key = StorageKey::PlayerReferralStats(player.clone());
+        env.storage().persistent().set(&key, stats);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_referral_stats(env: &Env, player: &Address) -> ReferralStats {
+        let key = StorageKey::PlayerReferralStats(player.clone());
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(ReferralStats {
+                referrer: None,
+                total_referral_rewards: 0,
+                referrals_count: 0,
+            })
+    }
+
+    fn save_referral_code(env: &Env, code: &Bytes, player: &Address) {
+        let key = StorageKey::ReferralCode(code.clone());
+        env.storage().persistent().set(&key, player);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_referral_code(env: &Env, code: &Bytes) -> Option<Address> {
+        let key = StorageKey::ReferralCode(code.clone());
+        env.storage().persistent().get(&key).unwrap()
+    }
+
+    // ── Jackpot storage helpers ─────────────────────────────────────────────
+
+    fn save_jackpot(env: &Env, balance: i128) {
+        env.storage().persistent().set(&StorageKey::Jackpot, &balance);
+        env.storage().persistent().extend_ttl(&StorageKey::Jackpot, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_jackpot(env: &Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Jackpot)
+            .unwrap_or(0)
+    }
+
+    // ── Timeout storage helpers ─────────────────────────────────────────────
+
+    fn save_reveal_timeout(env: &Env, timeout: u32) {
+        env.storage().persistent().set(&StorageKey::RevealTimeout, &timeout);
+        env.storage().persistent().extend_ttl(&StorageKey::RevealTimeout, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_reveal_timeout(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::RevealTimeout)
+            .unwrap_or(REVEAL_TIMEOUT_LEDGERS)
+    }
+
 
     /// Begin a new coinflip game for `player`.
     ///
@@ -1023,7 +1235,32 @@ impl CoinflipContract {
         stats.reserve_balance = stats.reserve_balance.checked_sub(gross_payout)
             .ok_or(Error::InsufficientReserves)?;
         stats.total_fees = stats.total_fees.checked_add(fee_amount).unwrap_or(stats.total_fees);
+        
+        // Accumulate jackpot from fees
+        let jackpot_accumulation = calculate_jackpot_accumulation(fee_amount).unwrap_or(0);
+        let mut jackpot = Self::load_jackpot(&env);
+        jackpot = jackpot.checked_add(jackpot_accumulation).unwrap_or(jackpot);
+        
+        // Check if player qualifies for jackpot payout
+        let mut jackpot_payout = 0i128;
+        if game.streak >= JACKPOT_STREAK_THRESHOLD {
+            jackpot_payout = calculate_jackpot_payout(jackpot).unwrap_or(0);
+            if jackpot_payout > 0 {
+                jackpot = jackpot.checked_sub(jackpot_payout).unwrap_or(0);
+                stats.reserve_balance = stats.reserve_balance.checked_sub(jackpot_payout).unwrap_or(stats.reserve_balance);
+            }
+        }
+        
         Self::save_stats(&env, &stats);
+        Self::save_jackpot(&env, jackpot);
+
+        // Update leaderboard
+        let mut player_stats = Self::load_player_leaderboard_stats(&env, &player);
+        player_stats.total_winnings = player_stats.total_winnings.checked_add(net_payout).unwrap_or(player_stats.total_winnings);
+        player_stats.longest_streak = player_stats.longest_streak.max(game.streak);
+        player_stats.total_games = player_stats.total_games.saturating_add(1);
+        Self::save_player_leaderboard_stats(&env, &player, &player_stats);
+        Self::update_leaderboard(&env, &player, &player_stats);
 
         // Mark game completed before transfers for the same reason.
         game.phase = GamePhase::Completed;
@@ -1034,6 +1271,11 @@ impl CoinflipContract {
 
         // Transfer fee to treasury
         token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
+        
+        // Transfer jackpot payout if applicable
+        if jackpot_payout > 0 {
+            token_client.transfer(&env.current_contract_address(), &player, &jackpot_payout);
+        }
 
         Ok(())
     }
@@ -1440,7 +1682,8 @@ impl CoinflipContract {
 
         // Reject if the timeout window has not yet elapsed.
         let current = env.ledger().sequence();
-        let expires_at = game.start_ledger.saturating_add(REVEAL_TIMEOUT_LEDGERS);
+        let timeout = Self::load_reveal_timeout(&env);
+        let expires_at = game.start_ledger.saturating_add(timeout);
         if current < expires_at {
             return Err(Error::RevealTimeout);
         }
@@ -1594,6 +1837,101 @@ impl CoinflipContract {
         // 2. Re-derive outcome and compare.
         let derived = generate_outcome(&env, &entry.secret, &entry.contract_random);
         Ok(derived == entry.outcome)
+    }
+
+    /// Get the leaderboard with top 100 players by total winnings.
+    ///
+    /// Returns a paginated slice of the leaderboard.
+    ///
+    /// # Arguments
+    /// - `offset` – zero-based start index into the leaderboard
+    /// - `limit`  – maximum number of entries to return (capped at 20)
+    ///
+    /// # Returns
+    /// A `Vec<LeaderboardEntry>` slice.
+    pub fn get_leaderboard(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<LeaderboardEntry> {
+        let leaderboard = Self::load_leaderboard(&env);
+        let len = leaderboard.entries.len();
+        if offset >= len {
+            return soroban_sdk::Vec::new(&env);
+        }
+        let page = limit.min(20);
+        let end = (offset + page).min(len);
+        let mut result = soroban_sdk::Vec::new(&env);
+        for i in offset..end {
+            result.push_back(leaderboard.entries.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Get referral statistics for a player.
+    ///
+    /// # Arguments
+    /// - `player` – address to query
+    ///
+    /// # Returns
+    /// The player's referral stats.
+    pub fn get_referral_stats(env: Env, player: Address) -> ReferralStats {
+        Self::load_referral_stats(&env, &player)
+    }
+
+    /// Get the current jackpot balance.
+    ///
+    /// # Returns
+    /// The current jackpot balance in stroops.
+    pub fn get_jackpot(env: Env) -> i128 {
+        Self::load_jackpot(&env)
+    }
+
+    /// Set the reveal timeout duration (admin only).
+    ///
+    /// # Arguments
+    /// - `admin`   – must match `config.admin`
+    /// - `timeout_ledgers` – new timeout in ledgers
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
+    pub fn set_timeout(env: Env, admin: Address, timeout_ledgers: u32) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        Self::save_reveal_timeout(&env, timeout_ledgers);
+        Ok(())
+    }
+
+    /// Extend the reveal timeout for an active game (player only).
+    ///
+    /// # Arguments
+    /// - `player` – must authorize
+    ///
+    /// # Errors
+    /// - [`Error::NoActiveGame`] – no game exists for player
+    /// - [`Error::InvalidPhase`] – game is not in Committed phase
+    pub fn extend_timeout(env: Env, player: Address) -> Result<(), Error> {
+        player.require_auth();
+
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        if game.phase != GamePhase::Committed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // Double the timeout (max 2x extension)
+        let timeout = Self::load_reveal_timeout(&env);
+        let new_start = env.ledger().sequence().saturating_sub(timeout);
+        game.start_ledger = new_start;
+        Self::save_player_game(&env, &player, &game);
+
+        Ok(())
     }
 }
 
