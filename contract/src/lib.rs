@@ -1303,11 +1303,10 @@ impl CoinflipContract {
     ///
     /// # Process (on success)
     /// 1. Verify the player has a game in `Committed` phase.
-    /// 2. Verify the reveal window has expired.
-    /// 3. Credit the wager back to `reserve_balance` (house keeps the wager
-    ///    because the player failed to reveal — this prevents griefing by
-    ///    locking reserves indefinitely).
-    /// 4. Delete the player's game state to free the slot.
+    /// 2. Verify the reveal window has expired (`current_ledger >= start_ledger + REVEAL_TIMEOUT_LEDGERS`).
+    /// 3. Forfeit the wager to `reserve_balance`. The house keeps the wager
+    ///    to prevent players from selectively timing out losing games.
+    /// 4. Delete the player's game state to free the slot for new games.
     ///
     /// # Arguments
     /// - `player` – must authorize; must have a game in `Committed` phase
