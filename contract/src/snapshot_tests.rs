@@ -107,6 +107,8 @@ fn contract_stats_zero() {
         total_volume: 0,
         total_fees: 0,
         reserve_balance: 0,
+        pool_size: 0,
+        mix_count: 0,
     };
     assert_snapshot!(borsh_to_hex(&env, &stats));
 }
@@ -119,6 +121,8 @@ fn contract_stats_production() {
         total_volume: 1_000_000_000_000, // 100k XLM volume
         total_fees: 30_000_000_000,       // 3% of volume
         reserve_balance: 500_000_000_000, // 50k XLM reserves
+        pool_size: 1_000_000,
+        mix_count: 1_000_000,
     };
     assert_snapshot!(borsh_to_hex(&env, &stats));
 }
@@ -131,6 +135,8 @@ fn contract_stats_roundtrip() {
         total_volume: 123_456_789,
         total_fees: 12_345_678,
         reserve_balance: 1_000_000_000,
+        pool_size: 42,
+        mix_count: 21,
     };
 
     let bytes = env.bytes_from_object(&original).unwrap().unwrap();
@@ -364,9 +370,11 @@ fn upgrade_simulation_stats_compatibility() {
     // Create stats with current schema
     let stats = ContractStats {
         total_games: 1000,
-        total_wins: 600,
-        total_losses: 400,
+        total_volume: 600_000_000,
+        total_fees: 18_000_000,
         reserve_balance: 50_000_000,
+        pool_size: 1000,
+        mix_count: 1000,
     };
     
     // Serialize
@@ -377,9 +385,11 @@ fn upgrade_simulation_stats_compatibility() {
     
     // Verify all fields preserved
     assert_eq!(deserialized.total_games, 1000);
-    assert_eq!(deserialized.total_wins, 600);
-    assert_eq!(deserialized.total_losses, 400);
+    assert_eq!(deserialized.total_volume, 600_000_000);
+    assert_eq!(deserialized.total_fees, 18_000_000);
     assert_eq!(deserialized.reserve_balance, 50_000_000);
+    assert_eq!(deserialized.pool_size, 1000);
+    assert_eq!(deserialized.mix_count, 1000);
 }
 
 // ── Storage Layout Versioning Strategy ───────────────────────────────────────
