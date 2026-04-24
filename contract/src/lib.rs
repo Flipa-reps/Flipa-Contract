@@ -1725,6 +1725,9 @@ mod admin_security_tests;
 mod compliance_audit_tests;
 
 #[cfg(test)]
+mod disaster_recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
