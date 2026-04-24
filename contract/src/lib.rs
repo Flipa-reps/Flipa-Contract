@@ -666,6 +666,56 @@ pub fn verify_outcome_proof(env: &Env, proof: &OutcomeProof) -> bool {
     generate_outcome(env, &proof.secret, &proof.contract_random) == proof.outcome
 }
 
+/// A cryptographic audit trail for a single game's randomness generation.
+///
+/// Captures every step of the commit-reveal protocol so any observer can
+/// independently verify that the outcome was not manipulated by either party.
+///
+/// ## Verification steps (all reproducible with plain SHA-256)
+///
+/// 1. `SHA-256(secret) == commitment`
+///    — player was bound to their secret before `contract_random` was known
+/// 2. `SHA-256(ledger_sequence_bytes) == contract_random`
+///    — contract's contribution was fixed at game-start time
+/// 3. `SHA-256(secret || contract_random)[0] & 1` → outcome bit
+///    — neither party could unilaterally choose the result
+/// 4. `outcome == recorded_outcome`
+///    — the stored result matches the derivation
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RandomnessTrail {
+    /// Player's secret pre-image; reveals after game completion.
+    pub secret: Bytes,
+    /// SHA-256(secret); submitted before contract_random was known.
+    pub commitment: BytesN<32>,
+    /// SHA-256(ledger_sequence); fixed at game-start time.
+    pub contract_random: BytesN<32>,
+    /// Ledger sequence number at game creation; anchors contract_random.
+    pub ledger: u32,
+    /// Derived outcome: `SHA-256(secret || contract_random)[0] & 1`.
+    pub outcome: Side,
+    /// Whether the commitment → outcome chain verifies correctly.
+    pub valid: bool,
+}
+
+/// Verify the full randomness generation chain for a [`RandomnessTrail`].
+///
+/// Checks:
+/// 1. `SHA-256(trail.secret) == trail.commitment`
+/// 2. `generate_outcome(trail.secret, trail.contract_random) == trail.outcome`
+///
+/// Returns `false` immediately if `trail.secret` is empty (incomplete trail).
+/// This function is pure — no storage reads, no side effects.
+pub fn verify_randomness_trail(env: &Env, trail: &RandomnessTrail) -> bool {
+    if trail.secret.is_empty() {
+        return false;
+    }
+    if !verify_commitment(env, &trail.secret, &trail.commitment) {
+        return false;
+    }
+    generate_outcome(env, &trail.secret, &trail.contract_random) == trail.outcome
+}
+
 /// Provably fair coinflip game contract for the Stellar/Soroban platform.
 ///
 /// ## Public API
@@ -1730,6 +1780,48 @@ impl CoinflipContract {
             outcome: entry.outcome,
             side: entry.side,
             ledger: entry.ledger,
+        }))
+    }
+
+    /// Build a [`RandomnessTrail`] for a completed game in the player's history.
+    ///
+    /// Returns the full audit trail for the entry at `history_idx`, including
+    /// a pre-computed `valid` flag indicating whether the chain verifies.
+    /// Returns `None` when the entry's secret is empty (games settled via
+    /// `cash_out` do not re-store the secret after reveal).
+    ///
+    /// # Arguments
+    /// - `player`      – address whose history to inspect
+    /// - `history_idx` – index into the player's history buffer (0 = oldest)
+    ///
+    /// # Errors
+    /// - [`Error::NoActiveGame`] – no history exists for `player`
+    /// - [`Error::InvalidPhase`] – `history_idx` is out of range
+    pub fn get_randomness_trail(
+        env: Env,
+        player: Address,
+        history_idx: u32,
+    ) -> Result<Option<RandomnessTrail>, Error> {
+        let history = Self::load_player_history(&env, &player);
+        if history.is_empty() {
+            return Err(Error::NoActiveGame);
+        }
+        if history_idx >= history.len() {
+            return Err(Error::InvalidPhase);
+        }
+        let entry = history.get(history_idx).unwrap();
+        if entry.secret.is_empty() {
+            return Ok(None);
+        }
+        let valid = verify_commitment(&env, &entry.secret, &entry.commitment)
+            && generate_outcome(&env, &entry.secret, &entry.contract_random) == entry.outcome;
+        Ok(Some(RandomnessTrail {
+            secret: entry.secret,
+            commitment: entry.commitment,
+            contract_random: entry.contract_random,
+            outcome: entry.outcome,
+            ledger: entry.ledger,
+            valid,
         }))
     }
 
@@ -5828,6 +5920,229 @@ mod outcome_proof_property_tests {
 //   where fee_i = floor(gross_i * fee_bps_i / 10_000)
 //   and   gross_i = floor(wager_i * multiplier(streak_i) / 10_000)
 // ═══════════════════════════════════════════════════════════════════════════
+// Feature: randomness audit trail
+// Module:  randomness_audit_trail_tests
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod randomness_audit_trail_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> soroban_sdk::Address {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = Address::generate(env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        contract_id
+    }
+
+    /// Inject a history entry with a known secret and return the expected trail.
+    fn inject_entry(env: &Env, contract_id: &soroban_sdk::Address, player: &Address, secret_bytes: &[u8]) -> RandomnessTrail {
+        let secret = Bytes::from_slice(env, secret_bytes);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        let contract_random: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(env, &[55u8; 32])).into();
+        let outcome = generate_outcome(env, &secret, &contract_random);
+        env.as_contract(contract_id, || {
+            CoinflipContract::save_history_entry(env, player, HistoryEntry {
+                wager: 10_000_000, side: Side::Heads, outcome, won: outcome == Side::Heads,
+                streak: 1, commitment: commitment.clone(), secret: secret.clone(),
+                contract_random: contract_random.clone(), payout: 0, ledger: 42,
+            });
+        });
+        RandomnessTrail { secret, commitment, contract_random, outcome, ledger: 42, valid: true }
+    }
+
+    // ── verify_randomness_trail ──────────────────────────────────────────────
+
+    #[test]
+    fn test_valid_trail_verifies() {
+        let env = Env::default();
+        let secret = Bytes::from_slice(&env, &[3u8; 32]);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        let contract_random: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &[7u8; 32])).into();
+        let outcome = generate_outcome(&env, &secret, &contract_random);
+        let trail = RandomnessTrail { secret, commitment, contract_random, outcome, ledger: 1, valid: false };
+        assert!(verify_randomness_trail(&env, &trail));
+    }
+
+    #[test]
+    fn test_empty_secret_fails() {
+        let env = Env::default();
+        let trail = RandomnessTrail {
+            secret: Bytes::new(&env),
+            commitment: BytesN::from_array(&env, &[0u8; 32]),
+            contract_random: BytesN::from_array(&env, &[0u8; 32]),
+            outcome: Side::Heads, ledger: 0, valid: false,
+        };
+        assert!(!verify_randomness_trail(&env, &trail));
+    }
+
+    #[test]
+    fn test_tampered_commitment_fails() {
+        let env = Env::default();
+        let secret = Bytes::from_slice(&env, &[3u8; 32]);
+        let contract_random: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &[7u8; 32])).into();
+        let outcome = generate_outcome(&env, &secret, &contract_random);
+        let trail = RandomnessTrail {
+            secret,
+            commitment: BytesN::from_array(&env, &[0u8; 32]), // wrong
+            contract_random, outcome, ledger: 0, valid: false,
+        };
+        assert!(!verify_randomness_trail(&env, &trail));
+    }
+
+    #[test]
+    fn test_tampered_outcome_fails() {
+        let env = Env::default();
+        let secret = Bytes::from_slice(&env, &[3u8; 32]);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        let contract_random: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &[7u8; 32])).into();
+        let real_outcome = generate_outcome(&env, &secret, &contract_random);
+        let flipped = match real_outcome { Side::Heads => Side::Tails, Side::Tails => Side::Heads };
+        let trail = RandomnessTrail { secret, commitment, contract_random, outcome: flipped, ledger: 0, valid: false };
+        assert!(!verify_randomness_trail(&env, &trail));
+    }
+
+    // ── get_randomness_trail ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_trail_returns_correct_data() {
+        let env = Env::default();
+        let contract_id = setup(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        let expected = inject_entry(&env, &contract_id, &player, &[3u8; 32]);
+
+        let trail = client.get_randomness_trail(&player, &0).unwrap().unwrap();
+        assert_eq!(trail.secret, expected.secret);
+        assert_eq!(trail.commitment, expected.commitment);
+        assert_eq!(trail.contract_random, expected.contract_random);
+        assert_eq!(trail.outcome, expected.outcome);
+        assert_eq!(trail.ledger, expected.ledger);
+        assert!(trail.valid);
+    }
+
+    #[test]
+    fn test_get_trail_valid_flag_is_true_for_honest_entry() {
+        let env = Env::default();
+        let contract_id = setup(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        inject_entry(&env, &contract_id, &player, &[3u8; 32]);
+        let trail = client.get_randomness_trail(&player, &0).unwrap().unwrap();
+        assert!(trail.valid);
+    }
+
+    #[test]
+    fn test_get_trail_no_history_returns_error() {
+        let env = Env::default();
+        let contract_id = setup(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        assert_eq!(client.try_get_randomness_trail(&player, &0), Err(Ok(Error::NoActiveGame)));
+    }
+
+    #[test]
+    fn test_get_trail_out_of_range_returns_error() {
+        let env = Env::default();
+        let contract_id = setup(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        inject_entry(&env, &contract_id, &player, &[3u8; 32]);
+        assert_eq!(client.try_get_randomness_trail(&player, &99), Err(Ok(Error::InvalidPhase)));
+    }
+
+    #[test]
+    fn test_get_trail_empty_secret_returns_none() {
+        let env = Env::default();
+        let contract_id = setup(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        let commitment: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &[1u8; 32])).into();
+        let contract_random: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &[2u8; 32])).into();
+        env.as_contract(&contract_id, || {
+            CoinflipContract::save_history_entry(&env, &player, HistoryEntry {
+                wager: 0, side: Side::Heads, outcome: Side::Heads, won: true,
+                streak: 1, commitment, secret: Bytes::new(&env), // empty
+                contract_random, payout: 0, ledger: 1,
+            });
+        });
+        assert_eq!(client.get_randomness_trail(&player, &0), None);
+    }
+
+    #[test]
+    fn test_multiple_entries_indexed_correctly() {
+        let env = Env::default();
+        let contract_id = setup(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+        inject_entry(&env, &contract_id, &player, &[1u8; 32]);
+        inject_entry(&env, &contract_id, &player, &[2u8; 32]);
+
+        let t0 = client.get_randomness_trail(&player, &0).unwrap().unwrap();
+        let t1 = client.get_randomness_trail(&player, &1).unwrap().unwrap();
+        assert_ne!(t0.secret, t1.secret);
+        assert!(t0.valid);
+        assert!(t1.valid);
+    }
+
+    // ── property tests ───────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Any trail built from a valid (secret, contract_random) pair must verify.
+        #[test]
+        fn prop_valid_trail_always_verifies(
+            secret_bytes   in prop::array::uniform32(1u8..=255u8),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret = Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            let contract_random: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let outcome = generate_outcome(&env, &secret, &contract_random);
+            let trail = RandomnessTrail { secret, commitment, contract_random, outcome, ledger: 0, valid: false };
+            prop_assert!(verify_randomness_trail(&env, &trail));
+        }
+
+        /// Flipping the outcome always causes verification to fail.
+        #[test]
+        fn prop_tampered_outcome_always_fails(
+            secret_bytes   in prop::array::uniform32(1u8..=255u8),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret = Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            let contract_random: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let real = generate_outcome(&env, &secret, &contract_random);
+            let flipped = match real { Side::Heads => Side::Tails, Side::Tails => Side::Heads };
+            let trail = RandomnessTrail { secret, commitment, contract_random, outcome: flipped, ledger: 0, valid: false };
+            prop_assert!(!verify_randomness_trail(&env, &trail));
+        }
+
+        /// verify_randomness_trail is deterministic.
+        #[test]
+        fn prop_verification_is_deterministic(
+            secret_bytes   in prop::array::uniform32(1u8..=255u8),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret = Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            let contract_random: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let outcome = generate_outcome(&env, &secret, &contract_random);
+            let trail = RandomnessTrail { secret, commitment, contract_random, outcome, ledger: 0, valid: false };
+            prop_assert_eq!(verify_randomness_trail(&env, &trail), verify_randomness_trail(&env, &trail));
+        }
+    }
+}
+
 // Feature: secure key derivation / commitment strength
 // Module:  commitment_strength_tests
 // ═══════════════════════════════════════════════════════════════════════════
