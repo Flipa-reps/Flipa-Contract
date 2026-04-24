@@ -256,7 +256,7 @@ fn claim_winnings_from_committed_is_invalid_phase() {
     fund(&env, &contract_id, 1_000_000_000);
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 1);
-    assert_eq!(client.try_claim_winnings(&player), Err(Ok(Error::InvalidPhase)));
+    assert_eq!(client.try_claim_winnings(&player, &soroban_sdk::Bytes::new(&env)), Err(Ok(Error::InvalidPhase)));
 }
 
 /// continue_streak from Committed → InvalidPhase.

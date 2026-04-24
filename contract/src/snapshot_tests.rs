@@ -254,7 +254,8 @@ fn error_enum_stable_codes() {
     // Verify stable u32 discriminants (protocol contract)
     assert_eq!(Error::WagerBelowMinimum as u32, 1);
     assert_eq!(Error::AlreadyInitialized as u32, 51);
-    // All 17 codes covered in lib.rs error_codes::VARIANT_COUNT
+    assert_eq!(Error::DuplicateCommitment as u32, 52);
+    // All 18 codes covered in lib.rs error_codes::VARIANT_COUNT
 }
 
 // ── Backward Compatibility Probes ────────────────────────────────────────────
@@ -401,5 +402,5 @@ fn upgrade_simulation_stats_compatibility() {
 fn storage_versioning_documented() {
     // This test serves as documentation of the storage layout versioning strategy
     // and ensures the strategy is maintained across upgrades
-    assert_eq!(error_codes::VARIANT_COUNT, 17);
+    assert_eq!(error_codes::VARIANT_COUNT, 18);
 }
