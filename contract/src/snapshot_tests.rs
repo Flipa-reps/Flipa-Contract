@@ -161,6 +161,8 @@ fn game_state_committed_streak_0() {
         fee_bps: 300,
         phase: GamePhase::Committed,
         start_ledger: 12345,
+    
+        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     assert_snapshot!(borsh_to_hex(&env, &game));
 }
@@ -179,6 +181,8 @@ fn game_state_all_phases() {
                 fee_bps: 300,
                 phase: $phase,
                 start_ledger: 12345,
+            
+                oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
             };
             assert_snapshot!(format!("{:?}", borsh_to_hex(&env, &game)));
         };
@@ -202,6 +206,8 @@ fn game_state_edge_streaks() {
             fee_bps: 500, // max fee
             phase: GamePhase::Revealed,
             start_ledger: u32::MAX,
+        
+            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
         assert_snapshot!(format!("streak_{}", streak), borsh_to_hex(&env, &game));
     }
@@ -219,6 +225,8 @@ fn game_state_roundtrip() {
         fee_bps: 300,
         phase: GamePhase::Revealed,
         start_ledger: 12345,
+    
+        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
 
     let bytes = env.bytes_from_object(&original).unwrap().unwrap();
@@ -324,6 +332,8 @@ fn storage_ttl_extension_snapshot() {
         fee_bps: 300,
         phase: GamePhase::Committed,
         start_ledger: 100,
+    
+        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     
     let bytes = env.bytes_from_object(&game).unwrap().unwrap();

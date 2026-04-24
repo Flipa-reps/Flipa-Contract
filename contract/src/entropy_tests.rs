@@ -63,7 +63,7 @@ fn test_start_game_accumulates_entropy() {
 
     let before = load_entropy(&env, &contract_id);
     let player = Address::generate(&env);
-    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1));
+    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let after = load_entropy(&env, &contract_id);
 
     assert_eq!(after.pool_size, before.pool_size + 1);
@@ -79,7 +79,7 @@ fn test_start_game_mixes_entropy() {
 
     let before = load_entropy(&env, &contract_id);
     let player = Address::generate(&env);
-    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1));
+    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let after = load_entropy(&env, &contract_id);
 
     assert_eq!(after.mix_count, before.mix_count + 1);
@@ -95,10 +95,10 @@ fn test_continue_streak_accumulates_and_mixes_entropy() {
 
     let player = Address::generate(&env);
     // Start and win a game (seed 1 → Heads win).
-    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1));
+    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    assert_eq!(client.reveal(&player, &secret), true);
+    assert_eq!(client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), true);
 
     let before = load_entropy(&env, &contract_id);
     env.ledger().with_mut(|l| l.sequence_number += 1);
@@ -122,12 +122,12 @@ fn test_entropy_pool_value_changes_across_games() {
     // Advance ledger so each game gets a distinct contribution.
     env.ledger().with_mut(|l| l.sequence_number += 1);
     let p1 = Address::generate(&env);
-    client.start_game(&p1, &Side::Heads, &10_000_000, &commitment(&env, 1));
+    client.start_game(&p1, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let pool_after_game1 = load_entropy(&env, &contract_id).pool;
 
     env.ledger().with_mut(|l| l.sequence_number += 1);
     let p2 = Address::generate(&env);
-    client.start_game(&p2, &Side::Heads, &10_000_000, &commitment(&env, 2));
+    client.start_game(&p2, &Side::Heads, &10_000_000, &commitment(&env, 2, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let pool_after_game2 = load_entropy(&env, &contract_id).pool;
 
     assert_ne!(pool_after_init, pool_after_game1, "pool must change after first game");
@@ -146,7 +146,7 @@ fn test_contract_random_is_entropy_mixed() {
     fund(&env, &contract_id, 1_000_000_000);
 
     let player = Address::generate(&env);
-    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1));
+    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
 
     let game: GameState = env.as_contract(&contract_id, || {
         CoinflipContract::load_player_game(&env, &player).unwrap()
@@ -194,13 +194,13 @@ fn test_same_sequence_different_pool_yields_different_random() {
 
     // Warm up contract B's pool with an extra game.
     let warmup = Address::generate(&env);
-    client_b.start_game(&warmup, &Side::Heads, &1_000_000, &commitment(&env, 99));
+    client_b.start_game(&warmup, &Side::Heads, &1_000_000, &commitment(&env, 99, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
 
     // Now both contracts start a game at the same ledger sequence.
     let player_a = Address::generate(&env);
     let player_b = Address::generate(&env);
-    client_a.start_game(&player_a, &Side::Heads, &10_000_000, &commitment(&env, 1));
-    client_b.start_game(&player_b, &Side::Heads, &10_000_000, &commitment(&env, 1));
+    client_a.start_game(&player_a, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
+    client_b.start_game(&player_b, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
 
     let game_a: GameState = env.as_contract(&cid_a, || {
         CoinflipContract::load_player_game(&env, &player_a).unwrap()
@@ -233,7 +233,7 @@ fn test_stats_pool_size_tracks_accumulations() {
     for i in 0..3u32 {
         env.ledger().with_mut(|l| l.sequence_number += 1);
         let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, i as u8 + 1));
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, i as u8 + 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     }
 
     let stats = load_stats(&env, &contract_id);
@@ -256,7 +256,7 @@ fn test_stats_mix_count_tracks_mixes() {
     for i in 0..3u32 {
         env.ledger().with_mut(|l| l.sequence_number += 1);
         let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, i as u8 + 1));
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, i as u8 + 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     }
 
     let stats = load_stats(&env, &contract_id);
@@ -277,7 +277,7 @@ fn test_quality_metrics_are_monotonically_non_decreasing() {
     for i in 0..5u32 {
         env.ledger().with_mut(|l| l.sequence_number += 1);
         let player = Address::generate(&env);
-        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, i as u8 + 1));
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, i as u8 + 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
 
         let stats = load_stats(&env, &contract_id);
         assert!(stats.pool_size >= prev_pool_size, "pool_size must not decrease");
@@ -296,10 +296,10 @@ fn test_mix_count_increments_on_continue_streak() {
     fund(&env, &contract_id, 1_000_000_000);
 
     let player = Address::generate(&env);
-    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1));
+    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    assert_eq!(client.reveal(&player, &secret), true);
+    assert_eq!(client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), true);
 
     let before = load_stats(&env, &contract_id).mix_count;
     env.ledger().with_mut(|l| l.sequence_number += 1);
