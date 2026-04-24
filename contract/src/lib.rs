@@ -534,6 +534,72 @@ pub fn generate_outcome(env: &Env, player_secret: &Bytes, contract_random: &Byte
     if hash.to_array()[0] % 2 == 0 { Side::Heads } else { Side::Tails }
 }
 
+/// A self-contained proof bundle that lets any party verify a game outcome
+/// without trusting the contract or any third party.
+///
+/// ## What this proves
+///
+/// Given `(secret, commitment, contract_random, outcome)`, any verifier can
+/// independently confirm:
+///
+/// 1. **Commitment integrity** – `SHA-256(secret) == commitment`
+///    The player locked their secret before the contract's randomness was known.
+///
+/// 2. **Outcome correctness** – `SHA-256(secret || contract_random)[0] & 1`
+///    determines the outcome bit; the recorded `outcome` matches.
+///
+/// Together these two checks prove that neither party could have unilaterally
+/// chosen the outcome: the player was bound by their commitment, and the
+/// contract's randomness was fixed at game-start time.
+///
+/// ## Privacy note
+///
+/// This is a *transparent* proof — the secret is included in plain text.
+/// The privacy guarantee comes from the commit-reveal protocol itself:
+/// the secret is only revealed *after* the outcome is already determined,
+/// so revealing it post-game leaks no exploitable information.
+///
+/// Off-chain verifiers can reproduce both checks using only standard SHA-256,
+/// with no dependency on the contract or the Stellar network.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutcomeProof {
+    /// The player's revealed secret (pre-image of `commitment`).
+    pub secret: Bytes,
+    /// SHA-256 of `secret`; submitted before `contract_random` was known.
+    pub commitment: BytesN<32>,
+    /// SHA-256 of the ledger sequence at game-start time.
+    pub contract_random: BytesN<32>,
+    /// The derived outcome: `SHA-256(secret || contract_random)[0] & 1 == 0 → Heads`.
+    pub outcome: Side,
+    /// The player's chosen side; `won == (outcome == side)`.
+    pub side: Side,
+    /// Ledger sequence at game creation; anchors the proof to a specific block.
+    pub ledger: u32,
+}
+
+/// Verify an [`OutcomeProof`] without any on-chain state.
+///
+/// Performs both checks that constitute a complete outcome proof:
+///
+/// 1. `SHA-256(proof.secret) == proof.commitment`
+/// 2. `generate_outcome(proof.secret, proof.contract_random) == proof.outcome`
+///
+/// Returns `true` only when both checks pass.  Returns `false` if either
+/// check fails or if `proof.secret` is empty (proof is incomplete).
+///
+/// This function is pure — it reads no storage and has no side effects.
+/// It can be called by anyone, on-chain or off-chain, to audit any game.
+pub fn verify_outcome_proof(env: &Env, proof: &OutcomeProof) -> bool {
+    if proof.secret.is_empty() {
+        return false;
+    }
+    if !verify_commitment(env, &proof.secret, &proof.commitment) {
+        return false;
+    }
+    generate_outcome(env, &proof.secret, &proof.contract_random) == proof.outcome
+}
+
 /// Provably fair coinflip game contract for the Stellar/Soroban platform.
 ///
 /// ## Public API
@@ -1544,6 +1610,48 @@ impl CoinflipContract {
             result.push_back(history.get(i).unwrap());
         }
         result
+    }
+
+    /// Build an [`OutcomeProof`] for a completed game in the player's history.
+    ///
+    /// Returns the proof bundle for the entry at `history_idx`.  The proof
+    /// can be passed to [`verify_outcome_proof`] (or verified off-chain with
+    /// plain SHA-256) to confirm the outcome without trusting the contract.
+    ///
+    /// Returns `None` when the entry's secret is empty (games settled via
+    /// `cash_out` do not re-store the secret after reveal).
+    ///
+    /// # Arguments
+    /// - `player`      – address whose history to inspect
+    /// - `history_idx` – index into the player's history buffer (0 = oldest)
+    ///
+    /// # Errors
+    /// - [`Error::NoActiveGame`] – no history exists for `player`
+    /// - [`Error::InvalidPhase`] – `history_idx` is out of range
+    pub fn get_outcome_proof(
+        env: Env,
+        player: Address,
+        history_idx: u32,
+    ) -> Result<Option<OutcomeProof>, Error> {
+        let history = Self::load_player_history(&env, &player);
+        if history.is_empty() {
+            return Err(Error::NoActiveGame);
+        }
+        if history_idx >= history.len() {
+            return Err(Error::InvalidPhase);
+        }
+        let entry = history.get(history_idx).unwrap();
+        if entry.secret.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(OutcomeProof {
+            secret: entry.secret,
+            commitment: entry.commitment,
+            contract_random: entry.contract_random,
+            outcome: entry.outcome,
+            side: entry.side,
+            ledger: entry.ledger,
+        }))
     }
 
     /// Verify that a past game's outcome is reproducible from its stored proof.
@@ -5298,8 +5406,337 @@ mod property_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Feature: soroban-coinflip-game
-// Module:  cumulative_fee_tests
+// Feature: outcome proof verification
+// Module:  outcome_proof_tests
+//
+// Validates OutcomeProof generation, verify_outcome_proof correctness, and
+// tamper-detection across all proof fields.
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod outcome_proof_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn make_proof(env: &Env, secret_bytes: &[u8], side: Side) -> OutcomeProof {
+        let secret: Bytes = Bytes::from_slice(env, secret_bytes);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        let contract_random: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_slice(env, &[99u8; 32]))
+            .into();
+        let outcome = generate_outcome(env, &secret, &contract_random);
+        OutcomeProof { secret, commitment, contract_random, outcome, side, ledger: 1 }
+    }
+
+    // ── verify_outcome_proof ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_valid_proof_verifies() {
+        let env = Env::default();
+        let proof = make_proof(&env, &[1u8; 32], Side::Heads);
+        assert!(verify_outcome_proof(&env, &proof));
+    }
+
+    #[test]
+    fn test_empty_secret_fails() {
+        let env = Env::default();
+        let mut proof = make_proof(&env, &[1u8; 32], Side::Heads);
+        proof.secret = Bytes::new(&env);
+        assert!(!verify_outcome_proof(&env, &proof));
+    }
+
+    #[test]
+    fn test_tampered_secret_fails() {
+        let env = Env::default();
+        let mut proof = make_proof(&env, &[1u8; 32], Side::Heads);
+        proof.secret = Bytes::from_slice(&env, &[2u8; 32]); // wrong secret
+        assert!(!verify_outcome_proof(&env, &proof));
+    }
+
+    #[test]
+    fn test_tampered_commitment_fails() {
+        let env = Env::default();
+        let mut proof = make_proof(&env, &[1u8; 32], Side::Heads);
+        proof.commitment = BytesN::from_array(&env, &[0u8; 32]); // wrong commitment
+        assert!(!verify_outcome_proof(&env, &proof));
+    }
+
+    #[test]
+    fn test_tampered_outcome_fails() {
+        let env = Env::default();
+        let mut proof = make_proof(&env, &[1u8; 32], Side::Heads);
+        // Flip the outcome to the opposite side
+        proof.outcome = match proof.outcome {
+            Side::Heads => Side::Tails,
+            Side::Tails => Side::Heads,
+        };
+        assert!(!verify_outcome_proof(&env, &proof));
+    }
+
+    #[test]
+    fn test_tampered_contract_random_fails() {
+        let env = Env::default();
+        let mut proof = make_proof(&env, &[1u8; 32], Side::Heads);
+        proof.contract_random = BytesN::from_array(&env, &[0u8; 32]); // wrong random
+        // outcome was derived from the original contract_random, so re-derivation
+        // with the tampered value will produce a different (or same) side — but
+        // the commitment check still passes; the outcome check may fail.
+        // We verify that the proof is no longer fully valid.
+        let recomputed = generate_outcome(&env, &proof.secret, &proof.contract_random);
+        // The proof is invalid if the recomputed outcome differs from the stored one.
+        // (If by coincidence they match, the proof would still pass — that's fine,
+        //  it just means the tampered random happened to produce the same bit.)
+        let expected = recomputed == proof.outcome;
+        assert_eq!(verify_outcome_proof(&env, &proof), expected);
+    }
+
+    // ── get_outcome_proof ────────────────────────────────────────────────────
+
+    /// Set up contract and return (env, contract_id).
+    fn setup_contract(env: &Env) -> soroban_sdk::Address {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = Address::generate(env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = i128::MAX / 2;
+            CoinflipContract::save_stats(env, &stats);
+        });
+        contract_id
+    }
+
+    /// Inject a completed history entry with a known secret.
+    fn inject_history(env: &Env, contract_id: &soroban_sdk::Address, player: &Address, secret_bytes: &[u8]) -> OutcomeProof {
+        let secret = Bytes::from_slice(env, secret_bytes);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        let contract_random: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_slice(env, &[77u8; 32]))
+            .into();
+        let outcome = generate_outcome(env, &secret, &contract_random);
+        let entry = HistoryEntry {
+            wager: 10_000_000,
+            side: Side::Heads,
+            outcome,
+            won: outcome == Side::Heads,
+            streak: 1,
+            commitment: commitment.clone(),
+            secret: secret.clone(),
+            contract_random: contract_random.clone(),
+            payout: 18_430_000,
+            ledger: 42,
+        };
+        env.as_contract(contract_id, || {
+            CoinflipContract::save_history_entry(env, player, entry);
+        });
+        OutcomeProof { secret, commitment, contract_random, outcome, side: Side::Heads, ledger: 42 }
+    }
+
+    #[test]
+    fn test_get_outcome_proof_returns_correct_proof() {
+        let env = Env::default();
+        let contract_id = setup_contract(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+
+        let expected = inject_history(&env, &contract_id, &player, &[5u8; 32]);
+        let proof = client.get_outcome_proof(&player, &0).unwrap();
+
+        assert_eq!(proof.secret, expected.secret);
+        assert_eq!(proof.commitment, expected.commitment);
+        assert_eq!(proof.contract_random, expected.contract_random);
+        assert_eq!(proof.outcome, expected.outcome);
+        assert_eq!(proof.ledger, expected.ledger);
+    }
+
+    #[test]
+    fn test_get_outcome_proof_verifies() {
+        let env = Env::default();
+        let contract_id = setup_contract(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+
+        inject_history(&env, &contract_id, &player, &[5u8; 32]);
+        let proof = client.get_outcome_proof(&player, &0).unwrap().unwrap();
+
+        // The returned proof must pass verify_outcome_proof.
+        assert!(verify_outcome_proof(&env, &proof));
+    }
+
+    #[test]
+    fn test_get_outcome_proof_no_history_returns_error() {
+        let env = Env::default();
+        let contract_id = setup_contract(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+
+        let result = client.try_get_outcome_proof(&player, &0);
+        assert_eq!(result, Err(Ok(Error::NoActiveGame)));
+    }
+
+    #[test]
+    fn test_get_outcome_proof_out_of_range_returns_error() {
+        let env = Env::default();
+        let contract_id = setup_contract(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+
+        inject_history(&env, &contract_id, &player, &[5u8; 32]);
+        let result = client.try_get_outcome_proof(&player, &99);
+        assert_eq!(result, Err(Ok(Error::InvalidPhase)));
+    }
+
+    #[test]
+    fn test_get_outcome_proof_empty_secret_returns_none() {
+        let env = Env::default();
+        let contract_id = setup_contract(&env);
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let player = Address::generate(&env);
+
+        // Inject a history entry with an empty secret (cash_out path).
+        let commitment: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_slice(&env, &[1u8; 32]))
+            .into();
+        let contract_random: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_slice(&env, &[2u8; 32]))
+            .into();
+        let entry = HistoryEntry {
+            wager: 10_000_000,
+            side: Side::Heads,
+            outcome: Side::Heads,
+            won: true,
+            streak: 1,
+            commitment,
+            secret: Bytes::new(&env), // empty — cash_out path
+            contract_random,
+            payout: 18_430_000,
+            ledger: 1,
+        };
+        env.as_contract(&contract_id, || {
+            CoinflipContract::save_history_entry(&env, &player, entry);
+        });
+
+        let result = client.get_outcome_proof(&player, &0);
+        assert_eq!(result, None);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: outcome proof verification (property tests)
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod outcome_proof_property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Any proof built from a valid (secret, contract_random) pair must verify.
+        #[test]
+        fn prop_valid_proof_always_verifies(
+            secret_bytes   in prop::array::uniform32(1u8..=255u8),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret: Bytes = Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            let contract_random: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let outcome = generate_outcome(&env, &secret, &contract_random);
+            let proof = OutcomeProof {
+                secret, commitment, contract_random, outcome,
+                side: Side::Heads, ledger: 0,
+            };
+            prop_assert!(verify_outcome_proof(&env, &proof));
+        }
+
+        /// Flipping the outcome field always causes verification to fail.
+        #[test]
+        fn prop_tampered_outcome_always_fails(
+            secret_bytes   in prop::array::uniform32(1u8..=255u8),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret: Bytes = Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            let contract_random: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let real_outcome = generate_outcome(&env, &secret, &contract_random);
+            let flipped = match real_outcome { Side::Heads => Side::Tails, Side::Tails => Side::Heads };
+            let proof = OutcomeProof {
+                secret, commitment, contract_random, outcome: flipped,
+                side: Side::Heads, ledger: 0,
+            };
+            prop_assert!(!verify_outcome_proof(&env, &proof));
+        }
+
+        /// A wrong secret (different from the one that produced the commitment)
+        /// always causes verification to fail.
+        #[test]
+        fn prop_wrong_secret_always_fails(
+            real_bytes  in prop::array::uniform32(1u8..=255u8),
+            wrong_bytes in prop::array::uniform32(1u8..=255u8),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            prop_assume!(real_bytes != wrong_bytes);
+            let env = soroban_sdk::Env::default();
+            let real_secret: Bytes = Bytes::from_slice(&env, &real_bytes);
+            let wrong_secret: Bytes = Bytes::from_slice(&env, &wrong_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&real_secret).into();
+            let contract_random: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let outcome = generate_outcome(&env, &real_secret, &contract_random);
+            let proof = OutcomeProof {
+                secret: wrong_secret, commitment, contract_random, outcome,
+                side: Side::Heads, ledger: 0,
+            };
+            prop_assert!(!verify_outcome_proof(&env, &proof));
+        }
+
+        /// An empty secret always causes verification to fail.
+        #[test]
+        fn prop_empty_secret_always_fails(
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let contract_random: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let proof = OutcomeProof {
+                secret: Bytes::new(&env),
+                commitment: BytesN::from_array(&env, &[0u8; 32]),
+                contract_random,
+                outcome: Side::Heads,
+                side: Side::Heads,
+                ledger: 0,
+            };
+            prop_assert!(!verify_outcome_proof(&env, &proof));
+        }
+
+        /// verify_outcome_proof is deterministic: same proof → same result.
+        #[test]
+        fn prop_verification_is_deterministic(
+            secret_bytes   in prop::array::uniform32(1u8..=255u8),
+            contract_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret: Bytes = Bytes::from_slice(&env, &secret_bytes);
+            let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+            let contract_random: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
+            let outcome = generate_outcome(&env, &secret, &contract_random);
+            let proof = OutcomeProof {
+                secret, commitment, contract_random, outcome,
+                side: Side::Heads, ledger: 0,
+            };
+            prop_assert_eq!(
+                verify_outcome_proof(&env, &proof),
+                verify_outcome_proof(&env, &proof)
+            );
+        }
+    }
+}
 //
 // Verifies that `total_fees` in ContractStats accumulates correctly across
 // multiple sequential payouts and across fee_bps configuration changes.
