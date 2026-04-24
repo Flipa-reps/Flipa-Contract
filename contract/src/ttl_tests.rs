@@ -53,7 +53,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id, admin)
 }
 
@@ -164,7 +164,7 @@ fn cash_out_extends_stats_ttl() {
         commitment: c, contract_random: cr, fee_bps: 300,
         phase: GamePhase::Revealed, start_ledger: env.ledger().sequence(),
     
-        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(&contract_id, || {
         CoinflipContract::save_player_game(&env, &player, &game);
@@ -192,7 +192,7 @@ fn continue_streak_extends_player_game_ttl() {
         commitment: c, contract_random: cr, fee_bps: 300,
         phase: GamePhase::Revealed, start_ledger: env.ledger().sequence(),
     
-        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(&contract_id, || {
         CoinflipContract::save_player_game(&env, &player, &game);

@@ -60,7 +60,7 @@ fn error_wager_below_minimum_reachable() {
     let commitment = BytesN::<32>::random(&env);
 
     // Try to start game with wager below minimum (1_000_000)
-    let result = client.try_start_game(&player, &Side::Heads, &100, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    let result = client.try_start_game(&player, &Side::Heads, &100, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     assert!(result.is_err(), "should reject wager below minimum");
 }
 
@@ -75,7 +75,7 @@ fn error_wager_above_maximum_reachable() {
     let commitment = BytesN::<32>::random(&env);
 
     // Try to start game with wager above maximum (100_000_000)
-    let result = client.try_start_game(&player, &Side::Heads, &1_000_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    let result = client.try_start_game(&player, &Side::Heads, &1_000_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     assert!(result.is_err(), "should reject wager above maximum");
 }
 
@@ -90,10 +90,10 @@ fn error_active_game_exists_reachable() {
     let commitment = BytesN::<32>::random(&env);
 
     // Start first game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Try to start second game without completing first
-    let result = client.try_start_game(&player, &Side::Tails, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    let result = client.try_start_game(&player, &Side::Tails, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     assert!(result.is_err(), "should reject second active game");
 }
 
@@ -109,7 +109,7 @@ fn error_insufficient_reserves_reachable() {
     let commitment = BytesN::<32>::random(&env);
 
     // Try to start game with large wager that exceeds reserves
-    let result = client.try_start_game(&player, &Side::Heads, &100_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    let result = client.try_start_game(&player, &Side::Heads, &100_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     assert!(result.is_err(), "should reject game when reserves insufficient");
 }
 
@@ -128,7 +128,7 @@ fn error_contract_paused_reachable() {
     client.set_paused(&admin, &true);
 
     // Try to start game while paused
-    let result = client.try_start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    let result = client.try_start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     assert!(result.is_err(), "should reject game when contract paused");
 }
 
@@ -144,7 +144,7 @@ fn error_no_active_game_reachable() {
 
     // Try to reveal without starting game
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(result.is_err(), "should reject reveal without active game");
 }
 
@@ -160,15 +160,15 @@ fn error_invalid_phase_reachable() {
     let commitment = env.crypto().sha256(&secret).into();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Reveal to move to Revealed phase
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
     // Try to reveal again (should be in Revealed phase, not Committed)
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(result.is_err(), "should reject reveal in wrong phase");
 }
 
@@ -185,11 +185,11 @@ fn error_commitment_mismatch_reachable() {
     let commitment = env.crypto().sha256(&secret).into();
 
     // Start game with correct commitment
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Try to reveal with wrong secret
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let result = client.try_reveal(&player, &wrong_secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let result = client.try_reveal(&player, &wrong_secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(result.is_err(), "should reject reveal with mismatched commitment");
 }
 
@@ -205,11 +205,11 @@ fn error_no_winnings_to_claim_reachable() {
     let commitment = env.crypto().sha256(&secret).into();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Reveal (may lose)
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
     if !won {
         // If lost, try to cash out (should fail - no winnings)
@@ -230,11 +230,11 @@ fn error_invalid_commitment_reachable() {
     let commitment = env.crypto().sha256(&secret).into();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Reveal to win
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
     // Try to continue with all-zero commitment (invalid)
     let invalid_commitment = BytesN::<32>::from_array(&env, &[0u8; 32]);

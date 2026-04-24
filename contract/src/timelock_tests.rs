@@ -22,7 +22,7 @@ fn setup(env: &Env) -> (Address, CoinflipContractClient) {
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
     let token = Address::generate(env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (contract_id, client)
 }
 
@@ -56,7 +56,7 @@ fn test_reveal_same_ledger_rejected() {
     client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
 
     // No ledger advance — same ledger as start_game.
-    let result = client.try_reveal(&player, &secret(&env, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+    let result = client.try_reveal(&player, &secret(&env, &BytesN::from_array(&env, &[0u8; 64])));
     assert_eq!(result, Err(Ok(Error::RevealTimeout)));
 }
 
@@ -73,7 +73,7 @@ fn test_reveal_one_ledger_too_early_rejected() {
 
     // Advance to one ledger before the minimum delay.
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS - 1);
-    let result = client.try_reveal(&player, &secret(&env, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+    let result = client.try_reveal(&player, &secret(&env, &BytesN::from_array(&env, &[0u8; 64])));
     assert_eq!(result, Err(Ok(Error::RevealTimeout)));
 }
 
@@ -89,7 +89,7 @@ fn test_reveal_at_exact_delay_boundary_succeeds() {
     client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
 
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let result = client.try_reveal(&player, &secret(&env, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+    let result = client.try_reveal(&player, &secret(&env, &BytesN::from_array(&env, &[0u8; 64])));
     assert!(result.is_ok(), "reveal at exact delay boundary must succeed");
 }
 
@@ -105,7 +105,7 @@ fn test_reveal_after_delay_succeeds() {
     client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
 
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS + 50);
-    let result = client.try_reveal(&player, &secret(&env, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+    let result = client.try_reveal(&player, &secret(&env, &BytesN::from_array(&env, &[0u8; 64])));
     assert!(result.is_ok(), "reveal after delay must succeed");
 }
 
@@ -127,7 +127,7 @@ fn test_reveal_timelock_no_state_mutation() {
     });
 
     // Attempt reveal too early.
-    let _ = client.try_reveal(&player, &secret(&env, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+    let _ = client.try_reveal(&player, &secret(&env, &BytesN::from_array(&env, &[0u8; 64])));
 
     let after: GameState = env.as_contract(&contract_id, || {
         CoinflipContract::load_player_game(&env, &player).unwrap()
@@ -151,7 +151,7 @@ fn test_reveal_timelock_no_stats_mutation() {
         CoinflipContract::load_stats(&env)
     });
 
-    let _ = client.try_reveal(&player, &secret(&env, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+    let _ = client.try_reveal(&player, &secret(&env, &BytesN::from_array(&env, &[0u8; 64])));
 
     let after: ContractStats = env.as_contract(&contract_id, || {
         CoinflipContract::load_stats(&env)
@@ -186,5 +186,5 @@ fn test_reveal_window_is_non_empty() {
 
     // At MIN_REVEAL_DELAY_LEDGERS: reveal succeeds, reclaim is too early.
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    assert!(client.try_reveal(&player, &secret(&env, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]))).is_ok());
+    assert!(client.try_reveal(&player, &secret(&env, &BytesN::from_array(&env, &[0u8; 64]))).is_ok());
 }

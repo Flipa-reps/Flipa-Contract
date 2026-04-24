@@ -12,7 +12,7 @@ fn setup(env: &Env) -> (Address, CoinflipContractClient) {
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
     let token = Address::generate(env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (contract_id, client)
 }
 
@@ -98,7 +98,7 @@ fn test_continue_streak_accumulates_and_mixes_entropy() {
     client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    assert_eq!(client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), true);
+    assert_eq!(client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), true);
 
     let before = load_entropy(&env, &contract_id);
     env.ledger().with_mut(|l| l.sequence_number += 1);
@@ -180,7 +180,7 @@ fn test_same_sequence_different_pool_yields_different_random() {
     let admin_a = Address::generate(&env);
     let treasury_a = Address::generate(&env);
     let token_a = Address::generate(&env);
-    client_a.initialize(&admin_a, &treasury_a, &token_a, &300, &1_000_000, &100_000_000);
+    client_a.initialize(&admin_a, &treasury_a, &token_a, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     fund(&env, &cid_a, 1_000_000_000);
 
     // Contract B: two games started before the game we care about.
@@ -189,7 +189,7 @@ fn test_same_sequence_different_pool_yields_different_random() {
     let admin_b = Address::generate(&env);
     let treasury_b = Address::generate(&env);
     let token_b = Address::generate(&env);
-    client_b.initialize(&admin_b, &treasury_b, &token_b, &300, &1_000_000, &100_000_000);
+    client_b.initialize(&admin_b, &treasury_b, &token_b, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     fund(&env, &cid_b, 1_000_000_000);
 
     // Warm up contract B's pool with an extra game.
@@ -299,7 +299,7 @@ fn test_mix_count_increments_on_continue_streak() {
     client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    assert_eq!(client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), true);
+    assert_eq!(client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), true);
 
     let before = load_stats(&env, &contract_id).mix_count;
     env.ledger().with_mut(|l| l.sequence_number += 1);
