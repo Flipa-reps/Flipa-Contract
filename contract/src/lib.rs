@@ -1637,6 +1637,9 @@ mod statistics_tests;
 mod admin_security_tests;
 
 #[cfg(test)]
+mod reveal_validation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
