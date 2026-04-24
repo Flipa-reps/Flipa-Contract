@@ -987,6 +987,7 @@ impl CoinflipContract {
         side: Side,
         wager: i128,
         commitment: BytesN<32>,
+        referrer: Option<Address>,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -1044,6 +1045,19 @@ impl CoinflipContract {
         };
 
         Self::save_player_game(&env, &player, &game);
+
+        // Track referral if provided
+        if let Some(ref referrer_addr) = referrer {
+            if referrer_addr != &player {
+                let mut referrer_stats = Self::load_referral_stats(&env, referrer_addr);
+                referrer_stats.referrals_count = referrer_stats.referrals_count.saturating_add(1);
+                Self::save_referral_stats(&env, referrer_addr, &referrer_stats);
+                
+                let mut player_stats = Self::load_referral_stats(&env, &player);
+                player_stats.referrer = Some(referrer_addr.clone());
+                Self::save_referral_stats(&env, &player, &player_stats);
+            }
+        }
 
         // Update global statistics to reflect a new active game creation.
         let mut stats = stats;
@@ -1262,6 +1276,22 @@ impl CoinflipContract {
         Self::save_player_leaderboard_stats(&env, &player, &player_stats);
         Self::update_leaderboard(&env, &player, &player_stats);
 
+        // Calculate and distribute referral rewards
+        let referral_reward = calculate_referral_reward(game.wager).unwrap_or(0);
+        let player_referral_stats = Self::load_referral_stats(&env, &player);
+        let mut referral_payout = 0i128;
+        
+        if let Some(referrer) = player_referral_stats.referrer {
+            if referral_reward > 0 {
+                referral_payout = referral_reward;
+                let mut referrer_stats = Self::load_referral_stats(&env, &referrer);
+                referrer_stats.total_referral_rewards = referrer_stats.total_referral_rewards
+                    .checked_add(referral_reward)
+                    .unwrap_or(referrer_stats.total_referral_rewards);
+                Self::save_referral_stats(&env, &referrer, &referrer_stats);
+            }
+        }
+
         // Mark game completed before transfers for the same reason.
         game.phase = GamePhase::Completed;
         Self::save_player_game(&env, &player, &game);
@@ -1275,6 +1305,13 @@ impl CoinflipContract {
         // Transfer jackpot payout if applicable
         if jackpot_payout > 0 {
             token_client.transfer(&env.current_contract_address(), &player, &jackpot_payout);
+        }
+        
+        // Transfer referral reward if applicable
+        if referral_payout > 0 {
+            if let Some(referrer) = player_referral_stats.referrer {
+                token_client.transfer(&env.current_contract_address(), &referrer, &referral_payout);
+            }
         }
 
         Ok(())
