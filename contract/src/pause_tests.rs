@@ -178,6 +178,7 @@ fn test_reveal_succeeds_when_paused() {
     client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
     client.set_paused(&admin, &true);
     // reveal must still work
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let result = client.try_reveal(&player, &secret);
     assert_eq!(result, Ok(true));
     let game = env.as_contract(&contract_id, || {
@@ -269,6 +270,7 @@ fn test_full_game_lifecycle_while_paused() {
     client.set_paused(&admin, &true);
 
     // Reveal while paused
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     assert!(won);
 
@@ -290,6 +292,7 @@ fn test_full_game_lifecycle_while_paused() {
     env.as_contract(&contract_id, || {
         CoinflipContract::save_player_game(&env, &player, &g);
     });
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won2 = client.reveal(&player, &secret2);
     assert!(won2);
 
@@ -472,6 +475,7 @@ fn test_reveal_succeeds_when_paused_existing_game() {
     client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
     client.set_paused(&admin, &true);
     
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let result = client.try_reveal(&player, &secret);
     assert!(result.is_ok(), "reveal should succeed when paused");
     
@@ -651,6 +655,7 @@ fn test_full_game_lifecycle_with_pause_unpause_cycles() {
     client.set_paused(&admin, &true);
     
     // Reveal while paused
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     assert!(won);
     

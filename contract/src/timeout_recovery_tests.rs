@@ -257,6 +257,7 @@ fn test_reveal_before_timeout_prevents_reclaim() {
     let commitment = make_commitment(&env, 1);
     client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
     // Reveal before timeout
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player, &secret);
     // Advance past timeout
     advance_ledger(&env, TIMEOUT + 10);

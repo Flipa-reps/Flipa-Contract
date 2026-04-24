@@ -110,6 +110,7 @@ fn reveal_win_increments_streak_from_zero() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 0);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if won {
         assert_eq!(streak_of(&env, &contract_id, &player), 1);
@@ -125,6 +126,7 @@ fn reveal_win_increments_streak_by_exactly_one() {
         let player = Address::generate(&env);
         inject(&env, &contract_id, &player, GamePhase::Committed, initial);
         let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
         let won = client.reveal(&player, &secret);
         if won {
             assert_eq!(
@@ -145,6 +147,7 @@ fn reveal_win_increments_streak_past_tier_cap() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 4);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if won {
         assert_eq!(streak_of(&env, &contract_id, &player), 5);
@@ -190,6 +193,7 @@ fn loss_deletes_game_no_streak_survives() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 3);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if !won {
         // Game must be gone — no streak to read
@@ -208,6 +212,7 @@ fn new_game_after_loss_starts_at_streak_zero() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 5);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if !won {
         // Start a fresh game — must begin at streak 0
@@ -233,6 +238,7 @@ fn ten_consecutive_wins_reach_streak_ten() {
     // the current streak so the commitment always matches the known secret.
     while wins < 10 {
         inject(&env, &contract_id, &player, GamePhase::Committed, streak);
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
         let won = client.reveal(&player, &secret);
         if won {
             streak += 1;
@@ -253,6 +259,7 @@ fn streak_boundary_zero_win_reaches_tier_1() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 0);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if won {
         let s = streak_of(&env, &contract_id, &player);
@@ -269,6 +276,7 @@ fn streak_boundary_three_win_reaches_cap() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 3);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if won {
         let s = streak_of(&env, &contract_id, &player);
@@ -286,6 +294,7 @@ fn streak_boundary_above_cap_multiplier_stays_capped() {
         let player = Address::generate(&env);
         inject(&env, &contract_id, &player, GamePhase::Committed, initial);
         let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
         let won = client.reveal(&player, &secret);
         if won {
             let s = streak_of(&env, &contract_id, &player);
@@ -308,6 +317,7 @@ fn streak_never_decreases_after_win() {
     let mut prev = 0u32;
     for initial in [0u32, 1, 2, 3, 4] {
         inject(&env, &contract_id, &player, GamePhase::Committed, initial);
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
         let won = client.reveal(&player, &secret);
         if won {
             let current = streak_of(&env, &contract_id, &player);
