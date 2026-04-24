@@ -59,6 +59,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Ad
 /// | 40   | `TransferFailed`             | Transfer       | `claim_winnings`                   |
 /// | 50   | `AdminTreasuryConflict`      | Initialization | `initialize`                       |
 /// | 51   | `AlreadyInitialized`         | Initialization | `initialize`                       |
+/// | 60   | `RevealTooEarly`             | Front-running  | `reveal`                           |
 pub mod error_codes {
     // Game creation errors (1–5)
     pub const WAGER_BELOW_MINIMUM: u32 = 1;
@@ -91,8 +92,12 @@ pub mod error_codes {
     pub const ADMIN_TREASURY_CONFLICT: u32 = 50;
     pub const ALREADY_INITIALIZED: u32 = 51;
 
+    // Front-running protection (60)
+    /// Reveal attempted in the same ledger as game start; must wait at least one ledger.
+    pub const REVEAL_TOO_EARLY: u32 = 60;
+
     /// Total number of defined error variants.
-    pub const VARIANT_COUNT: usize = 18;
+    pub const VARIANT_COUNT: usize = 19;
 }
 
 /// Error codes for the coinflip contract.
@@ -216,6 +221,23 @@ pub enum Error {
     /// Returned by: `initialize`.
     /// Code: 51 — see [`error_codes::ALREADY_INITIALIZED`]
     AlreadyInitialized = 51,
+
+    // ── Front-running protection (60) ───────────────────────────────────────
+
+    /// Reveal was attempted in the same ledger as `start_game` (or `continue_streak`).
+    ///
+    /// `contract_random = SHA-256(ledger_sequence)` is fixed per ledger.  If a
+    /// player could submit `start_game` and `reveal` in the same ledger they
+    /// could observe the ledger sequence before it closes, pre-compute the
+    /// outcome, and only submit the reveal when it is favourable.
+    ///
+    /// Requiring at least one ledger between commitment and reveal closes this
+    /// window: by the time the reveal ledger is being built, `contract_random`
+    /// is already immutably committed on-chain.
+    ///
+    /// Returned by: `reveal`.
+    /// Code: 60 — see [`error_codes::REVEAL_TOO_EARLY`]
+    RevealTooEarly = 60,
 }
 
 /// The player's chosen side for a coinflip.
@@ -427,6 +449,15 @@ const TTL_EXTEND_TO: u32 = 500_000;
 /// Number of ledgers a player has to call `reveal` before the wager can be
 /// reclaimed via `reclaim_wager`.  At ~5 s/ledger this is roughly 8 minutes.
 const REVEAL_TIMEOUT_LEDGERS: u32 = 100;
+
+/// Minimum ledger gap between `start_game` (or `continue_streak`) and `reveal`.
+///
+/// Prevents same-ledger front-running: if both transactions land in the same
+/// ledger, the player could have observed `ledger_sequence` before it closed
+/// and crafted a secret that produces a winning outcome.  Requiring the reveal
+/// to be in a strictly later ledger ensures `contract_random` is already
+/// immutably committed before the reveal is submitted.
+const MIN_REVEAL_DELAY: u32 = 1;
 
 /// Returns the gross payout multiplier (in basis points, 10_000 = 1x)
 /// for the given win `streak` level.
@@ -1094,6 +1125,15 @@ impl CoinflipContract {
             return Err(Error::CommitmentMismatch);
         }
 
+        // Guard 4: reveal must be in a strictly later ledger than start_game.
+        // contract_random = SHA-256(ledger_sequence) is fixed per ledger.  A
+        // player who submits start_game and reveal in the same ledger could
+        // observe the sequence before the ledger closes and pre-compute a
+        // winning secret.  This guard closes that window.
+        if env.ledger().sequence() <= game.start_ledger {
+            return Err(Error::RevealTooEarly);
+        }
+
         // Determine outcome by combining player secret + contract random
         let outcome = generate_outcome(&env, &secret, &game.contract_random);
 
@@ -1432,6 +1472,8 @@ impl CoinflipContract {
         game.phase = GamePhase::Committed;
         game.commitment = new_commitment;
         game.contract_random = contract_random.into();
+        // Refresh start_ledger so the RevealTooEarly guard applies to the next reveal.
+        game.start_ledger = env.ledger().sequence();
 
         Self::save_player_game(&env, &player, &game);
 
@@ -2052,6 +2094,7 @@ mod tests {
         assert_eq!(Error::TransferFailed as u32, 40);
         assert_eq!(Error::AdminTreasuryConflict as u32, 50);
         assert_eq!(Error::AlreadyInitialized as u32, 51);
+        assert_eq!(Error::RevealTooEarly as u32, 60);
     }
 
     #[test]
@@ -2983,6 +3026,7 @@ mod tests {
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
         client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         assert_eq!(client.try_reveal(&player, &secret), Ok(true));
 
         // Fee changes after reveal must not alter this game's payout terms.
@@ -3008,6 +3052,7 @@ mod tests {
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
         client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         assert_eq!(client.try_reveal(&player, &secret), Ok(true));
 
         let expected = calculate_payout(10_000_000, 1, 500).unwrap();
@@ -4042,6 +4087,7 @@ mod property_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &Side::Heads, &wager, &commitment);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             prop_assert_eq!(client.try_reveal(&player, &secret), Ok(true));
 
             let revealed: GameState = env.as_contract(&contract_id, || {
@@ -4094,6 +4140,7 @@ mod property_tests {
             let secret_one = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment_one: BytesN<32> = env.crypto().sha256(&secret_one).into();
             client.start_game(&player_one, &Side::Heads, &wager, &commitment_one);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             prop_assert_eq!(client.try_reveal(&player_one, &secret_one), Ok(true));
 
             // Admin updates fee; this must only affect newly created games.
@@ -4395,6 +4442,7 @@ mod property_tests {
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
         client.start_game(&player, &Side::Heads, &wager, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &secret);
 
         (admin, treasury, token, contract_id, player)
@@ -4517,6 +4565,7 @@ mod property_tests {
             let secret2 = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment2: BytesN<32> = env.crypto().sha256(&secret2).into();
             client.start_game(&player2, &Side::Heads, &wager2, &commitment2);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player2, &secret2);
 
             // Record initial balances
@@ -4629,6 +4678,7 @@ mod property_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &Side::Heads, &wager, &commitment);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &secret);
 
             let pre_stats: ContractStats = env.as_contract(&contract_id, || {
@@ -5420,6 +5470,7 @@ mod property_tests {
             prop_assert_eq!(Error::TransferFailed as u32, error_codes::TRANSFER_FAILED);
             prop_assert_eq!(Error::AdminTreasuryConflict as u32, error_codes::ADMIN_TREASURY_CONFLICT);
             prop_assert_eq!(Error::AlreadyInitialized as u32, error_codes::ALREADY_INITIALIZED);
+            prop_assert_eq!(Error::RevealTooEarly as u32, error_codes::REVEAL_TOO_EARLY);
         }
 
         /// VARIANT_COUNT must exactly match the number of Error enum variants.
@@ -5427,7 +5478,7 @@ mod property_tests {
         fn prop_variant_count_is_accurate(_dummy in 0u32..100u32) {
             // All 18 variants enumerated — if a new variant is added without
             // updating VARIANT_COUNT, this list will need to grow.
-            let all_codes: [u32; 18] = [
+            let all_codes: [u32; 19] = [
                 error_codes::WAGER_BELOW_MINIMUM,
                 error_codes::WAGER_ABOVE_MAXIMUM,
                 error_codes::ACTIVE_GAME_EXISTS,
@@ -5446,6 +5497,7 @@ mod property_tests {
                 error_codes::TRANSFER_FAILED,
                 error_codes::ADMIN_TREASURY_CONFLICT,
                 error_codes::ALREADY_INITIALIZED,
+                error_codes::REVEAL_TOO_EARLY,
             ];
             prop_assert_eq!(all_codes.len(), error_codes::VARIANT_COUNT);
         }
@@ -5919,6 +5971,128 @@ mod outcome_proof_property_tests {
 //   total_fees_after == total_fees_before + Σ fee_i
 //   where fee_i = floor(gross_i * fee_bps_i / 10_000)
 //   and   gross_i = floor(wager_i * multiplier(streak_i) / 10_000)
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: anti-front-running protection
+// Module:  anti_frontrunning_tests
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod anti_frontrunning_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    fn setup(env: &Env) -> (soroban_sdk::Address, CoinflipContractClient) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = Address::generate(env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = i128::MAX / 2;
+            CoinflipContract::save_stats(env, &stats);
+        });
+        (contract_id, client)
+    }
+
+    fn strong_commitment(env: &Env, seed: u8) -> (Bytes, BytesN<32>) {
+        let secret = Bytes::from_slice(env, &[seed; 32]);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        (secret, commitment)
+    }
+
+    // ── Same-ledger reveal is rejected ───────────────────────────────────────
+
+    #[test]
+    fn test_reveal_same_ledger_as_start_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let player = Address::generate(&env);
+        let (secret, commitment) = strong_commitment(&env, 1);
+
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+        // No ledger advance — same ledger as start_game
+        let result = client.try_reveal(&player, &secret);
+        assert_eq!(result, Err(Ok(Error::RevealTooEarly)));
+    }
+
+    #[test]
+    fn test_reveal_next_ledger_succeeds() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let player = Address::generate(&env);
+        let (secret, commitment) = strong_commitment(&env, 1);
+
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
+        // One ledger later — must succeed
+        assert!(client.try_reveal(&player, &secret).is_ok());
+    }
+
+    #[test]
+    fn test_reveal_many_ledgers_later_succeeds() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let player = Address::generate(&env);
+        let (secret, commitment) = strong_commitment(&env, 1);
+
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += 50);
+        assert!(client.try_reveal(&player, &secret).is_ok());
+    }
+
+    // ── continue_streak refreshes start_ledger ───────────────────────────────
+
+    #[test]
+    fn test_reveal_after_continue_same_ledger_rejected() {
+        let env = Env::default();
+        let (contract_id, client) = setup(&env);
+        let player = Address::generate(&env);
+        let (secret1, commitment1) = strong_commitment(&env, 1);
+
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment1);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
+        client.reveal(&player, &secret1); // win
+
+        // continue_streak in ledger N
+        let (_, commitment2) = strong_commitment(&env, 2);
+        client.continue_streak(&player, &commitment2);
+
+        // Reveal in the same ledger as continue_streak — must be rejected
+        let secret2 = Bytes::from_slice(&env, &[2u8; 32]);
+        let result = client.try_reveal(&player, &secret2);
+        assert_eq!(result, Err(Ok(Error::RevealTooEarly)));
+    }
+
+    #[test]
+    fn test_reveal_after_continue_next_ledger_succeeds() {
+        let env = Env::default();
+        let (contract_id, client) = setup(&env);
+        let player = Address::generate(&env);
+        let (secret1, commitment1) = strong_commitment(&env, 1);
+
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment1);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
+        client.reveal(&player, &secret1); // win
+
+        let (_, commitment2) = strong_commitment(&env, 2);
+        client.continue_streak(&player, &commitment2);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
+
+        let secret2 = Bytes::from_slice(&env, &[2u8; 32]);
+        assert!(client.try_reveal(&player, &secret2).is_ok());
+    }
+
+    // ── Error code stability ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_reveal_too_early_error_code() {
+        assert_eq!(Error::RevealTooEarly as u32, error_codes::REVEAL_TOO_EARLY);
+        assert_eq!(error_codes::REVEAL_TOO_EARLY, 60);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Feature: randomness audit trail
 // Module:  randomness_audit_trail_tests
@@ -7283,6 +7457,7 @@ mod loss_forfeiture_tests {
             client.start_game(&player, &side, &wager, &commitment);
 
             // LF-1: must return false
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             let result = client.reveal(&player, &secret);
             prop_assert!(!result, "reveal must return false on a loss");
 
@@ -7323,6 +7498,7 @@ mod loss_forfeiture_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &side, &wager, &commitment);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &secret);
 
             let reserves_after: i128 = env.as_contract(&contract_id, || {
@@ -7359,6 +7535,7 @@ mod loss_forfeiture_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &side, &wager, &commitment);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &secret);
 
             // LF-4: new game must be accepted
@@ -7401,6 +7578,7 @@ mod loss_forfeiture_tests {
             let secret_h = loss_secret_for_side(&env_h, &Side::Heads);
             let commitment_h: BytesN<32> = env_h.crypto().sha256(&secret_h).into();
             client_h.start_game(&player_h, &Side::Heads, &wager, &commitment_h);
+            env_h.ledger().with_mut(|l| l.sequence_number += 1);
             client_h.reveal(&player_h, &secret_h);
             let delta_h = env_h.as_contract(&contract_id_h, || {
                 CoinflipContract::load_stats(&env_h).reserve_balance
@@ -7416,6 +7594,7 @@ mod loss_forfeiture_tests {
             let secret_t = loss_secret_for_side(&env_t, &Side::Tails);
             let commitment_t: BytesN<32> = env_t.crypto().sha256(&secret_t).into();
             client_t.start_game(&player_t, &Side::Tails, &wager, &commitment_t);
+            env_t.ledger().with_mut(|l| l.sequence_number += 1);
             client_t.reveal(&player_t, &secret_t);
             let delta_t = env_t.as_contract(&contract_id_t, || {
                 CoinflipContract::load_stats(&env_t).reserve_balance
@@ -7735,6 +7914,7 @@ mod reserve_solvency_tests {
         let commitment = env.crypto().sha256(&secret).into();
         
         client.start_game(&player, &Side::Heads, &wager, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &secret);
         
         // Now game is in Revealed (streak 1). Next streak is 2. Multiplier for 2 is 3.5x.
@@ -7842,6 +8022,7 @@ mod reserve_balance_accuracy_tests {
 
             client.start_game(&player, &Side::Heads, &wager, &commitment);
             let before = reserve(&env, &id);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &secret);
             let after = reserve(&env, &id);
 
@@ -7865,6 +8046,7 @@ mod reserve_balance_accuracy_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &Side::Heads, &wager, &commitment);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &secret);
             // streak = 1 after win
             let gross = wager.checked_mul(get_multiplier(1) as i128) / 10_000;
@@ -7913,6 +8095,7 @@ mod reserve_balance_accuracy_tests {
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
             client.start_game(&player, &Side::Heads, &wager, &commitment);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &secret);
             client.cash_out(&player);
 
@@ -7939,12 +8122,14 @@ mod reserve_balance_accuracy_tests {
             let loss_sec = loss_secret(&env);
             let loss_com: BytesN<32> = env.crypto().sha256(&loss_sec).into();
             client.start_game(&p_loss, &Side::Heads, &wager, &loss_com);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&p_loss, &loss_sec);
 
             // Win game
             let win_sec = win_secret(&env);
             let win_com: BytesN<32> = env.crypto().sha256(&win_sec).into();
             client.start_game(&p_win, &Side::Heads, &wager, &win_com);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&p_win, &win_sec);
             let gross_win = wager.checked_mul(get_multiplier(1) as i128) / 10_000;
 
@@ -8021,6 +8206,7 @@ mod reserve_balance_accuracy_tests {
             let secret = loss_secret(&env);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
             client.start_game(&player, &Side::Heads, &wager, &commitment);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &secret);
         }
 
@@ -8071,6 +8257,7 @@ mod concurrency_edge_case_tests {
 
         // Game 1: start -> reveal (win) -> cash_out (no real token needed)
         client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &secret);
         client.cash_out(&player);
 
@@ -8092,6 +8279,7 @@ mod concurrency_edge_case_tests {
 
         // Game 1: start -> reveal (win) -> cash_out
         client.start_game(&player, &Side::Heads, &min_wager, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &secret);
         let payout = client.try_cash_out(&player);
         assert!(payout.is_ok());
@@ -8115,6 +8303,7 @@ mod concurrency_edge_case_tests {
         client.start_game(&player, &Side::Heads, &min_wager, &commitment);
 
         // First reveal succeeds
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &secret);
 
         // Second reveal fails with InvalidPhase because game moved to Revealed phase
@@ -8355,7 +8544,11 @@ mod integration_tests {
         ) -> bool {
             let commitment = self.make_commitment(seed);
             self.client.start_game(player, &side, &wager, &commitment);
+            // Advance one ledger so reveal is in a strictly later ledger than
+            // start_game (anti-front-running guard).
+            self.env.ledger().with_mut(|l| l.sequence_number += 1);
             let secret = self.make_secret(seed);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             self.client.reveal(player, &secret)
         }
 
@@ -8442,6 +8635,7 @@ mod integration_tests {
         h.client.continue_streak(&player, &new_commitment);
         assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
         let secret2 = h.make_secret(1);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         let won2 = h.client.reveal(&player, &secret2);
         assert!(won2, "round 2 must win");
         assert_eq!(h.game_state(&player).streak, 2);
@@ -8464,6 +8658,7 @@ mod integration_tests {
                 let commitment = h.make_commitment(1);
                 h.client.continue_streak(&player, &commitment);
                 let secret = h.make_secret(1);
+                env.ledger().with_mut(|l| l.sequence_number += 1);
                 let won = h.client.reveal(&player, &secret);
                 assert!(won, "round {} must win", expected_streak);
             }
@@ -8539,6 +8734,7 @@ mod integration_tests {
         let player = h.player();
         h.fund(1_000_000_000);
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         let result = h.client.reveal(&player, &h.make_secret(1));
         assert!(result, "seed 1 + Heads must win");
         let game = h.game_state(&player);
@@ -8554,6 +8750,7 @@ mod integration_tests {
         h.fund(1_000_000_000);
         let reserve_before = h.stats().reserve_balance;
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(3));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         let result = h.client.reveal(&player, &h.make_secret(3));
         assert!(!result, "seed 3 + Heads must lose");
         // Game state must be gone.
@@ -8586,6 +8783,7 @@ mod integration_tests {
         h.fund(1_000_000_000);
         // Win to reach Revealed phase.
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         h.client.reveal(&player, &h.make_secret(1));
         assert_eq!(h.game_state(&player).phase, GamePhase::Revealed);
         // Second reveal must be rejected.
@@ -8609,6 +8807,7 @@ mod integration_tests {
         let player = h.player();
         h.fund(1_000_000_000);
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(3));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         h.client.reveal(&player, &h.make_secret(3)); // loss
         let result = h.client.try_start_game(
             &player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1),
@@ -8629,6 +8828,7 @@ mod integration_tests {
         let contract_random = h.game_state(&player).contract_random;
         let secret = h.make_secret(seed);
         let expected_side = generate_outcome(&h.env, &secret, &contract_random);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         let won = h.client.reveal(&player, &secret);
         assert_eq!(won, expected_side == Side::Heads,
             "reveal result must match generate_outcome prediction");
@@ -8723,6 +8923,7 @@ mod integration_tests {
         let commitment = h.make_commitment(1);
         h.client.start_game(&player, &predicted, &DEFAULT_WAGER, &commitment);
         let secret = h.make_secret(1);
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         let won = h.client.reveal(&player, &secret);
         assert!(won, "probe_outcome prediction must match actual reveal outcome");
     }
@@ -9428,6 +9629,7 @@ mod state_transition_tests {
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Committed, 0, wager);
             let secret = st_secret(&env, 1);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             if client.reveal(&player, &secret) {
                 let g = st_game(&env, &contract_id, &player);
                 prop_assert_eq!(g.phase, GamePhase::Revealed);
@@ -9444,6 +9646,7 @@ mod state_transition_tests {
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Committed, 0, wager);
             let secret = st_secret(&env, 3);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             if !client.reveal(&player, &secret) {
                 prop_assert!(st_game(&env, &contract_id, &player).is_none(),
                     "game must be deleted after loss");
@@ -9615,6 +9818,7 @@ mod state_transition_tests {
             st_fund(&env, &contract_id, 1_000_000_000);
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Committed, initial_streak, wager);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             if client.reveal(&player, &st_secret(&env, 1)) {
                 let g = st_game(&env, &contract_id, &player);
                 prop_assert!(g.streak > initial_streak,
@@ -10093,6 +10297,7 @@ mod stress_tests {
             let seed = if i % 2 == 0 { 1u8 } else { 3u8 };
             let commit = str_commit(&env, seed);
             client.start_game(&player, &Side::Heads, &5_000_000, &commit);
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             let won = client.reveal(&player, &str_secret(&env, seed));
             if won { client.cash_out(&player); }
         }
@@ -10233,6 +10438,7 @@ mod game_history_tests {
         let player = Address::generate(&env);
         // seed 3 → Tails outcome → loss for Heads player
         client.start_game(&player, &Side::Heads, &10_000_000, &hist_commit(&env, 3));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &hist_secret(&env, 3));
 
         let history = hist_history(&env, &contract_id, &player);
@@ -10253,6 +10459,7 @@ mod game_history_tests {
         let player = Address::generate(&env);
         // seed 1 → Heads outcome → win for Heads player
         client.start_game(&player, &Side::Heads, &10_000_000, &hist_commit(&env, 1));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &hist_secret(&env, 1));
         let payout = client.cash_out(&player);
 
@@ -10274,11 +10481,13 @@ mod game_history_tests {
 
         // Game 1: win
         client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 1));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &hist_secret(&env, 1));
         client.cash_out(&player);
 
         // Game 2: loss
         client.start_game(&player, &Side::Heads, &3_000_000, &hist_commit(&env, 3));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &hist_secret(&env, 3));
 
         let history = hist_history(&env, &contract_id, &player);
@@ -10298,6 +10507,7 @@ mod game_history_tests {
 
         for _ in 0..101 {
             client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &hist_secret(&env, 3));
         }
 
@@ -10317,6 +10527,7 @@ mod game_history_tests {
         // Create 5 loss entries.
         for _ in 0..5 {
             client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &hist_secret(&env, 3));
         }
 
@@ -10351,6 +10562,7 @@ mod game_history_tests {
 
         for _ in 0..30 {
             client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+            env.ledger().with_mut(|l| l.sequence_number += 1);
             client.reveal(&player, &hist_secret(&env, 3));
         }
 
@@ -10367,6 +10579,7 @@ mod game_history_tests {
         hist_fund(&env, &contract_id, 1_000_000_000);
         let player = Address::generate(&env);
         client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 3));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &hist_secret(&env, 3));
 
         let result = client.verify_past_game(&player, &0);
@@ -10380,6 +10593,7 @@ mod game_history_tests {
         hist_fund(&env, &contract_id, 1_000_000_000);
         let player = Address::generate(&env);
         client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 1));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &hist_secret(&env, 1));
         client.cash_out(&player);
 
@@ -10404,6 +10618,7 @@ mod game_history_tests {
         hist_fund(&env, &contract_id, 1_000_000_000);
         let player = Address::generate(&env);
         client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 3));
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &hist_secret(&env, 3));
 
         let result = client.try_verify_past_game(&player, &99);
@@ -10424,6 +10639,7 @@ mod game_history_tests {
         let contract_random = env.as_contract(&contract_id, || {
             CoinflipContract::load_player_game(&env, &player).unwrap().unwrap().contract_random
         });
+        env.ledger().with_mut(|l| l.sequence_number += 1);
         client.reveal(&player, &hist_secret(&env, 3));
 
         let entry = hist_history(&env, &contract_id, &player).get(0).unwrap();
@@ -10445,6 +10661,7 @@ mod game_history_tests {
             let player = Address::generate(&env);
             for _ in 0..n_games {
                 client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+                env.ledger().with_mut(|l| l.sequence_number += 1);
                 client.reveal(&player, &hist_secret(&env, 3));
             }
             let len = hist_history(&env, &contract_id, &player).len();
@@ -10462,6 +10679,7 @@ mod game_history_tests {
             let player = Address::generate(&env);
             for _ in 0..n_games {
                 client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+                env.ledger().with_mut(|l| l.sequence_number += 1);
                 client.reveal(&player, &hist_secret(&env, 3));
             }
             let result = client.get_game_history(&player, &offset, &10);
@@ -10476,6 +10694,7 @@ mod game_history_tests {
             let player = Address::generate(&env);
             for _ in 0..n_games {
                 client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3));
+                env.ledger().with_mut(|l| l.sequence_number += 1);
                 client.reveal(&player, &hist_secret(&env, 3));
             }
             let history = hist_history(&env, &contract_id, &player);
