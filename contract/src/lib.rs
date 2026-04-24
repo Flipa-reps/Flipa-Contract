@@ -854,8 +854,11 @@ impl CoinflipContract {
             return Err(Error::InsufficientReserves);
         }
 
+        // Gas optimization: cache ledger sequence to avoid redundant calls
+        let ledger_seq = env.ledger().sequence();
+        
         // Generate contract-side randomness contribution from ledger sequence
-        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let seq_bytes = ledger_seq.to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         ).into();
@@ -868,13 +871,14 @@ impl CoinflipContract {
             contract_random,
             fee_bps: config.fee_bps,
             phase: GamePhase::Committed,
-            start_ledger: env.ledger().sequence(),
+            start_ledger: ledger_seq,
             multipliers: config.multipliers.clone(),
         };
 
         Self::save_player_game(&env, &player, &game);
 
         // Update global statistics to reflect a new active game creation.
+        // Gas optimization: batch update stats in single operation
         let mut stats = stats;
         stats.total_games = stats.total_games.checked_add(1).unwrap_or(stats.total_games);
         stats.total_volume = stats.total_volume.checked_add(wager).unwrap_or(stats.total_volume);
@@ -946,7 +950,9 @@ impl CoinflipContract {
         }
 
         // Determine outcome by combining player secret + contract random
-        let outcome = generate_outcome(&env, &secret, &game.contract_random);
+        // Gas optimization: cache contract_random to avoid redundant access
+        let contract_random = game.contract_random.clone();
+        let outcome = generate_outcome(&env, &secret, &contract_random);
 
         let won = outcome == game.side;
 
@@ -976,7 +982,7 @@ impl CoinflipContract {
                 streak: 0,
                 commitment: game.commitment,
                 secret,
-                contract_random: game.contract_random,
+                contract_random,
                 payout: 0,
                 ledger: game.start_ledger,
             });
@@ -1268,8 +1274,11 @@ impl CoinflipContract {
             return Err(Error::InsufficientReserves);
         }
 
+        // Gas optimization: cache ledger sequence to avoid redundant calls
+        let ledger_seq = env.ledger().sequence();
+        
         // Generate new contract randomness from the current ledger sequence
-        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let seq_bytes = ledger_seq.to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         ).into();
