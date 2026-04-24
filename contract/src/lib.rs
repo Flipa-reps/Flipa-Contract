@@ -1637,6 +1637,15 @@ mod statistics_tests;
 mod admin_security_tests;
 
 #[cfg(test)]
+mod observability_tests;
+
+#[cfg(test)]
+mod upgrade_migration_tests;
+
+#[cfg(test)]
+mod security_validation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
