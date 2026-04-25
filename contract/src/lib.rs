@@ -342,6 +342,10 @@ pub enum StorageKey {
     Stats,
     /// Per-player game state ([`GameState`]), keyed by player address.
     PlayerGame(Address),
+    /// Per-player referrer address, keyed by player address.
+    PlayerReferrer(Address),
+    /// Per-referrer accumulated rewards, keyed by referrer address.
+    ReferrerRewards(Address),
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -610,6 +614,48 @@ impl CoinflipContract {
             .remove(&StorageKey::PlayerGame(player.clone()));
     }
 
+    /// Set a player's referrer address.
+    fn set_player_referrer(env: &Env, player: &Address, referrer: &Address) {
+        let key = StorageKey::PlayerReferrer(player.clone());
+        env.storage().persistent().set(&key, referrer);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Get a player's referrer address. Returns `None` if no referrer is set.
+    fn get_player_referrer(env: &Env, player: &Address) -> Option<Address> {
+        let key = StorageKey::PlayerReferrer(player.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.storage().persistent().get(&key)
+    }
+
+    /// Add referral rewards to a referrer's accumulated balance.
+    fn add_referrer_rewards(env: &Env, referrer: &Address, amount: i128) {
+        let key = StorageKey::ReferrerRewards(referrer.clone());
+        let current = env.storage().persistent().get::<_, i128>(&key).unwrap_or(0);
+        let new_balance = current.checked_add(amount).unwrap_or(current);
+        env.storage().persistent().set(&key, &new_balance);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Get a referrer's accumulated rewards.
+    fn get_referrer_rewards(env: &Env, referrer: &Address) -> i128 {
+        let key = StorageKey::ReferrerRewards(referrer.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Claim accumulated referral rewards.
+    fn claim_referrer_rewards(env: &Env, referrer: &Address) -> i128 {
+        let key = StorageKey::ReferrerRewards(referrer.clone());
+        let rewards = env.storage().persistent().get::<_, i128>(&key).unwrap_or(0);
+        env.storage().persistent().remove(&key);
+        rewards
+    }
+
     /// Begin a new coinflip game for `player`.
     ///
     /// Acceptance invariants:
@@ -663,6 +709,7 @@ impl CoinflipContract {
         side: Side,
         wager: i128,
         commitment: BytesN<32>,
+        referrer: Option<Address>,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -700,6 +747,11 @@ impl CoinflipContract {
             .ok_or(Error::InsufficientReserves)?;
         if stats.reserve_balance < max_payout {
             return Err(Error::InsufficientReserves);
+        }
+
+        // Track referrer if provided
+        if let Some(ref ref_addr) = referrer {
+            Self::set_player_referrer(&env, &player, ref_addr);
         }
 
         // Generate contract-side randomness contribution from ledger sequence
@@ -881,6 +933,17 @@ impl CoinflipContract {
         game.phase = GamePhase::Completed;
         Self::save_player_game(&env, &player, &game);
 
+        // Distribute referral rewards (1% of protocol fees)
+        if let Some(referrer) = Self::get_player_referrer(&env, &player) {
+            let referral_reward = fee_amount
+                .checked_mul(1)
+                .and_then(|v| v.checked_div(100))
+                .unwrap_or(0);
+            if referral_reward > 0 {
+                Self::add_referrer_rewards(&env, &referrer, referral_reward);
+            }
+        }
+
         // Transfer net payout to player
         token_client.transfer(&env.current_contract_address(), &player, &net_payout);
 
@@ -973,12 +1036,12 @@ impl CoinflipContract {
     /// | `wager`          | Unchanged — the original bet stays locked              |
     /// | `streak`         | Unchanged — incremented only by `reveal` on a win      |
     /// | `fee_bps`        | Unchanged — snapshot from game creation is honoured    |
+    /// | `side`           | Unchanged — player's chosen side carries over          |
     ///
     /// ### What is replaced
     ///
     /// | Field            | New value                                              |
     /// |------------------|--------------------------------------------------------|
-    /// | `side`           | `new_side` if provided, otherwise unchanged             |
     /// | `commitment`     | `new_commitment` supplied by the caller                |
     /// | `contract_random`| Fresh SHA-256 of the current ledger sequence number    |
     /// | `phase`          | `GamePhase::Committed`                                 |
@@ -1011,7 +1074,6 @@ impl CoinflipContract {
     /// 2. New contract randomness is derived from the current ledger sequence.
     /// 3. Game phase is reset to `Committed` with the fresh commitment and
     ///    randomness; the streak counter and wager are preserved.
-    /// 4. If `new_side` is provided, the player's side is updated for strategic gameplay.
     ///
     /// ## Errors
     ///
@@ -1026,7 +1088,6 @@ impl CoinflipContract {
         env: Env,
         player: Address,
         new_commitment: BytesN<32>,
-        new_side: Option<Side>,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -1075,11 +1136,6 @@ impl CoinflipContract {
         game.phase = GamePhase::Committed;
         game.commitment = new_commitment;
         game.contract_random = contract_random.into();
-        
-        // Allow optional side switching for strategic gameplay
-        if let Some(side) = new_side {
-            game.side = side;
-        }
 
         Self::save_player_game(&env, &player, &game);
 
@@ -1301,88 +1357,34 @@ impl CoinflipContract {
         Ok(game.wager)
     }
 
-    /// Partially cash out a percentage of winnings while continuing with the remainder.
+    /// Claim accumulated referral rewards.
     ///
-    /// Allows a player to secure a portion of their winnings while risking the
-    /// remaining amount on the next flip. The wager for the continued game is
-    /// reduced to the remaining amount.
+    /// Allows a referrer to withdraw their accumulated rewards from referred players' wins.
+    /// Referral rewards are calculated as 1% of the protocol fees collected from referred players.
     ///
     /// # Arguments
-    /// - `player`     – must authorize; must have an active game in `Revealed` phase
-    /// - `percentage` – percentage of winnings to cash out (1–99)
+    /// - `referrer` – must authorize; must have accumulated rewards
     ///
     /// # Returns
-    /// `Ok(cashed_out_amount)` — the net payout amount cashed out in stroops.
+    /// `Ok(rewards_amount)` — the total accumulated rewards in stroops.
     ///
-    /// # Guards (evaluated in order, no state mutation on failure)
-    /// 1. `NoActiveGame`                – no game record exists for `player`
-    /// 2. `InvalidPhase`                – game is not in `Revealed` phase
-    /// 3. `NoWinningsToClaimOrContinue` – `streak == 0` (player lost)
-    /// 4. `InvalidFeePercentage`        – percentage not in range [1, 99]
-    ///
-    /// # Process (on success)
-    /// 1. Calculate gross payout and fee for the full winnings.
-    /// 2. Calculate the partial net amount based on percentage.
-    /// 3. Deduct the cashed-out portion from reserves and add fee to total_fees.
-    /// 4. Update game wager to the remaining amount (net - cashed_out).
-    /// 5. Reset game to `Committed` phase with a fresh commitment and contract randomness.
-    /// 6. Return the cashed-out net amount.
-    pub fn partial_cash_out(
+    /// # Errors
+    /// - `TransferFailed` – token transfer fails
+    pub fn claim_referral_rewards(
         env: Env,
-        player: Address,
-        percentage: u32,
+        referrer: Address,
     ) -> Result<i128, Error> {
-        player.require_auth();
+        referrer.require_auth();
 
-        let mut game = Self::load_player_game(&env, &player)
-            .ok_or(Error::NoActiveGame)?;
-
-        if game.phase != GamePhase::Revealed {
-            return Err(Error::InvalidPhase);
-        }
-
-        if game.streak == 0 {
-            return Err(Error::NoWinningsToClaimOrContinue);
-        }
-
-        if percentage < 1 || percentage > 99 {
-            return Err(Error::InvalidFeePercentage);
-        }
-
-        let (gross, fee, net_payout) =
-            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
-                .ok_or(Error::InsufficientReserves)?;
-
-        let cashed_out = net_payout
-            .checked_mul(percentage as i128)
-            .and_then(|v| v.checked_div(100))
-            .ok_or(Error::InsufficientReserves)?;
-
-        let remaining = net_payout
-            .checked_sub(cashed_out)
-            .ok_or(Error::InsufficientReserves)?;
-
-        let mut stats = Self::load_stats(&env);
-        stats.reserve_balance = stats.reserve_balance
-            .checked_sub(cashed_out)
-            .ok_or(Error::InsufficientReserves)?;
-        stats.total_fees = stats.total_fees
-            .checked_add(fee)
-            .unwrap_or(stats.total_fees);
-        Self::save_stats(&env, &stats);
-
-        // Update game wager to remaining amount and reset to Committed phase
-        game.wager = remaining;
-        game.phase = GamePhase::Committed;
+        let rewards = Self::claim_referrer_rewards(&env, &referrer);
         
-        let seq_bytes = env.ledger().sequence().to_be_bytes();
-        game.contract_random = env.crypto().sha256(
-            &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
-        ).into();
+        if rewards > 0 {
+            let config = Self::load_config(&env);
+            let token_client = token::Client::new(&env, &config.token);
+            token_client.transfer(&env.current_contract_address(), &referrer, &rewards);
+        }
 
-        Self::save_player_game(&env, &player, &game);
-
-        Ok(cashed_out)
+        Ok(rewards)
     }
 }
 
