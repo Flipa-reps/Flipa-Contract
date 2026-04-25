@@ -468,6 +468,9 @@ pub struct ContractConfig {
     /// the signature with this key before accepting the proof.
     pub oracle_vrf_pk: BytesN<32>,
 }
+    /// Emergency shutdown flag; when `true`, new games and continues are blocked,
+    /// but reveals and cash-outs are allowed to complete in-flight games.
+    pub shutdown: bool,
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -1635,6 +1638,7 @@ impl CoinflipContract {
             min_reserve_threshold: 0,
             oracle_vrf_pk,
         };
+            shutdown: false,
         };
         
         let stats = ContractStats {
@@ -2048,6 +2052,8 @@ impl CoinflipContract {
 
         // Guard 1: contract must not be paused or in shutdown mode
         if config.paused {
+        // Guard 1: contract must not be paused or in shutdown
+        if config.paused || config.shutdown {
             return Err(Error::ContractPaused);
         }
         if config.shutdown_mode {
@@ -2794,6 +2800,13 @@ impl CoinflipContract {
         }
 
         // Guard 5: reserves must cover the next streak's worst-case payout.
+        // Guard 5: contract must not be in shutdown mode
+        let config = Self::load_config(&env);
+        if config.shutdown {
+            return Err(Error::ContractPaused); // Reusing error for shutdown
+        }
+
+        // Guard 6: reserves must cover the next streak's worst-case payout.
         // Config is not needed here — all required data (wager, streak) is in GameState.
         let stats = Self::load_stats(&env);
 
@@ -2879,6 +2892,32 @@ impl CoinflipContract {
             action: Symbol::new(&env, "set_paused"),
             admin,
         });
+
+        Ok(())
+    }
+
+    /// Enable or disable emergency shutdown mode (admin-only).
+    ///
+    /// Shutdown mode allows in-flight games to complete (reveal, cash_out)
+    /// while preventing new games (start_game) and streak continuations (continue_streak).
+    ///
+    /// # Arguments
+    /// - `admin` – must match `config.admin`
+    /// - `shutdown` – `true` to enable shutdown, `false` to disable
+    ///
+    /// # Returns
+    /// - `Ok(())` on success
+    /// - `Err(Unauthorized)` if caller is not admin
+    pub fn set_shutdown(env: Env, admin: Address, shutdown: bool) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        config.shutdown = shutdown;
+        Self::save_config(&env, &config);
 
         Ok(())
     }
