@@ -276,6 +276,9 @@ pub struct GameState {
     pub phase: GamePhase,
     /// Ledger sequence at game creation; used for timeout enforcement.
     pub start_ledger: u32,
+    /// Snapshotted multipliers for this game (in basis points).
+    /// [streak_1, streak_2, streak_3, streak_4_plus]
+    pub multipliers: [u32; 4],
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -301,6 +304,9 @@ pub struct ContractConfig {
     pub max_wager: i128,
     /// Emergency pause flag; when `true`, `start_game` is rejected.
     pub paused: bool,
+    /// Multipliers for each streak level in basis points.
+    /// [streak_1, streak_2, streak_3, streak_4_plus]
+    pub multipliers: [u32; 4],
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -432,6 +438,45 @@ pub fn get_multiplier(streak: u32) -> u32 {
         3 => MULTIPLIER_STREAK_3,
         _ => MULTIPLIER_STREAK_4_PLUS,
     }
+}
+
+/// Get multiplier from a multipliers array based on streak.
+///
+/// # Arguments
+/// - `multipliers` – array of 4 multipliers [streak_1, streak_2, streak_3, streak_4_plus]
+/// - `streak` – current win streak
+///
+/// # Returns
+/// The multiplier in basis points for the given streak.
+pub fn get_multiplier_from_array(multipliers: &[u32; 4], streak: u32) -> u32 {
+    match streak {
+        1 => multipliers[0],
+        2 => multipliers[1],
+        3 => multipliers[2],
+        _ => multipliers[3],
+    }
+}
+
+/// Calculates the full payout breakdown for a winning streak using custom multipliers.
+///
+/// Returns `(gross, fee, net)` in stroops, or `None` on arithmetic overflow.
+///
+/// # Arguments
+/// - `wager`   – original wager in stroops (must be > 0)
+/// - `multipliers` – array of 4 multipliers in basis points
+/// - `streak`  – current win streak
+/// - `fee_bps` – protocol fee in basis points (200–500)
+pub fn calculate_payout_breakdown_with_multipliers(
+    wager: i128,
+    multipliers: &[u32; 4],
+    streak: u32,
+    fee_bps: u32,
+) -> Option<(i128, i128, i128)> {
+    let multiplier = get_multiplier_from_array(multipliers, streak) as i128;
+    let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
+    let fee = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
+    let net = gross.checked_sub(fee)?;
+    Some((gross, fee, net))
 }
 
 /// Calculates the full payout breakdown for a winning streak.
@@ -615,6 +660,12 @@ impl CoinflipContract {
             min_wager,
             max_wager,
             paused: false,
+            multipliers: [
+                MULTIPLIER_STREAK_1,
+                MULTIPLIER_STREAK_2,
+                MULTIPLIER_STREAK_3,
+                MULTIPLIER_STREAK_4_PLUS,
+            ],
         };
         
         let stats = ContractStats {
@@ -806,8 +857,9 @@ impl CoinflipContract {
 
         // Guard 5: reserves must cover the worst-case payout (streak 4+, no fee deduction)
         let stats = Self::load_stats(&env);
+        let max_multiplier = config.multipliers[3]; // streak 4+ multiplier
         let max_payout = wager
-            .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+            .checked_mul(max_multiplier as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
         if stats.reserve_balance < max_payout {
@@ -827,6 +879,10 @@ impl CoinflipContract {
             commitment,
             contract_random,
             fee_bps: config.fee_bps,
+            phase: GamePhase::Committed,
+            start_ledger: env.ledger().sequence(),
+            multipliers: config.multipliers,
+        };
             phase: GamePhase::Committed,
             start_ledger: env.ledger().sequence(),
         };
@@ -1007,7 +1063,7 @@ impl CoinflipContract {
         // avoid the duplicate multiplier lookup + two checked_div calls that would
         // result from calling calculate_payout and then recomputing gross/fee.
         let (gross_payout, fee_amount, net_payout) =
-            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+            calculate_payout_breakdown_with_multipliers(game.wager, &game.multipliers, game.streak, game.fee_bps)
                 .ok_or(Error::InsufficientReserves)?;
 
         // Check sufficient reserves
@@ -1082,7 +1138,7 @@ impl CoinflipContract {
         // avoid the duplicate multiplier lookup + two checked_div calls that would
         // result from calling calculate_payout and then recomputing gross/fee.
         let (gross, fee, net_payout) =
-            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+            calculate_payout_breakdown_with_multipliers(game.wager, &game.multipliers, game.streak, game.fee_bps)
                 .ok_or(Error::InsufficientReserves)?;
 
         let mut stats = Self::load_stats(&env);
@@ -1218,8 +1274,9 @@ impl CoinflipContract {
         let stats = Self::load_stats(&env);
 
         let next_streak = game.streak.saturating_add(1);
+        let next_multiplier = get_multiplier_from_array(&game.multipliers, next_streak);
         let max_payout = game.wager
-            .checked_mul(get_multiplier(next_streak) as i128)
+            .checked_mul(next_multiplier as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
 
@@ -1388,6 +1445,48 @@ impl CoinflipContract {
         }
 
         config.fee_bps = fee_bps;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
+
+    /// Update the multiplier values for each streak level.
+    ///
+    /// Only the configured `admin` may call this function.
+    /// Multipliers must be in monotonically increasing order.
+    ///
+    /// # Arguments
+    /// - `admin` – caller address; must authorize and match `config.admin`
+    /// - `multipliers` – array of 4 multipliers in basis points [streak_1, streak_2, streak_3, streak_4_plus]
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
+    /// - [`Error::InvalidWagerLimits`] – multipliers are not in monotonically increasing order
+    ///
+    /// # Security
+    /// - In-flight games use snapshotted multipliers from `GameState`, so this
+    ///   change only affects new games started after the update.
+    pub fn set_multipliers(
+        env: Env,
+        admin: Address,
+        multipliers: [u32; 4],
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Validate monotonic increase: streak_1 < streak_2 < streak_3 < streak_4_plus
+        if multipliers[0] >= multipliers[1]
+            || multipliers[1] >= multipliers[2]
+            || multipliers[2] >= multipliers[3]
+        {
+            return Err(Error::InvalidWagerLimits);
+        }
+
+        config.multipliers = multipliers;
         Self::save_config(&env, &config);
 
         Ok(())
