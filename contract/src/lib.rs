@@ -65,6 +65,7 @@ pub mod error_codes {
     pub const ACTIVE_GAME_EXISTS: u32 = 3;
     pub const INSUFFICIENT_RESERVES: u32 = 4;
     pub const CONTRACT_PAUSED: u32 = 5;
+    pub const CONTRACT_SHUTDOWN: u32 = 6;
 
     // Game state errors (10–13)
     pub const NO_ACTIVE_GAME: u32 = 10;
@@ -89,7 +90,7 @@ pub mod error_codes {
     pub const ALREADY_INITIALIZED: u32 = 51;
 
     /// Total number of defined error variants.
-    pub const VARIANT_COUNT: usize = 17;
+    pub const VARIANT_COUNT: usize = 18;
 }
 
 /// Error codes for the coinflip contract.
@@ -136,6 +137,12 @@ pub enum Error {
     /// Returned by: `start_game` (guard 1).
     /// Code: 5 — see [`error_codes::CONTRACT_PAUSED`]
     ContractPaused = 5,
+
+    /// Contract is in graceful shutdown; `start_game` and `continue_streak` are
+    /// rejected so no new risk is taken on, but active games may still settle.
+    /// Returned by: `start_game` (guard 1b), `continue_streak` (guard 0).
+    /// Code: 6 — see [`error_codes::CONTRACT_SHUTDOWN`]
+    ContractShutdown = 6,
 
     // ── Game state errors (10–13) ───────────────────────────────────────────
 
@@ -301,6 +308,10 @@ pub struct ContractConfig {
     pub max_wager: i128,
     /// Emergency pause flag; when `true`, `start_game` is rejected.
     pub paused: bool,
+    /// Graceful shutdown flag; when `true`, `start_game` and `continue_streak`
+    /// are rejected while `reveal`, `cash_out`, and `claim_winnings` remain
+    /// available so active games can settle to completion.
+    pub shutdown_mode: bool,
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -615,6 +626,7 @@ impl CoinflipContract {
             min_wager,
             max_wager,
             paused: false,
+            shutdown_mode: false,
         };
         
         let stats = ContractStats {
@@ -780,9 +792,12 @@ impl CoinflipContract {
 
         let config = Self::load_config(&env);
 
-        // Guard 1: contract must not be paused
+        // Guard 1: contract must not be paused or in shutdown mode
         if config.paused {
             return Err(Error::ContractPaused);
+        }
+        if config.shutdown_mode {
+            return Err(Error::ContractShutdown);
         }
 
         // Guard 2 & 3: Wager must be within configured bounds [min_wager, max_wager].
@@ -1192,6 +1207,12 @@ impl CoinflipContract {
     ) -> Result<(), Error> {
         player.require_auth();
 
+        // Guard 0: contract must not be in shutdown mode (no new risk allowed)
+        let config = Self::load_config(&env);
+        if config.shutdown_mode {
+            return Err(Error::ContractShutdown);
+        }
+
         // Guard 1: player must have an active game
         let mut game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
@@ -1388,6 +1409,37 @@ impl CoinflipContract {
         }
 
         config.fee_bps = fee_bps;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
+
+    /// Activate or deactivate graceful shutdown mode.
+    ///
+    /// In shutdown mode:
+    /// - `start_game` is rejected with [`Error::ContractShutdown`].
+    /// - `continue_streak` is rejected with [`Error::ContractShutdown`].
+    /// - `reveal`, `cash_out`, and `claim_winnings` remain available so
+    ///   all active games can settle to completion.
+    ///
+    /// Shutdown mode is independent of the `paused` flag and can be toggled
+    /// while the contract is paused (or vice-versa).
+    ///
+    /// # Arguments
+    /// - `admin`    – must authorize and match `config.admin`
+    /// - `shutdown` – `true` to enter shutdown mode, `false` to exit
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
+    pub fn emergency_shutdown(env: Env, admin: Address, shutdown: bool) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        config.shutdown_mode = shutdown;
         Self::save_config(&env, &config);
 
         Ok(())
@@ -1760,6 +1812,7 @@ mod tests {
         assert_eq!(Error::ActiveGameExists as u32, 3);
         assert_eq!(Error::InsufficientReserves as u32, 4);
         assert_eq!(Error::ContractPaused as u32, 5);
+        assert_eq!(Error::ContractShutdown as u32, 6);
         assert_eq!(Error::NoActiveGame as u32, 10);
         assert_eq!(Error::InvalidPhase as u32, 11);
         assert_eq!(Error::CommitmentMismatch as u32, 12);
@@ -5127,6 +5180,7 @@ mod property_tests {
             prop_assert_eq!(Error::ActiveGameExists as u32, error_codes::ACTIVE_GAME_EXISTS);
             prop_assert_eq!(Error::InsufficientReserves as u32, error_codes::INSUFFICIENT_RESERVES);
             prop_assert_eq!(Error::ContractPaused as u32, error_codes::CONTRACT_PAUSED);
+            prop_assert_eq!(Error::ContractShutdown as u32, error_codes::CONTRACT_SHUTDOWN);
             prop_assert_eq!(Error::NoActiveGame as u32, error_codes::NO_ACTIVE_GAME);
             prop_assert_eq!(Error::InvalidPhase as u32, error_codes::INVALID_PHASE);
             prop_assert_eq!(Error::CommitmentMismatch as u32, error_codes::COMMITMENT_MISMATCH);
@@ -5144,14 +5198,15 @@ mod property_tests {
         /// VARIANT_COUNT must exactly match the number of Error enum variants.
         #[test]
         fn prop_variant_count_is_accurate(_dummy in 0u32..100u32) {
-            // All 17 variants enumerated — if a new variant is added without
+            // All 18 variants enumerated — if a new variant is added without
             // updating VARIANT_COUNT, this list will need to grow.
-            let all_codes: [u32; 17] = [
+            let all_codes: [u32; 18] = [
                 error_codes::WAGER_BELOW_MINIMUM,
                 error_codes::WAGER_ABOVE_MAXIMUM,
                 error_codes::ACTIVE_GAME_EXISTS,
                 error_codes::INSUFFICIENT_RESERVES,
                 error_codes::CONTRACT_PAUSED,
+                error_codes::CONTRACT_SHUTDOWN,
                 error_codes::NO_ACTIVE_GAME,
                 error_codes::INVALID_PHASE,
                 error_codes::COMMITMENT_MISMATCH,
@@ -9441,6 +9496,304 @@ mod game_history_tests {
                 prop_assert!(!e.won, "loss entry must have won=false");
                 prop_assert_eq!(e.payout, 0i128, "loss entry must have payout=0");
             }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #447 — Emergency pause with graceful shutdown tests
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod emergency_shutdown_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    fn sd_setup() -> (Env, CoinflipContractClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(&env, &contract_id);
+        let admin    = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token    = Address::generate(&env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        (env, client, contract_id, admin)
+    }
+
+    fn sd_fund(env: &Env, contract_id: &Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = amount;
+            CoinflipContract::save_stats(env, &stats);
+        });
+    }
+
+    fn sd_secret(env: &Env, seed: u8) -> Bytes {
+        Bytes::from_slice(env, &[seed; 32])
+    }
+
+    fn sd_commit(env: &Env, seed: u8) -> BytesN<32> {
+        env.crypto().sha256(&sd_secret(env, seed)).into()
+    }
+
+    // ── emergency_shutdown admin function ────────────────────────────────
+
+    #[test]
+    fn test_emergency_shutdown_enables_shutdown_mode() {
+        let (env, client, contract_id, admin) = sd_setup();
+        client.emergency_shutdown(&admin, &true);
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert!(cfg.shutdown_mode);
+    }
+
+    #[test]
+    fn test_emergency_shutdown_can_be_disabled() {
+        let (env, client, contract_id, admin) = sd_setup();
+        client.emergency_shutdown(&admin, &true);
+        client.emergency_shutdown(&admin, &false);
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert!(!cfg.shutdown_mode);
+    }
+
+    #[test]
+    fn test_emergency_shutdown_rejects_non_admin() {
+        let (env, client, _contract_id, _admin) = sd_setup();
+        let attacker = Address::generate(&env);
+        let result = client.try_emergency_shutdown(&attacker, &true);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_emergency_shutdown_no_mutation_on_unauthorized() {
+        let (env, client, contract_id, _admin) = sd_setup();
+        let before: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        let attacker = Address::generate(&env);
+        let _ = client.try_emergency_shutdown(&attacker, &true);
+        let after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert_eq!(before, after);
+    }
+
+    // ── start_game blocked during shutdown ───────────────────────────────
+
+    #[test]
+    fn test_start_game_rejected_in_shutdown_mode() {
+        let (env, client, contract_id, admin) = sd_setup();
+        sd_fund(&env, &contract_id, 1_000_000_000);
+        client.emergency_shutdown(&admin, &true);
+        let player = Address::generate(&env);
+        let result = client.try_start_game(&player, &Side::Heads, &5_000_000, &sd_commit(&env, 1));
+        assert_eq!(result, Err(Ok(Error::ContractShutdown)));
+    }
+
+    #[test]
+    fn test_start_game_allowed_after_shutdown_lifted() {
+        let (env, client, contract_id, admin) = sd_setup();
+        sd_fund(&env, &contract_id, 1_000_000_000);
+        client.emergency_shutdown(&admin, &true);
+        client.emergency_shutdown(&admin, &false);
+        let player = Address::generate(&env);
+        let result = client.try_start_game(&player, &Side::Heads, &5_000_000, &sd_commit(&env, 1));
+        assert!(result.is_ok());
+    }
+
+    // ── continue_streak blocked during shutdown ───────────────────────────
+
+    #[test]
+    fn test_continue_streak_rejected_in_shutdown_mode() {
+        let (env, client, contract_id, admin) = sd_setup();
+        sd_fund(&env, &contract_id, 1_000_000_000);
+        // Set up a winning revealed game.
+        let player = Address::generate(&env);
+        let game = GameState {
+            wager: 5_000_000, side: Side::Heads, streak: 1,
+            commitment: sd_commit(&env, 1),
+            contract_random: sd_commit(&env, 2),
+            fee_bps: 300, phase: GamePhase::Revealed,
+            start_ledger: 0,
+        };
+        env.as_contract(&contract_id, || {
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+        client.emergency_shutdown(&admin, &true);
+        let result = client.try_continue_streak(&player, &sd_commit(&env, 3));
+        assert_eq!(result, Err(Ok(Error::ContractShutdown)));
+    }
+
+    // ── reveal and cash_out still work during shutdown ────────────────────
+
+    #[test]
+    fn test_reveal_allowed_during_shutdown() {
+        let (env, client, contract_id, admin) = sd_setup();
+        sd_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        // Start game before shutdown.
+        client.start_game(&player, &Side::Heads, &5_000_000, &sd_commit(&env, 1));
+        client.emergency_shutdown(&admin, &true);
+        // seed 1 → Heads win
+        let result = client.try_reveal(&player, &sd_secret(&env, 1));
+        assert!(result.is_ok(), "reveal must succeed during shutdown");
+    }
+
+    #[test]
+    fn test_cash_out_allowed_during_shutdown() {
+        let (env, client, contract_id, admin) = sd_setup();
+        sd_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        // Inject a winning revealed game.
+        let game = GameState {
+            wager: 5_000_000, side: Side::Heads, streak: 1,
+            commitment: sd_commit(&env, 1),
+            contract_random: sd_commit(&env, 2),
+            fee_bps: 300, phase: GamePhase::Revealed,
+            start_ledger: 0,
+        };
+        env.as_contract(&contract_id, || {
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+        client.emergency_shutdown(&admin, &true);
+        let result = client.try_cash_out(&player);
+        assert!(result.is_ok(), "cash_out must succeed during shutdown");
+    }
+
+    #[test]
+    fn test_full_active_game_completes_during_shutdown() {
+        let (env, client, contract_id, admin) = sd_setup();
+        sd_fund(&env, &contract_id, 1_000_000_000);
+        let player = Address::generate(&env);
+        // Start game, then activate shutdown.
+        client.start_game(&player, &Side::Heads, &5_000_000, &sd_commit(&env, 1));
+        client.emergency_shutdown(&admin, &true);
+        // Reveal (win) and cash out must both succeed.
+        assert_eq!(client.try_reveal(&player, &sd_secret(&env, 1)), Ok(true));
+        assert!(client.try_cash_out(&player).is_ok());
+    }
+
+    // ── shutdown is independent of paused flag ────────────────────────────
+
+    #[test]
+    fn test_shutdown_and_paused_are_independent() {
+        let (env, client, contract_id, admin) = sd_setup();
+        // Pause only: start_game → ContractPaused
+        client.set_paused(&admin, &true);
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert!(cfg.paused);
+        assert!(!cfg.shutdown_mode);
+
+        // Shutdown only: start_game → ContractShutdown
+        client.set_paused(&admin, &false);
+        client.emergency_shutdown(&admin, &true);
+        let cfg2: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert!(!cfg2.paused);
+        assert!(cfg2.shutdown_mode);
+    }
+
+    #[test]
+    fn test_shutdown_mode_false_by_default() {
+        let (env, _client, contract_id, _admin) = sd_setup();
+        let cfg: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&StorageKey::Config).unwrap()
+        });
+        assert!(!cfg.shutdown_mode, "shutdown_mode must default to false");
+    }
+
+    // ── error code stability ──────────────────────────────────────────────
+
+    #[test]
+    fn test_contract_shutdown_error_code() {
+        assert_eq!(Error::ContractShutdown as u32, 6);
+        assert_eq!(Error::ContractShutdown as u32, error_codes::CONTRACT_SHUTDOWN);
+    }
+
+    // ── property tests ────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// start_game always returns ContractShutdown when shutdown_mode is true.
+        #[test]
+        fn prop_start_game_always_rejected_in_shutdown(
+            wager in 1_000_000i128..=100_000_000i128,
+            side  in prop_oneof![Just(Side::Heads), Just(Side::Tails)],
+        ) {
+            let (env, client, contract_id, admin) = sd_setup();
+            sd_fund(&env, &contract_id, 1_000_000_000_000i128);
+            client.emergency_shutdown(&admin, &true);
+            let player = Address::generate(&env);
+            let result = client.try_start_game(&player, &side, &wager, &sd_commit(&env, 1));
+            prop_assert_eq!(result, Err(Ok(Error::ContractShutdown)));
+        }
+
+        /// continue_streak always returns ContractShutdown when shutdown_mode is true.
+        #[test]
+        fn prop_continue_streak_always_rejected_in_shutdown(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let (env, client, contract_id, admin) = sd_setup();
+            sd_fund(&env, &contract_id, 1_000_000_000_000i128);
+            let player = Address::generate(&env);
+            let game = GameState {
+                wager, side: Side::Heads, streak,
+                commitment: sd_commit(&env, 1),
+                contract_random: sd_commit(&env, 2),
+                fee_bps: 300, phase: GamePhase::Revealed,
+                start_ledger: 0,
+            };
+            env.as_contract(&contract_id, || {
+                CoinflipContract::save_player_game(&env, &player, &game);
+            });
+            client.emergency_shutdown(&admin, &true);
+            let result = client.try_continue_streak(&player, &sd_commit(&env, 3));
+            prop_assert_eq!(result, Err(Ok(Error::ContractShutdown)));
+        }
+
+        /// cash_out always succeeds during shutdown for a valid winning game.
+        #[test]
+        fn prop_cash_out_succeeds_during_shutdown(
+            wager  in 1_000_000i128..=10_000_000i128,
+            streak in 1u32..=4u32,
+        ) {
+            let (env, client, contract_id, admin) = sd_setup();
+            sd_fund(&env, &contract_id, 1_000_000_000_000i128);
+            let player = Address::generate(&env);
+            let game = GameState {
+                wager, side: Side::Heads, streak,
+                commitment: sd_commit(&env, 1),
+                contract_random: sd_commit(&env, 2),
+                fee_bps: 300, phase: GamePhase::Revealed,
+                start_ledger: 0,
+            };
+            env.as_contract(&contract_id, || {
+                CoinflipContract::save_player_game(&env, &player, &game);
+            });
+            client.emergency_shutdown(&admin, &true);
+            prop_assert!(client.try_cash_out(&player).is_ok());
+        }
+
+        /// Non-admin cannot activate shutdown regardless of address.
+        #[test]
+        fn prop_non_admin_cannot_activate_shutdown(_seed in 0u8..=255u8) {
+            let (env, client, _contract_id, _admin) = sd_setup();
+            let attacker = Address::generate(&env);
+            prop_assert_eq!(
+                client.try_emergency_shutdown(&attacker, &true),
+                Err(Ok(Error::Unauthorized))
+            );
         }
     }
 }
