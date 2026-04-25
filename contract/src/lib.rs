@@ -55,6 +55,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_sh
 /// | 30   | `Unauthorized`               | Admin          | `set_paused`, `set_treasury`, `set_wager_limits`, `set_fee` |
 /// | 31   | `InvalidFeePercentage`       | Admin          | `initialize`, `set_fee`            |
 /// | 32   | `InvalidWagerLimits`         | Admin          | `initialize`, `set_wager_limits`   |
+/// | 33   | `InvalidMultipliers`         | Admin          | `initialize`, `set_multipliers`    |
 /// | 40   | `TransferFailed`             | Transfer       | `claim_winnings`                   |
 /// | 50   | `AdminTreasuryConflict`      | Initialization | `initialize`                       |
 /// | 51   | `AlreadyInitialized`         | Initialization | `initialize`                       |
@@ -81,6 +82,7 @@ pub mod error_codes {
     pub const UNAUTHORIZED: u32 = 30;
     pub const INVALID_FEE_PERCENTAGE: u32 = 31;
     pub const INVALID_WAGER_LIMITS: u32 = 32;
+    pub const INVALID_MULTIPLIERS: u32 = 33;
 
     // Transfer errors (40)
     pub const TRANSFER_FAILED: u32 = 40;
@@ -199,6 +201,11 @@ pub enum Error {
     /// Returned by: `set_multipliers`.
     /// Code: 33 — see [`error_codes::INVALID_MULTIPLIER_TIERS`]
     InvalidMultiplierTiers = 33,
+    /// Multiplier tiers are invalid (not strictly monotonically increasing,
+    /// or any tier is at or below 1x / 10_000 bps).
+    /// Returned by: `initialize`, `set_multipliers`.
+    /// Code: 33 — see [`error_codes::INVALID_MULTIPLIERS`]
+    InvalidMultipliers = 33,
 
     // ── Transfer errors (40) ────────────────────────────────────────────────
 
@@ -323,6 +330,9 @@ pub struct GameState {
     pub side_bet_amount: i128,
     /// Snapshot of multiplier tiers at game creation for isolation.
     pub multipliers: Vec<u32>,
+    /// Multiplier snapshot captured at `start_game`; used for all payout
+    /// and solvency calculations so admin changes don't reprice active games.
+    pub multipliers: MultiplierConfig,
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -354,6 +364,8 @@ pub struct ContractConfig {
     pub shutdown_mode: bool,
     /// Multiplier tiers: [streak_1, streak_2, streak_3, streak_4_plus] in basis points.
     pub multipliers: Vec<u32>,
+    /// Multiplier tier configuration; snapshotted into each new game.
+    pub multipliers: MultiplierConfig,
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -501,6 +513,137 @@ pub struct ReferralStats {
     pub referrer: Option<Address>,
     pub total_referral_rewards: i128,
     pub referrals_count: u32,
+}
+
+// ── Event payload types ─────────────────────────────────────────────────────
+//
+// Each `#[contracttype]` struct is the data payload for one event category.
+// Topics are `(Symbol("tossd"), Symbol("<action>"))` pairs so indexers can
+// filter by contract + action without decoding the full payload.
+
+/// Emitted once by `initialize`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventInitialized {
+    pub admin:     Address,
+    pub treasury:  Address,
+    pub token:     Address,
+    pub fee_bps:   u32,
+    pub min_wager: i128,
+    pub max_wager: i128,
+}
+
+/// Emitted by `start_game` on success.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGameStarted {
+    pub player:     Address,
+    pub side:       Side,
+    pub wager:      i128,
+    pub commitment: BytesN<32>,
+    pub ledger:     u32,
+}
+
+/// Emitted by `reveal` on both win and loss paths.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGameRevealed {
+    pub player:  Address,
+    pub won:     bool,
+    /// Post-reveal streak (0 on loss).
+    pub streak:  u32,
+    pub outcome: Side,
+}
+
+/// Emitted by `cash_out` and `claim_winnings` on success.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGameSettled {
+    pub player: Address,
+    pub payout: i128,
+    pub fee:    i128,
+    pub streak: u32,
+    /// `Symbol("cash_out")` or `Symbol("claim_winnings")`.
+    pub method: soroban_sdk::Symbol,
+}
+
+/// Emitted by `continue_streak` on success.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventStreakContinued {
+    pub player:         Address,
+    pub streak:         u32,
+    pub new_commitment: BytesN<32>,
+}
+
+/// Emitted by `reclaim_wager` on success.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventWagerReclaimed {
+    pub player: Address,
+    pub wager:  i128,
+    pub ledger: u32,
+}
+
+/// Emitted by all admin setter functions (`set_paused`, `set_treasury`,
+/// `set_wager_limits`, `set_fee`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventAdminAction {
+    /// `Symbol("set_paused")`, `Symbol("set_treasury")`,
+    /// `Symbol("set_wager_limits")`, or `Symbol("set_fee")`.
+    pub action: soroban_sdk::Symbol,
+    pub admin:  Address,
+}
+
+/// Multiplier tier configuration, stored in [`ContractConfig`] and snapshotted
+/// into [`GameState`] at `start_game` time so admin changes never reprice
+/// in-flight games.
+///
+/// All values are in basis points (10_000 = 1x).
+/// Monotonicity invariant: `streak1 < streak2 < streak3 < streak4_plus`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiplierConfig {
+    /// Multiplier for streak 1 (default 19_000 = 1.9x).
+    pub streak1: u32,
+    /// Multiplier for streak 2 (default 35_000 = 3.5x).
+    pub streak2: u32,
+    /// Multiplier for streak 3 (default 60_000 = 6.0x).
+    pub streak3: u32,
+    /// Multiplier for streak 4+ (default 100_000 = 10.0x).
+    pub streak4_plus: u32,
+}
+
+impl MultiplierConfig {
+    /// Returns the default multiplier configuration matching the original constants.
+    pub fn default_config() -> Self {
+        MultiplierConfig {
+            streak1:      MULTIPLIER_STREAK_1,
+            streak2:      MULTIPLIER_STREAK_2,
+            streak3:      MULTIPLIER_STREAK_3,
+            streak4_plus: MULTIPLIER_STREAK_4_PLUS,
+        }
+    }
+
+    /// Returns the multiplier for the given streak level.
+    pub fn for_streak(&self, streak: u32) -> u32 {
+        match streak {
+            1 => self.streak1,
+            2 => self.streak2,
+            3 => self.streak3,
+            _ => self.streak4_plus,
+        }
+    }
+
+    /// Returns `true` if the tiers are strictly monotonically increasing and
+    /// all values are above 1x (10_000 bps).
+    pub fn is_valid(&self) -> bool {
+        self.streak1 > 10_000
+            && self.streak1 < self.streak2
+            && self.streak2 < self.streak3
+            && self.streak3 < self.streak4_plus
+    }
 }
 
 // ── Event payload types ─────────────────────────────────────────────────────
@@ -989,6 +1132,7 @@ impl CoinflipContract {
             paused: false,
             shutdown_mode: false,
             multipliers,
+            multipliers: MultiplierConfig::default_config(),
         };
         
         let stats = ContractStats {
@@ -1320,7 +1464,7 @@ impl CoinflipContract {
         // Guard 5: reserves must cover the worst-case payout (streak 4+, no fee deduction)
         let stats = Self::load_stats(&env);
         let max_payout = wager
-            .checked_mul(MULTIPLIER_STREAK_4_PLUS as i128)
+            .checked_mul(config.multipliers.streak4_plus as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
         if stats.reserve_balance < max_payout {
@@ -1349,6 +1493,7 @@ impl CoinflipContract {
             side_bet_amount: 0,
             start_ledger: ledger_seq,
             multipliers: config.multipliers.clone(),
+            multipliers: config.multipliers,
         };
 
         Self::save_player_game(&env, &player, &game);
@@ -1568,6 +1713,17 @@ impl CoinflipContract {
         let (gross_payout, fee_amount, net_payout) =
             calculate_payout_breakdown_with_tiers(game.wager, game.streak, game.fee_bps, &game.multipliers)
                 .ok_or(Error::InsufficientReserves)?;
+        // Single-pass payout breakdown using the snapshotted multiplier so that
+        // admin changes to multipliers never reprice in-flight games.
+        let multiplier_bps = game.multipliers.for_streak(game.streak) as i128;
+        let gross_payout = game.wager.checked_mul(multiplier_bps)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        let fee_amount = gross_payout.checked_mul(game.fee_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        let net_payout = gross_payout.checked_sub(fee_amount)
+            .ok_or(Error::InsufficientReserves)?;
 
         // Settle side bet
         let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount)
@@ -1723,6 +1879,17 @@ impl CoinflipContract {
         let (gross, fee, net_payout) =
             calculate_payout_breakdown_with_tiers(game.wager, game.streak, game.fee_bps, &game.multipliers)
                 .ok_or(Error::InsufficientReserves)?;
+        // Single-pass payout breakdown using the snapshotted multiplier so that
+        // admin changes to multipliers never reprice in-flight games.
+        let multiplier_bps = game.multipliers.for_streak(game.streak) as i128;
+        let gross = game.wager.checked_mul(multiplier_bps)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        let fee = gross.checked_mul(game.fee_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(Error::InsufficientReserves)?;
+        let net_payout = gross.checked_sub(fee)
+            .ok_or(Error::InsufficientReserves)?;
 
         // Settle side bet: compute payout (0 if condition not met).
         let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount)
@@ -1893,6 +2060,7 @@ impl CoinflipContract {
         let next_streak = game.streak.saturating_add(1);
         let max_payout = game.wager
             .checked_mul(get_multiplier_from_tiers(next_streak, &game.multipliers) as i128)
+            .checked_mul(game.multipliers.for_streak(next_streak) as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
 
@@ -2190,6 +2358,57 @@ impl CoinflipContract {
 
         config.multipliers = multipliers;
         Self::save_config(&env, &config);
+
+        Ok(())
+    }
+
+    /// Update the multiplier tiers used for payout calculations.
+    ///
+    /// Only the configured `admin` may call this function.
+    /// Changes apply to games created **after** this call; in-flight games
+    /// use the multipliers snapshotted at `start_game` time.
+    ///
+    /// # Monotonicity invariant
+    /// `streak1 < streak2 < streak3 < streak4_plus` and all values > 10_000 (1x).
+    ///
+    /// # Arguments
+    /// - `admin`       – must match `config.admin`; authorization required
+    /// - `streak1`     – multiplier for streak 1 in bps (e.g. 19_000 = 1.9x)
+    /// - `streak2`     – multiplier for streak 2 in bps
+    /// - `streak3`     – multiplier for streak 3 in bps
+    /// - `streak4_plus`– multiplier for streak 4+ in bps
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`]       – caller is not the configured admin
+    /// - [`Error::InvalidMultipliers`] – tiers are not strictly monotonically
+    ///                                   increasing or any value is ≤ 10_000
+    pub fn set_multipliers(
+        env: Env,
+        admin: Address,
+        streak1: u32,
+        streak2: u32,
+        streak3: u32,
+        streak4_plus: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let m = MultiplierConfig { streak1, streak2, streak3, streak4_plus };
+        if !m.is_valid() {
+            return Err(Error::InvalidMultipliers);
+        }
+
+        config.multipliers = m;
+        Self::save_config(&env, &config);
+
+        Self::emit_admin_action(&env, EventAdminAction {
+            action: Symbol::new(&env, "set_multipliers"),
+            admin,
+        });
 
         Ok(())
     }
@@ -2923,6 +3142,10 @@ mod tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
                 };
+                            $$$
+                            start_ledger: 0,
+                            multipliers: MultiplierConfig::default_config(),
+                        };
                 CoinflipContract::save_player_game(env, &player, &game);
             });
         }
@@ -3127,6 +3350,10 @@ mod tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         };
+                    $$$
+                    start_ledger: 0,
+                    multipliers: MultiplierConfig::default_config(),
+                };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
         });
@@ -3838,6 +4065,10 @@ mod tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
             };
+                        $$$
+                        start_ledger: 0,
+                        multipliers: MultiplierConfig::default_config(),
+                    };
             CoinflipContract::save_player_game(&env, &player, &game);
         });
 
@@ -5415,6 +5646,10 @@ mod property_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         };
+                    $$$
+                    start_ledger: 0,
+                    multipliers: MultiplierConfig::default_config(),
+                };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
         });
@@ -6378,6 +6613,10 @@ mod cumulative_fee_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         };
+                    $$$
+                    start_ledger: 0,
+                    multipliers: MultiplierConfig::default_config(),
+                };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
         });
@@ -8277,6 +8516,10 @@ mod integration_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
             };
+                        $$$
+                        start_ledger: 0,
+                        multipliers: MultiplierConfig::default_config(),
+                    };
             self.env.as_contract(&self.contract_id, || {
                 CoinflipContract::save_player_game(&self.env, player, &game);
             });
@@ -8857,6 +9100,10 @@ mod cash_out_availability_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         };
+                    $$$
+                    start_ledger: 0,
+                    multipliers: MultiplierConfig::default_config(),
+                };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
         });
