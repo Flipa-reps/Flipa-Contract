@@ -80,6 +80,7 @@ pub mod error_codes {
     pub const UNAUTHORIZED: u32 = 30;
     pub const INVALID_FEE_PERCENTAGE: u32 = 31;
     pub const INVALID_WAGER_LIMITS: u32 = 32;
+    pub const INVALID_TIMEOUT: u32 = 33;
 
     // Transfer errors (40)
     pub const TRANSFER_FAILED: u32 = 40;
@@ -89,7 +90,7 @@ pub mod error_codes {
     pub const ALREADY_INITIALIZED: u32 = 51;
 
     /// Total number of defined error variants.
-    pub const VARIANT_COUNT: usize = 17;
+    pub const VARIANT_COUNT: usize = 18;
 }
 
 /// Error codes for the coinflip contract.
@@ -188,6 +189,11 @@ pub enum Error {
     /// Code: 32 — see [`error_codes::INVALID_WAGER_LIMITS`]
     InvalidWagerLimits = 32,
 
+    /// Timeout value is outside the accepted range (50–1000 ledgers).
+    /// Returned by: `initialize`, `start_game`.
+    /// Code: 33 — see [`error_codes::INVALID_TIMEOUT`]
+    InvalidTimeout = 33,
+
     // ── Transfer errors (40) ────────────────────────────────────────────────
 
     /// Token transfer failed during settlement.
@@ -276,6 +282,8 @@ pub struct GameState {
     pub phase: GamePhase,
     /// Ledger sequence at game creation; used for timeout enforcement.
     pub start_ledger: u32,
+    /// Timeout in ledgers for this specific game (50-1000).
+    pub timeout_ledgers: u32,
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -301,6 +309,8 @@ pub struct ContractConfig {
     pub max_wager: i128,
     /// Emergency pause flag; when `true`, `start_game` is rejected.
     pub paused: bool,
+    /// Default reveal timeout in ledgers (50-1000); players can override per-game.
+    pub reveal_timeout_ledgers: u32,
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -586,6 +596,7 @@ impl CoinflipContract {
         fee_bps: u32,
         min_wager: i128,
         max_wager: i128,
+        reveal_timeout_ledgers: u32,
     ) -> Result<(), Error> {
         // Guard: prevent re-initialization
         if env.storage().persistent().has(&StorageKey::Config) {
@@ -606,8 +617,22 @@ impl CoinflipContract {
         if min_wager >= max_wager {
             return Err(Error::InvalidWagerLimits);
         }
+
+        // Validate reveal timeout (50-1000 ledgers)
+        if reveal_timeout_ledgers < 50 || reveal_timeout_ledgers > 1000 {
+            return Err(Error::InvalidTimeout);
+        }
         
         let config = ContractConfig {
+            admin,
+            treasury,
+            token,
+            fee_bps,
+            min_wager,
+            max_wager,
+            paused: false,
+            reveal_timeout_ledgers,
+        };
             admin,
             treasury,
             token,
@@ -775,6 +800,7 @@ impl CoinflipContract {
         side: Side,
         wager: i128,
         commitment: BytesN<32>,
+        timeout_ledgers: Option<u32>,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -783,6 +809,24 @@ impl CoinflipContract {
         // Guard 1: contract must not be paused
         if config.paused {
             return Err(Error::ContractPaused);
+        }
+
+        // Guard 2 & 3: Wager must be within configured bounds [min_wager, max_wager].
+        // Uses strict inequalities to ensure inclusive bounds:
+        // - Rejects wagers LESS THAN min (strictly below minimum)
+        // - Rejects wagers GREATER THAN max (strictly above maximum)
+        // This means exactly min and max are ACCEPTED.
+        if wager < config.min_wager {
+            return Err(Error::WagerBelowMinimum);
+        }
+        if wager > config.max_wager {
+            return Err(Error::WagerAboveMaximum);
+        }
+
+        // Validate timeout if provided, otherwise use config default
+        let timeout = timeout_ledgers.unwrap_or(config.reveal_timeout_ledgers);
+        if timeout < 50 || timeout > 1000 {
+            return Err(Error::InvalidTimeout);
         }
 
         // Guard 2 & 3: Wager must be within configured bounds [min_wager, max_wager].
@@ -829,6 +873,7 @@ impl CoinflipContract {
             fee_bps: config.fee_bps,
             phase: GamePhase::Committed,
             start_ledger: env.ledger().sequence(),
+            timeout_ledgers: timeout,
         };
 
         Self::save_player_game(&env, &player, &game);
@@ -1440,7 +1485,7 @@ impl CoinflipContract {
 
         // Reject if the timeout window has not yet elapsed.
         let current = env.ledger().sequence();
-        let expires_at = game.start_ledger.saturating_add(REVEAL_TIMEOUT_LEDGERS);
+        let expires_at = game.start_ledger.saturating_add(game.timeout_ledgers);
         if current < expires_at {
             return Err(Error::RevealTimeout);
         }
