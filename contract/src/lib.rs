@@ -88,8 +88,58 @@ pub mod error_codes {
     pub const ADMIN_TREASURY_CONFLICT: u32 = 50;
     pub const ALREADY_INITIALIZED: u32 = 51;
 
+    // Governance errors (60–65)
+    pub const PROPOSAL_NOT_FOUND: u32 = 60;
+    pub const PROPOSAL_ALREADY_EXECUTED: u32 = 61;
+    pub const PROPOSAL_NOT_APPROVED: u32 = 62;
+    pub const EXECUTION_DELAY_NOT_MET: u32 = 63;
+    pub const ALREADY_VOTED: u32 = 64;
+    pub const QUORUM_NOT_MET: u32 = 65;
+
     /// Total number of defined error variants.
-    pub const VARIANT_COUNT: usize = 17;
+    pub const VARIANT_COUNT: usize = 23;
+}
+
+/// Configuration change proposal for governance voting.
+///
+/// Proposals require voting and a 48-hour execution delay after approval.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Proposal {
+    /// Unique proposal ID
+    pub id: u32,
+    /// Proposer address
+    pub proposer: Address,
+    /// Proposal type (fee, wager_limits, treasury, pause)
+    pub proposal_type: ProposalType,
+    /// Ledger sequence when proposal was created
+    pub created_at: u32,
+    /// Ledger sequence when proposal was approved (0 if not approved)
+    pub approved_at: u32,
+    /// Ledger sequence when proposal can be executed (approved_at + 48 hours in ledgers)
+    pub executable_at: u32,
+    /// Whether proposal has been executed
+    pub executed: bool,
+    /// Number of votes in favor
+    pub votes_for: u32,
+    /// Number of votes against
+    pub votes_against: u32,
+    /// Addresses that have voted
+    pub voters: soroban_sdk::Vec<Address>,
+}
+
+/// Type of configuration change being proposed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalType {
+    /// Change fee percentage (new_fee_bps)
+    SetFee(u32),
+    /// Change wager limits (min, max)
+    SetWagerLimits(i128, i128),
+    /// Change treasury address
+    SetTreasury(Address),
+    /// Change pause state
+    SetPaused(bool),
 }
 
 /// Error codes for the coinflip contract.
@@ -206,6 +256,38 @@ pub enum Error {
     /// Returned by: `initialize`.
     /// Code: 51 — see [`error_codes::ALREADY_INITIALIZED`]
     AlreadyInitialized = 51,
+
+    // ── Governance errors (60–65) ───────────────────────────────────────────
+
+    /// Proposal not found.
+    /// Returned by: `vote_proposal`, `execute_proposal`.
+    /// Code: 60 — see [`error_codes::PROPOSAL_NOT_FOUND`]
+    ProposalNotFound = 60,
+
+    /// Proposal has already been executed.
+    /// Returned by: `execute_proposal`.
+    /// Code: 61 — see [`error_codes::PROPOSAL_ALREADY_EXECUTED`]
+    ProposalAlreadyExecuted = 61,
+
+    /// Proposal has not been approved yet.
+    /// Returned by: `execute_proposal`.
+    /// Code: 62 — see [`error_codes::PROPOSAL_NOT_APPROVED`]
+    ProposalNotApproved = 62,
+
+    /// Execution delay (48 hours) has not been met.
+    /// Returned by: `execute_proposal`.
+    /// Code: 63 — see [`error_codes::EXECUTION_DELAY_NOT_MET`]
+    ExecutionDelayNotMet = 63,
+
+    /// Address has already voted on this proposal.
+    /// Returned by: `vote_proposal`.
+    /// Code: 64 — see [`error_codes::ALREADY_VOTED`]
+    AlreadyVoted = 64,
+
+    /// Quorum not met for proposal approval.
+    /// Returned by: `vote_proposal`.
+    /// Code: 65 — see [`error_codes::QUORUM_NOT_MET`]
+    QuorumNotMet = 65,
 }
 
 /// The player's chosen side for a coinflip.
@@ -379,6 +461,10 @@ pub enum StorageKey {
     PlayerGame(Address),
     /// Per-player game history ring-buffer ([`Vec<HistoryEntry>`]), keyed by player address.
     PlayerHistory(Address),
+    /// Proposal by ID ([`Proposal`]).
+    Proposal(u32),
+    /// Next proposal ID counter.
+    ProposalCounter,
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -394,6 +480,12 @@ const MULTIPLIER_STREAK_1: u32 = 19_000; // 1.9x
 const MULTIPLIER_STREAK_2: u32 = 35_000; // 3.5x
 const MULTIPLIER_STREAK_3: u32 = 60_000; // 6.0x
 const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
+
+/// Governance constants
+/// 48 hours in ledgers (assuming 5 seconds per ledger)
+const EXECUTION_DELAY_LEDGERS: u32 = 34_560; // 48 hours * 3600 seconds / 5 seconds per ledger
+/// Minimum votes required for quorum (3 votes)
+const QUORUM_VOTES: u32 = 3;
 
 /// TTL constants for persistent storage entries.
 ///
@@ -1594,6 +1686,205 @@ impl CoinflipContract {
         // 2. Re-derive outcome and compare.
         let derived = generate_outcome(&env, &entry.secret, &entry.contract_random);
         Ok(derived == entry.outcome)
+    }
+
+    // ── Governance functions ────────────────────────────────────────────────
+
+    /// Create a new configuration change proposal.
+    ///
+    /// # Arguments
+    /// - `proposer` – address creating the proposal (must have Admin or Owner role)
+    /// - `proposal_type` – type of configuration change
+    ///
+    /// # Returns
+    /// The proposal ID
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – proposer does not have permission
+    pub fn create_proposal(
+        env: Env,
+        proposer: Address,
+        proposal_type: ProposalType,
+    ) -> Result<u32, Error> {
+        proposer.require_auth();
+
+        let config = Self::load_config(&env);
+        if proposer != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Get next proposal ID
+        let id = env.storage()
+            .persistent()
+            .get(&StorageKey::ProposalCounter)
+            .unwrap_or(0u32);
+        
+        let proposal = Proposal {
+            id,
+            proposer: proposer.clone(),
+            proposal_type,
+            created_at: env.ledger().sequence(),
+            approved_at: 0,
+            executable_at: 0,
+            executed: false,
+            votes_for: 0,
+            votes_against: 0,
+            voters: soroban_sdk::Vec::new(&env),
+        };
+
+        env.storage().persistent().set(&StorageKey::Proposal(id), &proposal);
+        env.storage().persistent().extend_ttl(&StorageKey::Proposal(id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        
+        env.storage().persistent().set(&StorageKey::ProposalCounter, &(id + 1));
+        env.storage().persistent().extend_ttl(&StorageKey::ProposalCounter, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Ok(id)
+    }
+
+    /// Vote on a proposal.
+    ///
+    /// # Arguments
+    /// - `voter` – address voting (must have Admin or Owner role)
+    /// - `proposal_id` – ID of the proposal
+    /// - `in_favor` – true to vote in favor, false to vote against
+    ///
+    /// # Errors
+    /// - [`Error::ProposalNotFound`] – proposal does not exist
+    /// - [`Error::ProposalAlreadyExecuted`] – proposal has already been executed
+    /// - [`Error::AlreadyVoted`] – voter has already voted on this proposal
+    /// - [`Error::Unauthorized`] – voter does not have permission
+    pub fn vote_proposal(
+        env: Env,
+        voter: Address,
+        proposal_id: u32,
+        in_favor: bool,
+    ) -> Result<(), Error> {
+        voter.require_auth();
+
+        let config = Self::load_config(&env);
+        if voter != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut proposal: Proposal = env.storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check if already voted
+        for i in 0..proposal.voters.len() {
+            if proposal.voters.get(i).unwrap() == voter {
+                return Err(Error::AlreadyVoted);
+            }
+        }
+
+        // Record vote
+        proposal.voters.push_back(voter);
+        if in_favor {
+            proposal.votes_for += 1;
+        } else {
+            proposal.votes_against += 1;
+        }
+
+        // Check if quorum is met and proposal is approved
+        let total_votes = proposal.votes_for + proposal.votes_against;
+        if total_votes >= QUORUM_VOTES && proposal.votes_for > proposal.votes_against {
+            proposal.approved_at = env.ledger().sequence();
+            proposal.executable_at = proposal.approved_at + EXECUTION_DELAY_LEDGERS;
+        }
+
+        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.storage().persistent().extend_ttl(&StorageKey::Proposal(proposal_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Ok(())
+    }
+
+    /// Execute an approved proposal after the execution delay.
+    ///
+    /// # Arguments
+    /// - `executor` – address executing the proposal (must have Admin or Owner role)
+    /// - `proposal_id` – ID of the proposal
+    ///
+    /// # Errors
+    /// - [`Error::ProposalNotFound`] – proposal does not exist
+    /// - [`Error::ProposalAlreadyExecuted`] – proposal has already been executed
+    /// - [`Error::ProposalNotApproved`] – proposal has not been approved
+    /// - [`Error::ExecutionDelayNotMet`] – 48-hour delay has not passed
+    /// - [`Error::Unauthorized`] – executor does not have permission
+    pub fn execute_proposal(
+        env: Env,
+        executor: Address,
+        proposal_id: u32,
+    ) -> Result<(), Error> {
+        executor.require_auth();
+
+        let config = Self::load_config(&env);
+        if executor != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut proposal: Proposal = env.storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        if proposal.approved_at == 0 {
+            return Err(Error::ProposalNotApproved);
+        }
+
+        if env.ledger().sequence() < proposal.executable_at {
+            return Err(Error::ExecutionDelayNotMet);
+        }
+
+        // Execute the proposal
+        let mut config = Self::load_config(&env);
+        match &proposal.proposal_type {
+            ProposalType::SetFee(fee_bps) => {
+                if *fee_bps < 200 || *fee_bps > 500 {
+                    return Err(Error::InvalidFeePercentage);
+                }
+                config.fee_bps = *fee_bps;
+            }
+            ProposalType::SetWagerLimits(min, max) => {
+                if *min >= *max {
+                    return Err(Error::InvalidWagerLimits);
+                }
+                config.min_wager = *min;
+                config.max_wager = *max;
+            }
+            ProposalType::SetTreasury(treasury) => {
+                config.treasury = treasury.clone();
+            }
+            ProposalType::SetPaused(paused) => {
+                config.paused = *paused;
+            }
+        }
+        Self::save_config(&env, &config);
+
+        proposal.executed = true;
+        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.storage().persistent().extend_ttl(&StorageKey::Proposal(proposal_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Ok(())
+    }
+
+    /// Get a proposal by ID.
+    ///
+    /// # Arguments
+    /// - `proposal_id` – ID of the proposal
+    ///
+    /// # Returns
+    /// The proposal, or None if not found
+    pub fn get_proposal(env: Env, proposal_id: u32) -> Option<Proposal> {
+        env.storage().persistent().get(&StorageKey::Proposal(proposal_id))
     }
 }
 
