@@ -48,7 +48,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &MIN, &MAX);
+    client.initialize(&admin, &treasury, &token, &300, &MIN, &MAX, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id, admin)
 }
 
@@ -83,7 +83,7 @@ fn min_accepted() {
     fund(&env, &contract_id, i128::MAX / 2);
     let player = Address::generate(&env);
     // Exactly at min must succeed (inclusive lower bound).
-    assert!(client.try_start_game(&player, &Side::Heads, &MIN, &commitment(&env)).is_ok());
+    assert!(client.try_start_game(&player, &Side::Heads, &MIN, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into())).is_ok());
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn max_accepted() {
     fund(&env, &contract_id, i128::MAX / 2);
     let player = Address::generate(&env);
     // Exactly at max must succeed (inclusive upper bound).
-    assert!(client.try_start_game(&player, &Side::Heads, &MAX, &commitment(&env)).is_ok());
+    assert!(client.try_start_game(&player, &Side::Heads, &MAX, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into())).is_ok());
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn zero_rejected() {
     let (env, client, contract_id, _) = setup();
     fund(&env, &contract_id, i128::MAX / 2);
     let player = Address::generate(&env);
-    let result = client.try_start_game(&player, &Side::Heads, &0, &commitment(&env));
+    let result = client.try_start_game(&player, &Side::Heads, &0, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
 }
 
@@ -143,7 +143,7 @@ fn i128_min_rejected() {
     let (env, client, contract_id, _) = setup();
     fund(&env, &contract_id, i128::MAX / 2);
     let player = Address::generate(&env);
-    let result = client.try_start_game(&player, &Side::Heads, &i128::MIN, &commitment(&env));
+    let result = client.try_start_game(&player, &Side::Heads, &i128::MIN, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
 }
 
@@ -153,7 +153,7 @@ fn i128_max_rejected() {
     fund(&env, &contract_id, i128::MAX / 2);
     let player = Address::generate(&env);
     // i128::MAX far exceeds max_wager; must be rejected as above maximum.
-    let result = client.try_start_game(&player, &Side::Heads, &i128::MAX, &commitment(&env));
+    let result = client.try_start_game(&player, &Side::Heads, &i128::MAX, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)));
 }
 
@@ -173,13 +173,13 @@ fn limit_update_takes_effect_immediately() {
 
     // Exactly new_min accepted
     assert!(client
-        .try_start_game(&player, &Side::Heads, &new_min, &commitment(&env))
+        .try_start_game(&player, &Side::Heads, &new_min, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()))
         .is_ok());
 
     // Exactly new_max accepted (need a fresh player — no active game)
     let player2 = Address::generate(&env);
     assert!(client
-        .try_start_game(&player2, &Side::Heads, &new_max, &commitment(&env))
+        .try_start_game(&player2, &Side::Heads, &new_max, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()))
         .is_ok());
 }
 
@@ -194,7 +194,7 @@ fn limit_update_old_min_now_rejected() {
 
     let player = Address::generate(&env);
     // Old MIN is now below the new minimum → rejected
-    let result = client.try_start_game(&player, &Side::Heads, &MIN, &commitment(&env));
+    let result = client.try_start_game(&player, &Side::Heads, &MIN, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
 }
 
@@ -209,7 +209,7 @@ fn limit_update_old_max_now_rejected() {
 
     let player = Address::generate(&env);
     // Old MAX is now above the new maximum → rejected
-    let result = client.try_start_game(&player, &Side::Heads, &MAX, &commitment(&env));
+    let result = client.try_start_game(&player, &Side::Heads, &MAX, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)));
 }
 
