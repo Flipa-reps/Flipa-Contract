@@ -171,6 +171,11 @@ pub enum Error {
     /// Code: 21 — see [`error_codes::INVALID_COMMITMENT`]
     InvalidCommitment = 21,
 
+    /// Maximum streak limit reached; player must cash out.
+    /// Returned by: `continue_streak`.
+    /// Code: 22 — see [`error_codes::MAX_STREAK_REACHED`]
+    MaxStreakReached = 22,
+
     // ── Admin errors (30–32) ────────────────────────────────────────────────
 
     /// Caller is not authorized for admin operations.
@@ -301,6 +306,8 @@ pub struct ContractConfig {
     pub max_wager: i128,
     /// Emergency pause flag; when `true`, `start_game` is rejected.
     pub paused: bool,
+    /// Maximum consecutive wins allowed before forced cash-out (default: 10).
+    pub max_streak: u32,
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -615,6 +622,7 @@ impl CoinflipContract {
             min_wager,
             max_wager,
             paused: false,
+            max_streak: 10, // Default: 10 consecutive wins maximum
         };
         
         let stats = ContractStats {
@@ -1213,7 +1221,13 @@ impl CoinflipContract {
             return Err(Error::InvalidCommitment);
         }
 
-        // Guard 5: reserves must cover the next streak's worst-case payout.
+        // Guard 5: check if max streak limit reached
+        let config = Self::load_config(&env);
+        if game.streak >= config.max_streak {
+            return Err(Error::MaxStreakReached);
+        }
+
+        // Guard 6: reserves must cover the next streak's worst-case payout.
         // Config is not needed here — all required data (wager, streak) is in GameState.
         let stats = Self::load_stats(&env);
 
@@ -1388,6 +1402,43 @@ impl CoinflipContract {
         }
 
         config.fee_bps = fee_bps;
+        Self::save_config(&env, &config);
+
+        Ok(())
+    }
+
+    /// Updates the maximum streak limit (admin-only).
+    ///
+    /// Guards:
+    /// 1. Requires admin authorization.
+    /// 2. Caller must be the configured admin.
+    /// 3. Max streak must be at least 1.
+    ///
+    /// # Arguments
+    /// - `admin` – must match `config.admin`
+    /// - `max_streak` – new maximum consecutive wins allowed (minimum: 1)
+    ///
+    /// # Returns
+    /// - `Ok(())` on success
+    /// - `Err(Unauthorized)` if caller is not admin
+    /// - `Err(InvalidWagerLimits)` if max_streak < 1 (reusing error for validation)
+    pub fn set_max_streak(env: Env, admin: Address, max_streak: u32) -> Result<(), Error> {
+        // Guard 1: require admin authorization before touching any state.
+        admin.require_auth();
+
+        let mut config = Self::load_config(&env);
+
+        // Guard 2: caller must be the configured admin.
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard 3: max_streak must be at least 1
+        if max_streak < 1 {
+            return Err(Error::InvalidWagerLimits); // Reusing for validation
+        }
+
+        config.max_streak = max_streak;
         Self::save_config(&env, &config);
 
         Ok(())

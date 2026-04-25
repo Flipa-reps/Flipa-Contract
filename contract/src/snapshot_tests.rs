@@ -66,6 +66,7 @@ fn contract_config_edge_cases() {
         min_wager: 1_000_000,
         max_wager: i128::MAX / 10, // near max
         paused: true,
+        max_streak: 10,
     };
 
     assert_snapshot!(borsh_to_hex(&env, &config_paused));
@@ -86,6 +87,7 @@ fn contract_config_roundtrip() {
         min_wager: 1_000_000,
         max_wager: 100_000_000,
         paused: false,
+        max_streak: 10,
     };
 
     // Serialize → deserialize → reserialize → must match original bytes
@@ -342,6 +344,7 @@ fn upgrade_simulation_config_compatibility() {
         min_wager: 1_000_000,
         max_wager: 100_000_000,
         paused: false,
+        max_streak: 10,
     };
     
     // Serialize
@@ -364,8 +367,8 @@ fn upgrade_simulation_stats_compatibility() {
     // Create stats with current schema
     let stats = ContractStats {
         total_games: 1000,
-        total_wins: 600,
-        total_losses: 400,
+        total_volume: 100_000_000,
+        total_fees: 3_000_000,
         reserve_balance: 50_000_000,
     };
     
@@ -377,8 +380,8 @@ fn upgrade_simulation_stats_compatibility() {
     
     // Verify all fields preserved
     assert_eq!(deserialized.total_games, 1000);
-    assert_eq!(deserialized.total_wins, 600);
-    assert_eq!(deserialized.total_losses, 400);
+    assert_eq!(deserialized.total_volume, 100_000_000);
+    assert_eq!(deserialized.total_fees, 3_000_000);
     assert_eq!(deserialized.reserve_balance, 50_000_000);
 }
 
