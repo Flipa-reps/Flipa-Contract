@@ -111,6 +111,14 @@ pub mod error_codes {
     /// Reveal attempted in the same ledger as game start; must wait at least one ledger.
     pub const REVEAL_TOO_EARLY: u32 = 60;
 
+    // Governance errors (60–65)
+    pub const PROPOSAL_NOT_FOUND: u32 = 60;
+    pub const PROPOSAL_ALREADY_EXECUTED: u32 = 61;
+    pub const PROPOSAL_NOT_APPROVED: u32 = 62;
+    pub const EXECUTION_DELAY_NOT_MET: u32 = 63;
+    pub const ALREADY_VOTED: u32 = 64;
+    pub const QUORUM_NOT_MET: u32 = 65;
+
     /// Total number of defined error variants.
     pub const VARIANT_COUNT: usize = 25;
     pub const VARIANT_COUNT: usize = 18;
@@ -990,6 +998,12 @@ const MULTIPLIER_STREAK_1: u32 = 19_000; // 1.9x
 const MULTIPLIER_STREAK_2: u32 = 35_000; // 3.5x
 const MULTIPLIER_STREAK_3: u32 = 60_000; // 6.0x
 const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
+
+/// Governance constants
+/// 48 hours in ledgers (assuming 5 seconds per ledger)
+const EXECUTION_DELAY_LEDGERS: u32 = 34_560; // 48 hours * 3600 seconds / 5 seconds per ledger
+/// Minimum votes required for quorum (3 votes)
+const QUORUM_VOTES: u32 = 3;
 
 /// TTL constants for persistent storage entries.
 ///
