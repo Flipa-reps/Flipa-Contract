@@ -1637,6 +1637,11 @@ impl CoinflipContract {
         if min_wager >= max_wager {
             return Err(Error::InvalidWagerLimits);
         }
+
+        // Validate reveal timeout (50-1000 ledgers)
+        if reveal_timeout_ledgers < 50 || reveal_timeout_ledgers > 1000 {
+            return Err(Error::InvalidTimeout);
+        }
         
         let mut multipliers = Vec::new(&env);
         multipliers.push_back(MULTIPLIER_STREAK_1);
@@ -2079,6 +2084,24 @@ impl CoinflipContract {
         }
         if config.shutdown_mode {
             return Err(Error::ContractShutdown);
+        }
+
+        // Guard 2 & 3: Wager must be within configured bounds [min_wager, max_wager].
+        // Uses strict inequalities to ensure inclusive bounds:
+        // - Rejects wagers LESS THAN min (strictly below minimum)
+        // - Rejects wagers GREATER THAN max (strictly above maximum)
+        // This means exactly min and max are ACCEPTED.
+        if wager < config.min_wager {
+            return Err(Error::WagerBelowMinimum);
+        }
+        if wager > config.max_wager {
+            return Err(Error::WagerAboveMaximum);
+        }
+
+        // Validate timeout if provided, otherwise use config default
+        let timeout = timeout_ledgers.unwrap_or(config.reveal_timeout_ledgers);
+        if timeout < 50 || timeout > 1000 {
+            return Err(Error::InvalidTimeout);
         }
 
         // Guard 2 & 3: Wager must be within configured bounds [min_wager, max_wager].
