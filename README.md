@@ -63,6 +63,25 @@ cargo test --manifest-path contract/Cargo.toml
 
 Current test coverage is limited to setup, initialization, and early storage behavior. It does not yet cover the full game flow.
 
+## Load and Stress Testing
+
+Comprehensive load testing framework simulating hundreds to thousands of concurrent users.
+
+```bash
+# Quick start - run all load tests
+./scripts/run-load-tests.sh
+
+# Contract load tests only
+npm run contract:load
+
+# Frontend load tests only (requires dev server running)
+npm run load:basic
+npm run load:game-flow
+npm run load:stress
+```
+
+See [LOAD_TESTING.md](LOAD_TESTING.md) for detailed documentation, performance baselines, and analysis guide.
+
 ## Frontend Start
 
 ```bash
