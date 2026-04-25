@@ -27,7 +27,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id)
 }
 
@@ -106,6 +106,8 @@ fn test_reclaim_wager_revealed_phase_rejected() {
         fee_bps: 300,
         phase: GamePhase::Revealed,
         start_ledger: 0,
+    
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(&contract_id, || {
         CoinflipContract::save_player_game(&env, &player, &game);
@@ -228,7 +230,7 @@ fn test_reclaim_wager_allows_new_game_after_cleanup() {
         &player,
         &Side::Heads,
         &5_000_000,
-        &make_commitment(&env, 42),
+        &make_commitment(&env, 42, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert!(result.is_ok(), "player must be able to start a new game after reclaim");
 }
@@ -240,7 +242,7 @@ fn test_reclaim_wager_cannot_be_called_immediately_after_start_game() {
     let (env, client, contract_id) = setup();
     fund(&env, &contract_id, 1_000_000_000);
     let player = Address::generate(&env);
-    client.start_game(&player, &Side::Heads, &5_000_000, &make_commitment(&env, 1));
+    client.start_game(&player, &Side::Heads, &5_000_000, &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     // No ledger advance — should be rejected
     assert_eq!(
         client.try_reclaim_wager(&player),
@@ -255,9 +257,10 @@ fn test_reveal_before_timeout_prevents_reclaim() {
     let player = Address::generate(&env);
     let secret = make_secret(&env, 1);
     let commitment = make_commitment(&env, 1);
-    client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
+    client.start_game(&player, &Side::Heads, &5_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     // Reveal before timeout
-    client.reveal(&player, &secret);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+    client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     // Advance past timeout
     advance_ledger(&env, TIMEOUT + 10);
     // Game is now in Revealed phase — reclaim must be rejected

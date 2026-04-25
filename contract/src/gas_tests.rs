@@ -71,7 +71,7 @@ fn gas_start_game_baseline() {
     let commitment = BytesN::<32>::random(&env);
 
     let gas_used = measure_gas(&env, || {
-        client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
+        client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     });
 
     // Document baseline: start_game should use reasonable gas
@@ -90,10 +90,11 @@ fn gas_reveal_baseline() {
     let secret = Bytes::random(&env, 32);
     let commitment = env.crypto().sha256(&secret).into();
 
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     let gas_used = measure_gas(&env, || {
-        client.reveal(&player, &secret);
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+        client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     });
 
     // Document baseline: reveal should use reasonable gas
@@ -112,8 +113,9 @@ fn gas_cash_out_baseline() {
     let secret = Bytes::random(&env, 32);
     let commitment = env.crypto().sha256(&secret).into();
 
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
-    client.reveal(&player, &secret);
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+    client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
     let gas_used = measure_gas(&env, || {
         client.cash_out(&player);
@@ -140,7 +142,7 @@ fn gas_start_game_consistency() {
         let commitment = BytesN::<32>::random(&env);
 
         let gas_used = measure_gas(&env, || {
-            client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
+            client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         });
 
         gas_measurements.push(gas_used);
@@ -172,10 +174,11 @@ fn gas_reveal_consistency() {
         let secret = Bytes::random(&env, 32);
         let commitment = env.crypto().sha256(&secret).into();
 
-        client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
+        client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
         let gas_used = measure_gas(&env, || {
-            client.reveal(&player, &secret);
+            env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         });
 
         gas_measurements.push(gas_used);
@@ -206,7 +209,7 @@ fn gas_start_game_min_wager() {
     let commitment = BytesN::<32>::random(&env);
 
     let gas_used = measure_gas(&env, || {
-        client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
+        client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     });
 
     assert!(gas_used > 0, "start_game with min wager should consume gas");
@@ -223,7 +226,7 @@ fn gas_start_game_max_wager() {
     let commitment = BytesN::<32>::random(&env);
 
     let gas_used = measure_gas(&env, || {
-        client.start_game(&player, &Side::Heads, &100_000_000, &commitment);
+        client.start_game(&player, &Side::Heads, &100_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     });
 
     assert!(gas_used > 0, "start_game with max wager should consume gas");
@@ -243,8 +246,9 @@ fn gas_full_game_flow_within_budget() {
     let commitment = env.crypto().sha256(&secret).into();
 
     let total_gas = measure_gas(&env, || {
-        client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
-        client.reveal(&player, &secret);
+        client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+        client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         client.cash_out(&player);
     });
 
@@ -268,8 +272,9 @@ fn gas_multiple_games_efficiency() {
         let commitment = env.crypto().sha256(&secret).into();
 
         total_gas += measure_gas(&env, || {
-            client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
-            client.reveal(&player, &secret);
+            client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             client.cash_out(&player);
         });
     }

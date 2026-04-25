@@ -63,11 +63,11 @@ fn payout_zero_wager_returns_zero() {
 }
 
 /// Test payout breakdown with zero wager.
-/// Should return Some((0, 0, 0)).
+/// Should return Some((0, 0, 0, 0)).
 #[test]
 fn payout_breakdown_zero_wager_returns_zeros() {
     let result = calculate_payout_breakdown(0, 1, 300);
-    assert_eq!(result, Some((0, 0, 0)), "zero wager should return (0, 0, 0)");
+    assert_eq!(result, Some((0, 0, 0, 0)), "zero wager should return (0, 0, 0)");
 }
 
 // ── Boundary: Minimum fee (200 bps) ─────────────────────────────────────────
@@ -88,7 +88,7 @@ fn payout_min_fee_200bps_succeeds() {
 fn payout_breakdown_min_fee_200bps_succeeds() {
     let result = calculate_payout_breakdown(1_000_000, 1, 200);
     assert!(result.is_some(), "minimum fee should not overflow");
-    let (gross, fee, net) = result.unwrap();
+    let (gross, fee, net, _bonus) = result.unwrap();
     assert!(gross > 0, "gross should be positive");
     assert!(fee > 0, "fee should be positive");
     assert!(net > 0, "net should be positive");
@@ -113,7 +113,7 @@ fn payout_max_fee_500bps_succeeds() {
 fn payout_breakdown_max_fee_500bps_succeeds() {
     let result = calculate_payout_breakdown(1_000_000, 1, 500);
     assert!(result.is_some(), "maximum fee should not overflow");
-    let (gross, fee, net) = result.unwrap();
+    let (gross, fee, net, _bonus) = result.unwrap();
     assert!(gross > 0, "gross should be positive");
     assert!(fee > 0, "fee should be positive");
     assert!(net > 0, "net should be positive");
@@ -140,7 +140,7 @@ fn payout_zero_fee_0bps_returns_gross() {
 fn payout_breakdown_zero_fee_0bps_returns_zero_fee() {
     let result = calculate_payout_breakdown(1_000_000, 1, 0);
     assert!(result.is_some(), "zero fee should not overflow");
-    let (gross, fee, net) = result.unwrap();
+    let (gross, fee, net, _bonus) = result.unwrap();
     assert_eq!(fee, 0, "fee should be zero");
     assert_eq!(gross, net, "net should equal gross when fee is zero");
 }
@@ -226,7 +226,7 @@ fn payout_breakdown_invariant_gross_minus_fee_equals_net() {
     ];
 
     for (wager, streak, fee_bps) in test_cases {
-        if let Some((gross, fee, net)) = calculate_payout_breakdown(wager, streak, fee_bps) {
+        if let Some((gross, fee, net, _bonus)) = calculate_payout_breakdown(wager, streak, fee_bps) {
             assert_eq!(
                 gross - fee, net,
                 "invariant failed for wager={}, streak={}, fee_bps={}",
@@ -255,7 +255,7 @@ fn payout_equals_breakdown_net() {
         let breakdown = calculate_payout_breakdown(wager, streak, fee_bps);
 
         match (payout, breakdown) {
-            (Some(p), Some((_, _, net))) => {
+            (Some(p), Some((_, _, net, _))) => {
                 assert_eq!(p, net, "payout should equal net from breakdown");
             }
             (None, None) => {
@@ -283,7 +283,7 @@ fn payout_breakdown_fee_is_non_negative() {
     ];
 
     for (wager, streak, fee_bps) in test_cases {
-        if let Some((_, fee, _)) = calculate_payout_breakdown(wager, streak, fee_bps) {
+        if let Some((_, fee, _, _)) = calculate_payout_breakdown(wager, streak, fee_bps) {
             assert!(fee >= 0, "fee should be non-negative");
         }
     }
@@ -304,7 +304,7 @@ fn payout_breakdown_net_is_non_negative() {
     ];
 
     for (wager, streak, fee_bps) in test_cases {
-        if let Some((_, _, net)) = calculate_payout_breakdown(wager, streak, fee_bps) {
+        if let Some((_, _, net, _)) = calculate_payout_breakdown(wager, streak, fee_bps) {
             assert!(net >= 0, "net should be non-negative");
         }
     }
@@ -330,7 +330,7 @@ fn payout_breakdown_large_safe_wager_succeeds() {
     let large_wager = 1_000_000_000_000i128; // 1 trillion stroops
     let result = calculate_payout_breakdown(large_wager, 1, 300);
     assert!(result.is_some(), "large safe wager should not overflow");
-    let (gross, fee, net) = result.unwrap();
+    let (gross, fee, net, _bonus) = result.unwrap();
     assert!(gross > 0, "gross should be positive");
     assert!(fee > 0, "fee should be positive");
     assert!(net > 0, "net should be positive");
