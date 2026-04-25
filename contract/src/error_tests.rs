@@ -1,7 +1,7 @@
 /// Comprehensive error code stability validation tests for the Tossd contract.
 ///
 /// # Coverage
-/// - Test all 17 error variants are reachable
+/// - Test all 18 error variants are reachable
 /// - Validate error code numeric stability
 /// - Ensure error messages are descriptive
 /// - Test error propagation through call stack
@@ -39,12 +39,13 @@ fn error_codes_match_constants() {
     assert_eq!(error_codes::TRANSFER_FAILED, 40);
     assert_eq!(error_codes::ADMIN_TREASURY_CONFLICT, 50);
     assert_eq!(error_codes::ALREADY_INITIALIZED, 51);
+    assert_eq!(error_codes::DUPLICATE_COMMITMENT, 52);
 }
 
 /// Verify error code variant count matches documented value.
 #[test]
 fn error_codes_variant_count_correct() {
-    assert_eq!(error_codes::VARIANT_COUNT, 17);
+    assert_eq!(error_codes::VARIANT_COUNT, 18);
 }
 
 // ── Error reachability tests ────────────────────────────────────────────────
@@ -453,4 +454,9 @@ fn error_code_reference_documentation() {
     //   - Contract has already been initialized
     //   - Returned by: initialize
     //   - Resolution: Contract can only be initialized once
+    //
+    // Code 52: DuplicateCommitment
+    //   - Commitment has already been used in a previous game
+    //   - Returned by: start_game, continue_streak
+    //   - Resolution: Generate a fresh secret and commitment for each game
 }

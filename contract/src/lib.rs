@@ -90,6 +90,7 @@ pub mod error_codes {
     // Initialization errors (50–51)
     pub const ADMIN_TREASURY_CONFLICT: u32 = 50;
     pub const ALREADY_INITIALIZED: u32 = 51;
+    pub const DUPLICATE_COMMITMENT: u32 = 52;
 
     // Governance errors (60–65)
     pub const PROPOSAL_NOT_FOUND: u32 = 60;
@@ -104,6 +105,7 @@ pub mod error_codes {
 
     /// Total number of defined error variants.
     pub const VARIANT_COUNT: usize = 25;
+    pub const VARIANT_COUNT: usize = 18;
 }
 
 /// Error codes for the coinflip contract.
@@ -296,6 +298,10 @@ pub enum SideBet {
     /// Caller holds a role that is insufficient for the requested operation.
     /// Code: 70
     InsufficientRole = 70,
+    /// Commitment has already been used in a previous game; reuse is rejected.
+    /// Returned by: `start_game`, `continue_streak`.
+    /// Code: 52 — prevents replay attacks.
+    DuplicateCommitment = 52,
 }
 
 /// The player's chosen side for a coinflip.
@@ -408,6 +414,10 @@ pub struct ContractConfig {
     pub multipliers: Vec<u32>,
     /// Multiplier tier configuration; snapshotted into each new game.
     pub multipliers: MultiplierConfig,
+    /// Circuit-breaker threshold in stroops. When `reserve_balance` drops at or
+    /// below this value, `start_game` is auto-paused with [`Error::ContractPaused`].
+    /// Set to 0 to disable the circuit breaker.
+    pub min_reserve_threshold: i128,
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -849,6 +859,8 @@ pub struct EventAdminAction {
     /// `Symbol("set_wager_limits")`, or `Symbol("set_fee")`.
     pub action: soroban_sdk::Symbol,
     pub admin:  Address,
+    /// Set of used commitment hashes to prevent replay attacks.
+    UsedCommitments,
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -1257,6 +1269,7 @@ impl CoinflipContract {
             shutdown_mode: false,
             multipliers,
             multipliers: MultiplierConfig::default_config(),
+            min_reserve_threshold: 0,
         };
         
         let stats = ContractStats {
@@ -1598,6 +1611,16 @@ impl CoinflipContract {
         // Gas optimization: cache ledger sequence to avoid redundant calls
         let ledger_seq = env.ledger().sequence();
         
+        // Guard 6 (circuit breaker): auto-pause when reserves drop at or below threshold.
+        if config.min_reserve_threshold > 0 && stats.reserve_balance <= config.min_reserve_threshold {
+            return Err(Error::ContractPaused);
+        }
+
+        // Guard 7: reject reused commitments to prevent replay attacks.
+        if Self::is_commitment_used(&env, &commitment) {
+            return Err(Error::DuplicateCommitment);
+        }
+
         // Generate contract-side randomness contribution from ledger sequence
         let seq_bytes = ledger_seq.to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
@@ -1621,6 +1644,7 @@ impl CoinflipContract {
         };
 
         Self::save_player_game(&env, &player, &game);
+        Self::mark_commitment_used(&env, &game.commitment);
 
         // Track referral if provided
         if let Some(ref referrer_addr) = referrer {
@@ -1811,6 +1835,7 @@ impl CoinflipContract {
     pub fn claim_winnings(
         env: Env,
         player: Address,
+        secret: Bytes,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -1920,6 +1945,20 @@ impl CoinflipContract {
                 Self::save_referral_stats(&env, &referrer, &referrer_stats);
             }
         }
+
+        // Record history with the provided secret so verify_past_game works.
+        Self::save_history_entry(&env, &player, HistoryEntry {
+            wager: game.wager,
+            side: game.side,
+            outcome: game.side, // won, so outcome == side
+            won: true,
+            streak: game.streak,
+            commitment: game.commitment.clone(),
+            secret,
+            contract_random: game.contract_random.clone(),
+            payout: net_payout,
+            ledger: game.start_ledger,
+        });
 
         // Mark game completed before transfers for the same reason.
         game.phase = GamePhase::Completed;
@@ -2177,6 +2216,11 @@ impl CoinflipContract {
             return Err(Error::InvalidCommitment);
         }
 
+        // Guard 4b: reject reused commitments to prevent replay attacks.
+        if Self::is_commitment_used(&env, &new_commitment) {
+            return Err(Error::DuplicateCommitment);
+        }
+
         // Guard 5: reserves must cover the next streak's worst-case payout.
         // Config is not needed here — all required data (wager, streak) is in GameState.
         let stats = Self::load_stats(&env);
@@ -2207,6 +2251,7 @@ impl CoinflipContract {
         game.contract_random = contract_random.into();
 
         Self::save_player_game(&env, &player, &game);
+        Self::mark_commitment_used(&env, &new_commitment);
 
         Self::emit_streak_continued(&env, EventStreakContinued {
             player,
@@ -2836,6 +2881,47 @@ impl CoinflipContract {
     /// Return the registered voter list.
     pub fn get_voters(env: Env) -> soroban_sdk::Vec<Address> {
         Self::load_voters(&env)
+    /// Update the circuit-breaker reserve threshold.
+    ///
+    /// When `reserve_balance <= min_reserve_threshold`, `start_game` is automatically
+    /// rejected with [`Error::ContractPaused`]. Set to `0` to disable.
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
+    pub fn set_min_reserve_threshold(env: Env, admin: Address, threshold: i128) -> Result<(), Error> {
+        admin.require_auth();
+        let mut config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        config.min_reserve_threshold = threshold;
+        Self::save_config(&env, &config);
+        Ok(())
+    }
+
+    // ── Commitment nonce tracking helpers ───────────────────────────────────
+
+    /// Returns `true` if `commitment` has already been used in a previous game.
+    fn is_commitment_used(env: &Env, commitment: &BytesN<32>) -> bool {
+        let key = StorageKey::UsedCommitments;
+        let used: soroban_sdk::Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        used.contains(commitment)
+    }
+
+    /// Record `commitment` as used so future attempts are rejected.
+    fn mark_commitment_used(env: &Env, commitment: &BytesN<32>) {
+        let key = StorageKey::UsedCommitments;
+        let mut used: soroban_sdk::Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        used.push_back(commitment.clone());
+        env.storage().instance().set(&key, &used);
     }
 
     /// Reclaim a wager from a game that has exceeded the reveal timeout.
@@ -3269,6 +3355,7 @@ mod governance_tests;
 
 #[cfg(test)]
 mod rbac_tests;
+mod circuit_breaker_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3407,6 +3494,7 @@ mod tests {
         assert_eq!(Error::TransferFailed as u32, 40);
         assert_eq!(Error::AdminTreasuryConflict as u32, 50);
         assert_eq!(Error::AlreadyInitialized as u32, 51);
+        assert_eq!(Error::DuplicateCommitment as u32, 52);
     }
 
     #[test]
@@ -3876,7 +3964,7 @@ mod tests {
         // Inject a Revealed game with streak == 0 (loss state).
         inject_game(&env, &contract_id, &player, GamePhase::Revealed, 0, 10_000_000);
 
-        let result = client.try_claim_winnings(&player);
+        let result = client.try_claim_winnings(&player, &Bytes::new(&env));
         assert_eq!(result, Err(Ok(Error::NoWinningsToClaimOrContinue)));
 
         // State must be unchanged — no partial mutation.
@@ -6799,6 +6887,7 @@ mod property_tests {
             prop_assert_eq!(Error::TransferFailed as u32, error_codes::TRANSFER_FAILED);
             prop_assert_eq!(Error::AdminTreasuryConflict as u32, error_codes::ADMIN_TREASURY_CONFLICT);
             prop_assert_eq!(Error::AlreadyInitialized as u32, error_codes::ALREADY_INITIALIZED);
+            prop_assert_eq!(Error::DuplicateCommitment as u32, error_codes::DUPLICATE_COMMITMENT);
         }
 
         /// VARIANT_COUNT must exactly match the number of Error enum variants.
@@ -6825,6 +6914,7 @@ mod property_tests {
                 error_codes::TRANSFER_FAILED,
                 error_codes::ADMIN_TREASURY_CONFLICT,
                 error_codes::ALREADY_INITIALIZED,
+                error_codes::DUPLICATE_COMMITMENT,
             ];
             prop_assert_eq!(all_codes.len(), error_codes::VARIANT_COUNT);
         }
@@ -10322,8 +10412,8 @@ mod security_penetration_tests {
         env.as_contract(&contract_id, || {
             CoinflipContract::save_player_game(&env, &player, &game);
         });
-        let _ = client.try_claim_winnings(&player);
-        let second = client.try_claim_winnings(&player);
+        let _ = client.try_claim_winnings(&player, &Bytes::new(&env));
+        let second = client.try_claim_winnings(&player, &Bytes::new(&env));
         assert!(
             second == Err(Ok(Error::InvalidPhase)) || second == Err(Ok(Error::NoActiveGame)),
             "second claim must be rejected: {:?}", second
