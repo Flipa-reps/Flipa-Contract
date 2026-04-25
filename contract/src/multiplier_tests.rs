@@ -168,7 +168,7 @@ fn payout_higher_fee_produces_lower_net() {
 /// gross = 10_000_000 × 19_000 / 10_000 = 19_000_000
 #[test]
 fn payout_fee_zero_net_equals_gross() {
-    let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 1, 0).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(10_000_000, 1, 0).unwrap().unwrap();
     assert_eq!(fee, 0);
     assert_eq!(net, gross);
 }
@@ -176,7 +176,7 @@ fn payout_fee_zero_net_equals_gross() {
 /// Fee 10_000 bps (100%): net must be 0 (all gross taken as fee).
 #[test]
 fn payout_fee_10000_net_is_zero() {
-    let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 1, 10_000).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(10_000_000, 1, 10_000).unwrap().unwrap();
     assert_eq!(fee, gross);
     assert_eq!(net, 0);
 }
@@ -192,7 +192,7 @@ fn payout_wager_1_stroop_returns_some() {
 /// Zero wager: gross, fee, and net must all be 0.
 #[test]
 fn payout_wager_zero_all_components_zero() {
-    let (gross, fee, net) = calculate_payout_breakdown(0, 1, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(0, 1, 300).unwrap().unwrap();
     assert_eq!(gross, 0);
     assert_eq!(fee, 0);
     assert_eq!(net, 0);
@@ -253,7 +253,7 @@ fn payout_near_overflow_boundary_returns_some() {
 /// Streak 1 full breakdown.
 #[test]
 fn breakdown_streak_1_all_components() {
-    let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 1, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(10_000_000, 1, 300).unwrap().unwrap();
     assert_eq!(gross, 19_000_000);
     assert_eq!(fee, 570_000);
     assert_eq!(net, 18_430_000);
@@ -265,7 +265,7 @@ fn breakdown_streak_1_all_components() {
 /// net   = 33_950_000
 #[test]
 fn breakdown_streak_2_all_components() {
-    let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 2, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(10_000_000, 2, 300).unwrap().unwrap();
     assert_eq!(gross, 35_000_000);
     assert_eq!(fee, 1_050_000);
     assert_eq!(net, 33_950_000);
@@ -277,7 +277,7 @@ fn breakdown_streak_2_all_components() {
 /// net   = 58_200_000
 #[test]
 fn breakdown_streak_3_all_components() {
-    let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 3, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(10_000_000, 3, 300).unwrap().unwrap();
     assert_eq!(gross, 60_000_000);
     assert_eq!(fee, 1_800_000);
     assert_eq!(net, 58_200_000);
@@ -289,7 +289,7 @@ fn breakdown_streak_3_all_components() {
 /// net   = 97_000_000
 #[test]
 fn breakdown_streak_4_all_components() {
-    let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 4, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(10_000_000, 4, 300).unwrap().unwrap();
     assert_eq!(gross, 100_000_000);
     assert_eq!(fee, 3_000_000);
     assert_eq!(net, 97_000_000);
@@ -318,7 +318,7 @@ fn invariant_gross_minus_fee_equals_net() {
         (5_000_000, 2, 400),
     ];
     for &(wager, streak, fee_bps) in cases {
-        let (gross, fee, net) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap().unwrap();
+        let (gross, fee, net, _bonus) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap().unwrap();
         assert_eq!(
             gross - fee,
             net,
@@ -339,7 +339,7 @@ fn invariant_payout_net_matches_breakdown_net() {
         (50_000_000, 3, 300),
     ];
     for &(wager, streak, fee_bps) in cases {
-        let (_, _, breakdown_net) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap().unwrap();
+        let (_, _, breakdown_net, _) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap().unwrap();
         let payout_net = calculate_payout(wager, streak, fee_bps).unwrap().unwrap();
         assert_eq!(
             payout_net,
@@ -354,7 +354,7 @@ fn invariant_payout_net_matches_breakdown_net() {
 fn invariant_net_never_exceeds_gross() {
     for streak in [1, 2, 3, 4] {
         for fee_bps in [200, 300, 400, 500] {
-            let (gross, _fee, net) = calculate_payout_breakdown(10_000_000, streak, fee_bps).unwrap().unwrap();
+            let (gross, _fee, net, _bonus) = calculate_payout_breakdown(10_000_000, streak, fee_bps).unwrap().unwrap();
             assert!(
                 net <= gross,
                 "net({net}) > gross({gross}) for streak={streak} fee_bps={fee_bps}"
@@ -368,7 +368,7 @@ fn invariant_net_never_exceeds_gross() {
 fn invariant_gross_always_greater_than_wager() {
     let wager = 10_000_000_i128;
     for streak in [1, 2, 3, 4] {
-        let (gross, _fee, _net) = calculate_payout_breakdown(wager, streak, 300).unwrap().unwrap();
+        let (gross, _fee, _net, _bonus) = calculate_payout_breakdown(wager, streak, 300).unwrap().unwrap();
         assert!(
             gross > wager,
             "gross({gross}) should be > wager({wager}) for streak={streak}"
@@ -381,10 +381,10 @@ fn invariant_gross_always_greater_than_wager() {
 fn invariant_higher_streak_produces_higher_gross() {
     let wager = 10_000_000_i128;
     let fee_bps = 300_u32;
-    let (gross1, _, _) = calculate_payout_breakdown(wager, 1, fee_bps).unwrap().unwrap();
-    let (gross2, _, _) = calculate_payout_breakdown(wager, 2, fee_bps).unwrap().unwrap();
-    let (gross3, _, _) = calculate_payout_breakdown(wager, 3, fee_bps).unwrap().unwrap();
-    let (gross4, _, _) = calculate_payout_breakdown(wager, 4, fee_bps).unwrap().unwrap();
+    let (gross1, _, _, _) = calculate_payout_breakdown(wager, 1, fee_bps).unwrap().unwrap();
+    let (gross2, _, _, _) = calculate_payout_breakdown(wager, 2, fee_bps).unwrap().unwrap();
+    let (gross3, _, _, _) = calculate_payout_breakdown(wager, 3, fee_bps).unwrap().unwrap();
+    let (gross4, _, _, _) = calculate_payout_breakdown(wager, 4, fee_bps).unwrap().unwrap();
     assert!(gross1 < gross2);
     assert!(gross2 < gross3);
     assert!(gross3 < gross4);
@@ -396,8 +396,8 @@ fn invariant_higher_streak_produces_higher_gross() {
 fn invariant_payout_scales_linearly_with_wager() {
     let fee_bps = 300_u32;
     for streak in [1, 2, 3, 4] {
-        let (g1, f1, n1) = calculate_payout_breakdown(10_000_000, streak, fee_bps).unwrap().unwrap();
-        let (g2, f2, n2) = calculate_payout_breakdown(20_000_000, streak, fee_bps).unwrap().unwrap();
+        let (g1, f1, n1, _) = calculate_payout_breakdown(10_000_000, streak, fee_bps).unwrap().unwrap();
+        let (g2, f2, n2, _) = calculate_payout_breakdown(20_000_000, streak, fee_bps).unwrap().unwrap();
         assert_eq!(g2, g1 * 2, "gross should double for streak={streak}");
         assert_eq!(f2, f1 * 2, "fee should double for streak={streak}");
         assert_eq!(n2, n1 * 2, "net should double for streak={streak}");
@@ -498,7 +498,7 @@ fn multiplier_tier_transition_4_to_5_cap_plateau() {
 #[test]
 fn multiplier_payout_tier_1_1_9x() {
     let wager = 10_000_000i128;
-    let (gross, fee, net) = calculate_payout_breakdown(wager, 1, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(wager, 1, 300).unwrap().unwrap();
     assert_eq!(gross, 19_000_000, "tier 1 gross should be 1.9x wager");
     assert_eq!(fee, 570_000, "tier 1 fee should be 3% of gross");
     assert_eq!(net, 18_430_000, "tier 1 net should be gross - fee");
@@ -508,7 +508,7 @@ fn multiplier_payout_tier_1_1_9x() {
 #[test]
 fn multiplier_payout_tier_2_3_5x() {
     let wager = 10_000_000i128;
-    let (gross, fee, net) = calculate_payout_breakdown(wager, 2, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(wager, 2, 300).unwrap().unwrap();
     assert_eq!(gross, 35_000_000, "tier 2 gross should be 3.5x wager");
     assert_eq!(fee, 1_050_000, "tier 2 fee should be 3% of gross");
     assert_eq!(net, 33_950_000, "tier 2 net should be gross - fee");
@@ -518,7 +518,7 @@ fn multiplier_payout_tier_2_3_5x() {
 #[test]
 fn multiplier_payout_tier_3_6_0x() {
     let wager = 10_000_000i128;
-    let (gross, fee, net) = calculate_payout_breakdown(wager, 3, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(wager, 3, 300).unwrap().unwrap();
     assert_eq!(gross, 60_000_000, "tier 3 gross should be 6.0x wager");
     assert_eq!(fee, 1_800_000, "tier 3 fee should be 3% of gross");
     assert_eq!(net, 58_200_000, "tier 3 net should be gross - fee");
@@ -528,7 +528,7 @@ fn multiplier_payout_tier_3_6_0x() {
 #[test]
 fn multiplier_payout_tier_4_plus_10_0x() {
     let wager = 10_000_000i128;
-    let (gross, fee, net) = calculate_payout_breakdown(wager, 4, 300).unwrap().unwrap();
+    let (gross, fee, net, _bonus) = calculate_payout_breakdown(wager, 4, 300).unwrap().unwrap();
     assert_eq!(gross, 100_000_000, "tier 4+ gross should be 10.0x wager");
     assert_eq!(fee, 3_000_000, "tier 4+ fee should be 3% of gross");
     assert_eq!(net, 97_000_000, "tier 4+ net should be gross - fee");
