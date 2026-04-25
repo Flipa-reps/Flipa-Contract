@@ -2370,6 +2370,82 @@ impl CoinflipContract {
         }
     }
 
+    /// Reveal the player's secret using VRF-based randomness for enhanced security.
+    ///
+    /// This variant uses Verifiable Random Function (VRF) principles to generate
+    /// cryptographically secure randomness, providing stronger unpredictability
+    /// guarantees than SHA256-based randomness alone.
+    ///
+    /// Process:
+    /// 1. Verify commitment matches the revealed secret
+    /// 2. Generate VRF-based randomness combining player secret with environment randomness
+    /// 3. Determine outcome from VRF randomness
+    /// 4. Update game state to Revealed phase with result
+    /// 5. If player wins, calculate potential payout
+    /// 6. If player loses, end game and reset streak
+    ///
+    /// # Arguments
+    /// - `player` – must authorize; must have an active game in `Committed` phase
+    /// - `secret` – player's random secret bytes
+    ///
+    /// # Returns
+    /// `Ok(true)` if player won, `Ok(false)` if player lost.
+    ///
+    /// # Errors
+    /// - NoActiveGame: player has no game in Committed phase
+    /// - InvalidPhase: game not in Committed phase (preventing double-reveal)
+    /// - CommitmentMismatch: revealed secret doesn't match stored commitment
+    pub fn reveal_vrf(
+        env: Env,
+        player: Address,
+        secret: Bytes,
+    ) -> Result<bool, Error> {
+        player.require_auth();
+
+        // Guard 1: player must have an active game
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        // Guard 2: game must be in Committed phase
+        if game.phase != GamePhase::Committed {
+            return Err(Error::InvalidPhase);
+        }
+
+        // Guard 3: verify the commitment matches the revealed secret
+        if !verify_commitment(&env, &secret, &game.commitment) {
+            return Err(Error::CommitmentMismatch);
+        }
+
+        // Determine outcome using VRF-based randomness
+        let vrf_random = generate_vrf_randomness(&env, &secret);
+        let outcome_bit = vrf_random.to_array()[0] % 2;
+        let outcome = if outcome_bit == 0 { Side::Heads } else { Side::Tails };
+
+        let won = outcome == game.side;
+
+        if won {
+            // Win path: increment streak, advance to Revealed phase.
+            game.streak = game.streak.saturating_add(1);
+            game.phase = GamePhase::Revealed;
+            Self::save_player_game(&env, &player, &game);
+            Ok(true)
+        } else {
+            // Loss path — forfeiture:
+            // 1. Credit the wager back to contract reserves so the house keeps it.
+            // 2. Delete the player's game state to free storage and signal game-over.
+            let mut stats = Self::load_stats(&env);
+            stats.reserve_balance = stats
+                .reserve_balance
+                .checked_add(game.wager)
+                .unwrap_or(stats.reserve_balance);
+            Self::save_stats(&env, &stats);
+
+            Self::delete_player_game(&env, &player);
+
+            Ok(false)
+        }
+    }
+
     /// Claim winnings after a successful reveal via on-chain token transfer.
     ///
     /// This is the transfer-backed settlement path.  For a no-transfer accounting
