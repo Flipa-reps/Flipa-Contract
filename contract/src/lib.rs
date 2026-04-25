@@ -91,8 +91,16 @@ pub mod error_codes {
     pub const ADMIN_TREASURY_CONFLICT: u32 = 50;
     pub const ALREADY_INITIALIZED: u32 = 51;
 
+    // Governance errors (60–65)
+    pub const PROPOSAL_NOT_FOUND: u32 = 60;
+    pub const ALREADY_VOTED: u32 = 61;
+    pub const VOTING_OPEN: u32 = 62;
+    pub const VOTING_CLOSED: u32 = 63;
+    pub const THRESHOLD_NOT_MET: u32 = 64;
+    pub const PROPOSAL_ALREADY_EXECUTED: u32 = 65;
+
     /// Total number of defined error variants.
-    pub const VARIANT_COUNT: usize = 18;
+    pub const VARIANT_COUNT: usize = 24;
 }
 
 /// Error codes for the coinflip contract.
@@ -254,6 +262,31 @@ pub enum SideBet {
     None,
     ExactStreak(u32),
     Sequence(u32),
+    // ── Governance errors (60–65) ───────────────────────────────────────────
+
+    /// No proposal exists with the given id.
+    /// Code: 60
+    ProposalNotFound = 60,
+
+    /// Caller has already cast a vote on this proposal.
+    /// Code: 61
+    AlreadyVoted = 61,
+
+    /// Action requires voting to be closed but it is still open.
+    /// Code: 62
+    VotingOpen = 62,
+
+    /// Action requires voting to be open but the deadline has passed.
+    /// Code: 63
+    VotingClosed = 63,
+
+    /// Proposal did not reach the required approval threshold.
+    /// Code: 64
+    ThresholdNotMet = 64,
+
+    /// Proposal has already been executed or canceled.
+    /// Code: 65
+    ProposalAlreadyExecuted = 65,
 }
 
 /// The player's chosen side for a coinflip.
@@ -594,6 +627,14 @@ pub struct EventAdminAction {
     /// `Symbol("set_wager_limits")`, or `Symbol("set_fee")`.
     pub action: soroban_sdk::Symbol,
     pub admin:  Address,
+    /// Governance: monotonically increasing proposal counter.
+    ProposalCount,
+    /// Governance: a single [`Proposal`] keyed by its `u32` id.
+    Proposal(u32),
+    /// Governance: whether `voter` has already voted on proposal `id`.
+    ProposalVote(u32, Address),
+    /// Governance: registered voter list (`Vec<Address>`).
+    Voters,
 }
 
 /// Multiplier tier configuration, stored in [`ContractConfig`] and snapshotted
@@ -645,6 +686,51 @@ impl MultiplierConfig {
             && self.streak3 < self.streak4_plus
     }
 }
+
+// ── Governance types ────────────────────────────────────────────────────────
+
+/// The configuration change a proposal requests.
+///
+/// Each variant maps 1-to-1 to an existing admin setter so that executing a
+/// proposal is identical to calling that setter directly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalAction {
+    SetFee(u32),
+    SetWagerLimits(i128, i128),
+    SetMultipliers(MultiplierConfig),
+    SetPaused(bool),
+    SetTreasury(Address),
+}
+
+/// Lifecycle state of a governance proposal.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProposalStatus {
+    /// Voting window is open.
+    Active,
+    /// Executed successfully.
+    Executed,
+    /// Canceled by the admin before execution.
+    Canceled,
+}
+
+/// A governance proposal stored under [`StorageKey::Proposal`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Proposal {
+    pub id:              u32,
+    pub proposer:        Address,
+    pub action:          ProposalAction,
+    /// Ledger sequence after which voting is closed.
+    pub deadline_ledger: u32,
+    pub votes_for:       u32,
+    pub votes_against:   u32,
+    pub status:          ProposalStatus,
+}
+
+/// Number of ledgers a proposal's voting window stays open (~24 h at 5 s/ledger).
+pub const VOTING_PERIOD_LEDGERS: u32 = 17_280;
 
 // ── Event payload types ─────────────────────────────────────────────────────
 //
@@ -2413,6 +2499,279 @@ impl CoinflipContract {
         Ok(())
     }
 
+    // ── Governance helpers ──────────────────────────────────────────────────
+
+    fn load_proposal_count(env: &Env) -> u32 {
+        env.storage().persistent()
+            .get(&StorageKey::ProposalCount)
+            .unwrap_or(Some(0u32))
+            .unwrap_or(0)
+    }
+
+    fn save_proposal(env: &Env, p: &Proposal) {
+        let key = StorageKey::Proposal(p.id);
+        env.storage().persistent().set(&key, p);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_proposal(env: &Env, id: u32) -> Option<Proposal> {
+        let key = StorageKey::Proposal(id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.storage().persistent().get(&key).unwrap()
+    }
+
+    fn load_voters(env: &Env) -> soroban_sdk::Vec<Address> {
+        env.storage().persistent()
+            .get(&StorageKey::Voters)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+    }
+
+    fn save_voters(env: &Env, voters: &soroban_sdk::Vec<Address>) {
+        env.storage().persistent().set(&StorageKey::Voters, voters);
+        env.storage().persistent().extend_ttl(&StorageKey::Voters, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn has_voted(env: &Env, proposal_id: u32, voter: &Address) -> bool {
+        env.storage().persistent()
+            .has(&StorageKey::ProposalVote(proposal_id, voter.clone()))
+    }
+
+    fn record_vote(env: &Env, proposal_id: u32, voter: &Address) {
+        let key = StorageKey::ProposalVote(proposal_id, voter.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    // ── Governance public API ───────────────────────────────────────────────
+
+    /// Register an address as a governance voter.
+    ///
+    /// Only the admin may call this.  Duplicate registrations are silently ignored.
+    pub fn add_voter(env: Env, admin: Address, voter: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        let mut voters = Self::load_voters(&env);
+        // Avoid duplicates
+        for i in 0..voters.len() {
+            if voters.get(i).unwrap() == voter {
+                return Ok(());
+            }
+        }
+        voters.push_back(voter);
+        Self::save_voters(&env, &voters);
+        Ok(())
+    }
+
+    /// Remove an address from the governance voter list.
+    ///
+    /// Only the admin may call this.
+    pub fn remove_voter(env: Env, admin: Address, voter: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        let voters = Self::load_voters(&env);
+        let mut updated = soroban_sdk::Vec::new(&env);
+        for i in 0..voters.len() {
+            let v = voters.get(i).unwrap();
+            if v != voter {
+                updated.push_back(v);
+            }
+        }
+        Self::save_voters(&env, &updated);
+        Ok(())
+    }
+
+    /// Create a governance proposal for a configuration change.
+    ///
+    /// Any registered voter or the admin may propose.
+    /// Returns the new proposal id.
+    pub fn propose(env: Env, proposer: Address, action: ProposalAction) -> Result<u32, Error> {
+        proposer.require_auth();
+
+        // Proposer must be admin or a registered voter.
+        let config = Self::load_config(&env);
+        let voters = Self::load_voters(&env);
+        let is_admin = proposer == config.admin;
+        let is_voter = (0..voters.len()).any(|i| voters.get(i).unwrap() == proposer);
+        if !is_admin && !is_voter {
+            return Err(Error::Unauthorized);
+        }
+
+        let id = Self::load_proposal_count(&env);
+        let proposal = Proposal {
+            id,
+            proposer,
+            action,
+            deadline_ledger: env.ledger().sequence().saturating_add(VOTING_PERIOD_LEDGERS),
+            votes_for: 0,
+            votes_against: 0,
+            status: ProposalStatus::Active,
+        };
+
+        Self::save_proposal(&env, &proposal);
+        env.storage().persistent().set(&StorageKey::ProposalCount, &(id + 1));
+        env.storage().persistent().extend_ttl(&StorageKey::ProposalCount, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Ok(id)
+    }
+
+    /// Cast a vote on an active proposal.
+    ///
+    /// - `approve = true`  → vote in favour
+    /// - `approve = false` → vote against
+    ///
+    /// Only registered voters may vote.  Each voter may vote at most once per proposal.
+    pub fn vote(env: Env, voter: Address, proposal_id: u32, approve: bool) -> Result<(), Error> {
+        voter.require_auth();
+
+        // Must be a registered voter.
+        let voters = Self::load_voters(&env);
+        let is_voter = (0..voters.len()).any(|i| voters.get(i).unwrap() == voter);
+        if !is_voter {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut proposal = Self::load_proposal(&env, proposal_id)
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Active {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if env.ledger().sequence() > proposal.deadline_ledger {
+            return Err(Error::VotingClosed);
+        }
+        if Self::has_voted(&env, proposal_id, &voter) {
+            return Err(Error::AlreadyVoted);
+        }
+
+        if approve {
+            proposal.votes_for = proposal.votes_for.saturating_add(1);
+        } else {
+            proposal.votes_against = proposal.votes_against.saturating_add(1);
+        }
+
+        Self::record_vote(&env, proposal_id, &voter);
+        Self::save_proposal(&env, &proposal);
+
+        Ok(())
+    }
+
+    /// Execute a proposal that has passed the voting threshold.
+    ///
+    /// Execution is allowed only after the voting deadline has passed and
+    /// `votes_for > 50%` of registered voters (minimum 1 vote).
+    pub fn execute_proposal(env: Env, caller: Address, proposal_id: u32) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Only admin or a registered voter may trigger execution.
+        let config = Self::load_config(&env);
+        let voters = Self::load_voters(&env);
+        let is_admin = caller == config.admin;
+        let is_voter = (0..voters.len()).any(|i| voters.get(i).unwrap() == caller);
+        if !is_admin && !is_voter {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut proposal = Self::load_proposal(&env, proposal_id)
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Active {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if env.ledger().sequence() <= proposal.deadline_ledger {
+            return Err(Error::VotingOpen);
+        }
+
+        // 51% threshold: votes_for must be > half of registered voters, minimum 1.
+        let total_voters = voters.len();
+        let threshold = total_voters / 2 + 1; // integer ceiling of 51%
+        if proposal.votes_for < threshold || proposal.votes_for == 0 {
+            return Err(Error::ThresholdNotMet);
+        }
+
+        // Apply the configuration change.
+        let mut cfg = Self::load_config(&env);
+        match proposal.action.clone() {
+            ProposalAction::SetFee(fee_bps) => {
+                if fee_bps < 200 || fee_bps > 500 {
+                    return Err(Error::InvalidFeePercentage);
+                }
+                cfg.fee_bps = fee_bps;
+            }
+            ProposalAction::SetWagerLimits(min_wager, max_wager) => {
+                if min_wager >= max_wager {
+                    return Err(Error::InvalidWagerLimits);
+                }
+                cfg.min_wager = min_wager;
+                cfg.max_wager = max_wager;
+            }
+            ProposalAction::SetMultipliers(m) => {
+                if !m.is_valid() {
+                    return Err(Error::InvalidMultipliers);
+                }
+                cfg.multipliers = m;
+            }
+            ProposalAction::SetPaused(paused) => {
+                cfg.paused = paused;
+            }
+            ProposalAction::SetTreasury(treasury) => {
+                cfg.treasury = treasury;
+            }
+        }
+        Self::save_config(&env, &cfg);
+
+        proposal.status = ProposalStatus::Executed;
+        Self::save_proposal(&env, &proposal);
+
+        Self::emit_admin_action(&env, EventAdminAction {
+            action: Symbol::new(&env, "gov_execute"),
+            admin: caller,
+        });
+
+        Ok(())
+    }
+
+    /// Cancel an active proposal before it is executed.
+    ///
+    /// Only the admin or the original proposer may cancel.
+    pub fn cancel_proposal(env: Env, caller: Address, proposal_id: u32) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut proposal = Self::load_proposal(&env, proposal_id)
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Active {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        let config = Self::load_config(&env);
+        if caller != config.admin && caller != proposal.proposer {
+            return Err(Error::Unauthorized);
+        }
+
+        proposal.status = ProposalStatus::Canceled;
+        Self::save_proposal(&env, &proposal);
+
+        Ok(())
+    }
+
+    /// Return a proposal by id.
+    pub fn get_proposal(env: Env, proposal_id: u32) -> Option<Proposal> {
+        Self::load_proposal(&env, proposal_id)
+    }
+
+    /// Return the registered voter list.
+    pub fn get_voters(env: Env) -> soroban_sdk::Vec<Address> {
+        Self::load_voters(&env)
+    }
+
     /// Reclaim a wager from a game that has exceeded the reveal timeout.
     ///
     /// If a player starts a game but never calls `reveal`, their wager is
@@ -2840,6 +3199,7 @@ mod upgrade_migration_tests;
 #[cfg(test)]
 mod security_validation_tests;
 mod event_tests;
+mod governance_tests;
 
 #[cfg(test)]
 mod tests {
