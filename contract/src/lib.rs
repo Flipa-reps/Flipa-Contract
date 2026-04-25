@@ -99,8 +99,11 @@ pub mod error_codes {
     pub const THRESHOLD_NOT_MET: u32 = 64;
     pub const PROPOSAL_ALREADY_EXECUTED: u32 = 65;
 
+    // RBAC errors (70)
+    pub const INSUFFICIENT_ROLE: u32 = 70;
+
     /// Total number of defined error variants.
-    pub const VARIANT_COUNT: usize = 24;
+    pub const VARIANT_COUNT: usize = 25;
 }
 
 /// Error codes for the coinflip contract.
@@ -287,6 +290,12 @@ pub enum SideBet {
     /// Proposal has already been executed or canceled.
     /// Code: 65
     ProposalAlreadyExecuted = 65,
+
+    // ── RBAC errors (70) ────────────────────────────────────────────────────
+
+    /// Caller holds a role that is insufficient for the requested operation.
+    /// Code: 70
+    InsufficientRole = 70,
 }
 
 /// The player's chosen side for a coinflip.
@@ -635,6 +644,35 @@ pub struct EventAdminAction {
     ProposalVote(u32, Address),
     /// Governance: registered voter list (`Vec<Address>`).
     Voters,
+    /// RBAC: role assigned to an address.
+    Role(Address),
+}
+
+/// Admin role levels for role-based access control.
+///
+/// Permission matrix:
+///
+/// | Operation          | SuperAdmin | ConfigAdmin | PauseAdmin |
+/// |--------------------|:----------:|:-----------:|:----------:|
+/// | grant_role         | ✓          |             |            |
+/// | revoke_role        | ✓          |             |            |
+/// | set_treasury       | ✓          |             |            |
+/// | set_wager_limits   | ✓          | ✓           |            |
+/// | set_multipliers    | ✓          | ✓           |            |
+/// | set_fee            | ✓          | ✓           |            |
+/// | set_paused         | ✓          | ✓           | ✓          |
+///
+/// `config.admin` always has implicit `SuperAdmin` authority regardless of
+/// the role stored in `StorageKey::Role`.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum Role {
+    /// Can pause/unpause the contract.
+    PauseAdmin  = 0,
+    /// Can change fee, wager limits, multipliers, and pause.
+    ConfigAdmin = 1,
+    /// Full admin: all of the above plus treasury and role management.
+    SuperAdmin  = 2,
 }
 
 /// Multiplier tier configuration, stored in [`ContractConfig`] and snapshotted
@@ -2205,9 +2243,7 @@ impl CoinflipContract {
         admin.require_auth();
 
         let mut config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_role(&env, &admin, Role::PauseAdmin, &config)?;
 
         config.paused = paused;
         Self::save_config(&env, &config);
@@ -2239,9 +2275,7 @@ impl CoinflipContract {
         admin.require_auth();
 
         let mut config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_role(&env, &admin, Role::SuperAdmin, &config)?;
 
         config.treasury = treasury;
         Self::save_config(&env, &config);
@@ -2280,9 +2314,7 @@ impl CoinflipContract {
         admin.require_auth();
 
         let mut config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_role(&env, &admin, Role::ConfigAdmin, &config)?;
 
         if min_wager >= max_wager {
             return Err(Error::InvalidWagerLimits);
@@ -2327,13 +2359,8 @@ impl CoinflipContract {
         admin.require_auth();
 
         let mut config = Self::load_config(&env);
+        Self::require_role(&env, &admin, Role::ConfigAdmin, &config)?;
 
-        // Guard 2: caller must be the configured admin.
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
-
-        // Guard 3: fee must stay within the permitted protocol range (2–5%).
         if fee_bps < 200 || fee_bps > 500 {
             return Err(Error::InvalidFeePercentage);
         }
@@ -2479,9 +2506,7 @@ impl CoinflipContract {
         admin.require_auth();
 
         let mut config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_role(&env, &admin, Role::ConfigAdmin, &config)?;
 
         let m = MultiplierConfig { streak1, streak2, streak3, streak4_plus };
         if !m.is_valid() {
@@ -2544,6 +2569,51 @@ impl CoinflipContract {
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    // ── RBAC helpers ────────────────────────────────────────────────────────
+
+    /// Returns the role assigned to `addr`, or `None` if no role is set.
+    /// `config.admin` always has implicit `SuperAdmin` authority.
+    fn get_role(env: &Env, addr: &Address, config: &ContractConfig) -> Option<Role> {
+        if addr == &config.admin {
+            return Some(Role::SuperAdmin);
+        }
+        env.storage().persistent().get(&StorageKey::Role(addr.clone())).unwrap()
+    }
+
+    /// Returns `Ok(())` if `caller` holds at least `required` role, else `Err(InsufficientRole)`.
+    fn require_role(env: &Env, caller: &Address, required: Role, config: &ContractConfig) -> Result<(), Error> {
+        match Self::get_role(env, caller, config) {
+            Some(role) if role >= required => Ok(()),
+            _ => Err(Error::InsufficientRole),
+        }
+    }
+
+    // ── RBAC public API ──────────────────────────────────────────────────────
+
+    /// Assign a role to `grantee`.  Only `SuperAdmin` (or `config.admin`) may call this.
+    pub fn grant_role(env: Env, caller: Address, grantee: Address, role: Role) -> Result<(), Error> {
+        caller.require_auth();
+        let config = Self::load_config(&env);
+        Self::require_role(&env, &caller, Role::SuperAdmin, &config)?;
+        env.storage().persistent().set(&StorageKey::Role(grantee), &role);
+        Ok(())
+    }
+
+    /// Remove the role from `grantee`.  Only `SuperAdmin` may call this.
+    pub fn revoke_role(env: Env, caller: Address, grantee: Address) -> Result<(), Error> {
+        caller.require_auth();
+        let config = Self::load_config(&env);
+        Self::require_role(&env, &caller, Role::SuperAdmin, &config)?;
+        env.storage().persistent().remove(&StorageKey::Role(grantee));
+        Ok(())
+    }
+
+    /// Return the role assigned to `addr`, if any.
+    pub fn get_role_of(env: Env, addr: Address) -> Option<Role> {
+        let config = Self::load_config(&env);
+        Self::get_role(&env, &addr, &config)
+    }
+
     // ── Governance public API ───────────────────────────────────────────────
 
     /// Register an address as a governance voter.
@@ -2552,9 +2622,7 @@ impl CoinflipContract {
     pub fn add_voter(env: Env, admin: Address, voter: Address) -> Result<(), Error> {
         admin.require_auth();
         let config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_role(&env, &admin, Role::SuperAdmin, &config)?;
         let mut voters = Self::load_voters(&env);
         // Avoid duplicates
         for i in 0..voters.len() {
@@ -2573,9 +2641,7 @@ impl CoinflipContract {
     pub fn remove_voter(env: Env, admin: Address, voter: Address) -> Result<(), Error> {
         admin.require_auth();
         let config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_role(&env, &admin, Role::SuperAdmin, &config)?;
         let voters = Self::load_voters(&env);
         let mut updated = soroban_sdk::Vec::new(&env);
         for i in 0..voters.len() {
@@ -3200,6 +3266,9 @@ mod upgrade_migration_tests;
 mod security_validation_tests;
 mod event_tests;
 mod governance_tests;
+
+#[cfg(test)]
+mod rbac_tests;
 
 #[cfg(test)]
 mod tests {
