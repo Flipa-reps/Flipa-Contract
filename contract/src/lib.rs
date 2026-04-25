@@ -92,6 +92,21 @@ pub mod error_codes {
     pub const VARIANT_COUNT: usize = 17;
 }
 
+/// Role-based access control for admin operations.
+///
+/// Defines three permission levels:
+/// - `Owner`: Full control (can manage roles, update all config)
+/// - `Admin`: Can pause/unpause, update treasury, set fees
+/// - `Operator`: Can only pause/unpause the contract
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Role {
+    Owner = 1,
+    Admin = 2,
+    Operator = 3,
+}
+
 /// Error codes for the coinflip contract.
 ///
 /// Each variant maps to a stable `u32` error code via `#[repr(u32)]`.
@@ -379,6 +394,8 @@ pub enum StorageKey {
     PlayerGame(Address),
     /// Per-player game history ring-buffer ([`Vec<HistoryEntry>`]), keyed by player address.
     PlayerHistory(Address),
+    /// Role assignment for an address ([`Role`]), keyed by address.
+    Role(Address),
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -721,6 +738,111 @@ impl CoinflipContract {
             .get(&key)
             .unwrap_or_else(|| soroban_sdk::Vec::new(env))
     }
+
+    // ── Role management helpers ─────────────────────────────────────────────
+
+    /// Save a role assignment for an address.
+    fn save_role(env: &Env, address: &Address, role: Role) {
+        let key = StorageKey::Role(address.clone());
+        env.storage().persistent().set(&key, &role);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Load the role for an address. Returns None if no role is assigned.
+    fn load_role(env: &Env, address: &Address) -> Option<Role> {
+        let key = StorageKey::Role(address.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            env.storage().persistent().get(&key)
+        } else {
+            None
+        }
+    }
+
+    /// Delete a role assignment for an address.
+    fn delete_role(env: &Env, address: &Address) {
+        let key = StorageKey::Role(address.clone());
+        env.storage().persistent().remove(&key);
+    }
+
+    /// Check if the caller has the required permission level.
+    /// Owner role has all permissions, Admin has pause/treasury/fee permissions,
+    /// Operator can only pause/unpause.
+    fn has_permission(env: &Env, caller: &Address, required_role: Role) -> bool {
+        let config = Self::load_config(env);
+        
+        // Owner (admin) always has permission
+        if caller == &config.admin {
+            return true;
+        }
+
+        // Check assigned role
+        if let Some(role) = Self::load_role(env, caller) {
+            match required_role {
+                Role::Owner => role == Role::Owner,
+                Role::Admin => role == Role::Owner || role == Role::Admin,
+                Role::Operator => role == Role::Owner || role == Role::Admin || role == Role::Operator,
+            }
+        } else {
+            false
+        }
+    }
+
+    // ── Public role management functions ────────────────────────────────────
+
+    /// Assign a role to an address. Only the owner (admin) can assign roles.
+    ///
+    /// # Arguments
+    /// - `owner`   – caller address; must be the contract admin
+    /// - `address` – address to assign the role to
+    /// - `role`    – role to assign
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the contract admin
+    pub fn assign_role(env: Env, owner: Address, address: Address, role: Role) -> Result<(), Error> {
+        owner.require_auth();
+
+        let config = Self::load_config(&env);
+        if owner != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        Self::save_role(&env, &address, role);
+        Ok(())
+    }
+
+    /// Revoke a role from an address. Only the owner (admin) can revoke roles.
+    ///
+    /// # Arguments
+    /// - `owner`   – caller address; must be the contract admin
+    /// - `address` – address to revoke the role from
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the contract admin
+    pub fn revoke_role(env: Env, owner: Address, address: Address) -> Result<(), Error> {
+        owner.require_auth();
+
+        let config = Self::load_config(&env);
+        if owner != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        Self::delete_role(&env, &address);
+        Ok(())
+    }
+
+    /// Get the role assigned to an address.
+    ///
+    /// # Arguments
+    /// - `address` – address to query
+    ///
+    /// # Returns
+    /// The role assigned to the address, or None if no role is assigned.
+    pub fn get_role(env: Env, address: Address) -> Option<Role> {
+        Self::load_role(&env, &address)
+    }
+
+    // ── Game functions ──────────────────────────────────────────────────────
 
     /// Begin a new coinflip game for `player`.
     ///
