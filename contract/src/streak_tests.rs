@@ -35,7 +35,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id)
 }
 
@@ -68,7 +68,7 @@ fn inject(env: &Env, contract_id: &Address, player: &Address, phase: GamePhase, 
         phase,
         start_ledger: env.ledger().sequence(),
     
-        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(contract_id, || {
         CoinflipContract::save_player_game(env, player, &game);
@@ -113,7 +113,7 @@ fn reveal_win_increments_streak_from_zero() {
     inject(&env, &contract_id, &player, GamePhase::Committed, 0);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if won {
         assert_eq!(streak_of(&env, &contract_id, &player), 1);
     }
@@ -129,7 +129,7 @@ fn reveal_win_increments_streak_by_exactly_one() {
         inject(&env, &contract_id, &player, GamePhase::Committed, initial);
         let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         if won {
             assert_eq!(
                 streak_of(&env, &contract_id, &player),
@@ -150,7 +150,7 @@ fn reveal_win_increments_streak_past_tier_cap() {
     inject(&env, &contract_id, &player, GamePhase::Committed, 4);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if won {
         assert_eq!(streak_of(&env, &contract_id, &player), 5);
     }
@@ -196,7 +196,7 @@ fn loss_deletes_game_no_streak_survives() {
     inject(&env, &contract_id, &player, GamePhase::Committed, 3);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if !won {
         // Game must be gone — no streak to read
         let game = env.as_contract(&contract_id, || {
@@ -215,7 +215,7 @@ fn new_game_after_loss_starts_at_streak_zero() {
     inject(&env, &contract_id, &player, GamePhase::Committed, 5);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if !won {
         // Start a fresh game — must begin at streak 0
         client.start_game(&player, &Side::Heads, &WAGER, &new_commitment(&env, 99, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
@@ -241,7 +241,7 @@ fn ten_consecutive_wins_reach_streak_ten() {
     while wins < 10 {
         inject(&env, &contract_id, &player, GamePhase::Committed, streak);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         if won {
             streak += 1;
             wins += 1;
@@ -262,7 +262,7 @@ fn streak_boundary_zero_win_reaches_tier_1() {
     inject(&env, &contract_id, &player, GamePhase::Committed, 0);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if won {
         let s = streak_of(&env, &contract_id, &player);
         assert_eq!(s, 1);
@@ -279,7 +279,7 @@ fn streak_boundary_three_win_reaches_cap() {
     inject(&env, &contract_id, &player, GamePhase::Committed, 3);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if won {
         let s = streak_of(&env, &contract_id, &player);
         assert_eq!(s, 4);
@@ -297,7 +297,7 @@ fn streak_boundary_above_cap_multiplier_stays_capped() {
         inject(&env, &contract_id, &player, GamePhase::Committed, initial);
         let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         if won {
             let s = streak_of(&env, &contract_id, &player);
             assert_eq!(s, initial + 1);
@@ -320,7 +320,7 @@ fn streak_never_decreases_after_win() {
     for initial in [0u32, 1, 2, 3, 4] {
         inject(&env, &contract_id, &player, GamePhase::Committed, initial);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         if won {
             let current = streak_of(&env, &contract_id, &player);
             assert!(

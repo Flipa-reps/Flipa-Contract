@@ -25,7 +25,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id, admin)
 }
 
@@ -67,7 +67,7 @@ fn inject_game(
         phase,
         start_ledger: env.ledger().sequence(),
     
-        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(contract_id, || {
         CoinflipContract::save_player_game(env, player, &game);
@@ -177,11 +177,11 @@ fn test_reveal_succeeds_when_paused() {
     let player = Address::generate(&env);
     let secret = make_secret(&env, 1);
     let commitment = make_commitment(&env, 1);
-    client.start_game(&player, &Side::Heads, &5_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &5_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     client.set_paused(&admin, &true);
     // reveal must still work
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert_eq!(result, Ok(true));
     let game = env.as_contract(&contract_id, || {
         CoinflipContract::load_player_game(&env, &player).unwrap()
@@ -266,14 +266,14 @@ fn test_full_game_lifecycle_while_paused() {
     let commitment = make_commitment(&env, 1);
 
     // Start game before pause
-    client.start_game(&player, &Side::Heads, &5_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &5_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Pause
     client.set_paused(&admin, &true);
 
     // Reveal while paused
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(won);
 
     // Continue while paused
@@ -295,7 +295,7 @@ fn test_full_game_lifecycle_while_paused() {
         CoinflipContract::save_player_game(&env, &player, &g);
     });
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won2 = client.reveal(&player, &secret2, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won2 = client.reveal(&player, &secret2, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(won2);
 
     // Cash out while paused
@@ -321,7 +321,7 @@ proptest! {
         let player = Address::generate(&env);
         let side = if side_pick { Side::Heads } else { Side::Tails };
         let commitment = BytesN::from_array(&env, &commitment_bytes);
-        let result = client.try_start_game(&player, &side, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let result = client.try_start_game(&player, &side, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         prop_assert_eq!(result, Err(Ok(Error::ContractPaused)));
     }
 
@@ -374,7 +374,7 @@ proptest! {
         let player = Address::generate(&env);
         let commitment_bytes = [42u8; 32];
         let commitment = BytesN::from_array(&env, &commitment_bytes);
-        let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         prop_assert!(result.is_ok(), "start_game must succeed after unpause (wager={})", wager);
     }
 }
@@ -474,11 +474,11 @@ fn test_reveal_succeeds_when_paused_existing_game() {
     let secret = make_secret(&env, 1);
     let commitment = make_commitment(&env, 1);
     
-    client.start_game(&player, &Side::Heads, &5_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &5_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     client.set_paused(&admin, &true);
     
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(result.is_ok(), "reveal should succeed when paused");
     
     let game = env.as_contract(&contract_id, || {
@@ -651,14 +651,14 @@ fn test_full_game_lifecycle_with_pause_unpause_cycles() {
     let commitment = make_commitment(&env, 1);
     
     // Start game
-    client.start_game(&player, &Side::Heads, &5_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &5_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     
     // Pause
     client.set_paused(&admin, &true);
     
     // Reveal while paused
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let won = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(won);
     
     // Unpause

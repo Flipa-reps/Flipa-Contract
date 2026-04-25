@@ -390,6 +390,10 @@ pub struct GameState {
     /// `contract_random` before outcome derivation so all three parties
     /// (player, contract, oracle) must cooperate to predict the result.
     pub oracle_commitment: BytesN<32>,
+    /// SHA-256 of `(player_commitment || contract_random)` — the message the oracle
+    /// signs as its VRF proof input.  Computed and stored at `start_game` time so
+    /// the oracle cannot change what it signs after seeing the player's secret.
+    pub vrf_input: BytesN<32>,
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -427,6 +431,11 @@ pub struct ContractConfig {
     /// below this value, `start_game` is auto-paused with [`Error::ContractPaused`].
     /// Set to 0 to disable the circuit breaker.
     pub min_reserve_threshold: i128,
+    /// Oracle's Ed25519 public key used to verify VRF proofs.
+    /// The oracle signs the VRF input at reveal time; the contract verifies
+    /// the signature with this key before accepting the proof.
+    pub oracle_vrf_pk: BytesN<32>,
+}
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -491,8 +500,10 @@ pub struct HistoryEntry {
     pub contract_random: BytesN<32>,
     pub payout: i128,
     pub ledger: u32,
-    /// The oracle's revealed random bytes (pre-image of `oracle_commitment`).
-    pub oracle_random: Bytes,
+    /// The oracle's VRF proof (Ed25519 signature over `vrf_input`).
+    /// Stored for off-chain verifiability: anyone can re-verify the proof
+    /// using the oracle's public key from `ContractConfig`.
+    pub vrf_proof: BytesN<64>,
 }
 
 /// Maximum number of history entries retained per player.
@@ -1109,15 +1120,43 @@ pub fn verify_commitment(env: &Env, secret: &Bytes, commitment: &BytesN<32>) -> 
     &hash == commitment
 }
 
-/// Deterministically derives a [`Side`] outcome from three independent contributions:
-/// the player's revealed secret, the contract's pre-committed random value, and the
-/// oracle's revealed random bytes.
+/// Verifies an oracle VRF proof using Ed25519.
+///
+/// The oracle signs `vrf_input` with its Ed25519 private key.  This function
+/// verifies the 64-byte signature against the oracle's public key.
+///
+/// If `oracle_vrf_pk` is all-zero bytes, verification is skipped — this is the
+/// "no oracle" sentinel value used when the contract is deployed without an oracle.
+/// In production, always set a real Ed25519 public key.
+///
+/// # Panics
+/// Panics (aborting the transaction) if the signature is invalid and `oracle_vrf_pk`
+/// is non-zero.
+pub fn verify_vrf_proof(
+    env: &Env,
+    oracle_pk: &BytesN<32>,
+    vrf_input: &BytesN<32>,
+    vrf_proof: &BytesN<64>,
+) -> bool {
+    // All-zero public key = oracle disabled; skip verification.
+    if oracle_pk == &BytesN::from_array(env, &[0u8; 32]) {
+        return true;
+    }
+    let msg = Bytes::from_slice(env, &vrf_input.to_array());
+    env.crypto().ed25519_verify(oracle_pk, &msg, vrf_proof);
+    true
+}
+
+/// Derives the [`Side`] outcome from three independent contributions:
+/// the player's revealed secret, the contract's randomness, and the oracle's
+/// VRF output (derived from its Ed25519 proof).
 ///
 /// ## Algorithm
 ///
 /// ```text
-/// aggregated    = contract_random XOR oracle_random   (byte-wise XOR)
-/// combined      = player_secret || aggregated          (concatenation)
+/// vrf_output    = SHA-256(vrf_proof)                   (oracle's verifiable output)
+/// aggregated    = contract_random XOR vrf_output        (byte-wise XOR)
+/// combined      = player_secret || aggregated           (concatenation)
 /// combined_hash = SHA-256(combined)
 /// outcome_bit   = combined_hash[0] & 1
 /// outcome       = if outcome_bit == 0 { Heads } else { Tails }
@@ -1125,39 +1164,32 @@ pub fn verify_commitment(env: &Env, secret: &Bytes, commitment: &BytesN<32>) -> 
 ///
 /// ## Security Properties
 ///
-/// - **Player cannot bias**: the secret is locked by the commitment before
-///   `contract_random` is known, so the player cannot choose a secret that
-///   targets a desired outcome after seeing the contract's contribution.
-/// - **Contract cannot bias**: `contract_random` is derived from the ledger
-///   sequence at `start_game` time and stored immutably in [`GameState`];
-///   the contract cannot alter it after the player commits.
-/// - **Oracle cannot bias**: the oracle's contribution is committed to at
-///   `start_game` time via `oracle_commitment = SHA-256(oracle_random)`;
-///   the oracle cannot change its value after the player commits.
-/// - **Collusion resistance**: any two parties colluding still cannot predict
-///   the outcome without knowing the third party's pre-committed value.
-/// - **Deterministic**: identical inputs always produce identical outputs.
+/// - **Player cannot bias**: secret locked by commitment before `contract_random` is known.
+/// - **Contract cannot bias**: `contract_random` locked at `start_game` time.
+/// - **Oracle cannot bias**: the oracle signs `vrf_input = SHA-256(commitment || contract_random)`
+///   which is only known after `start_game`; the signature is verified on-chain before use.
+/// - **Verifiable**: anyone can re-verify the oracle's contribution using `verify_vrf_proof`.
 ///
 /// # Arguments
-/// - `env`             – Soroban execution environment (needed for SHA-256)
+/// - `env`             – Soroban execution environment
 /// - `player_secret`   – the raw secret bytes revealed by the player
 /// - `contract_random` – the 32-byte contract randomness stored in [`GameState`]
-/// - `oracle_random`   – the oracle's revealed random bytes (pre-image of `oracle_commitment`)
+/// - `vrf_proof`       – the oracle's 64-byte Ed25519 signature (VRF proof)
 pub fn generate_outcome(
     env: &Env,
     player_secret: &Bytes,
     contract_random: &BytesN<32>,
-    oracle_random: &Bytes,
+    vrf_proof: &BytesN<64>,
 ) -> Side {
-    // Aggregate contract and oracle contributions via XOR.
+    // Derive VRF output: SHA-256(proof) — deterministic given the proof.
+    let proof_bytes = Bytes::from_slice(env, &vrf_proof.to_array());
+    let vrf_output = env.crypto().sha256(&proof_bytes).to_array();
+
+    // Aggregate contract and VRF contributions via XOR.
     let cr_arr = contract_random.to_array();
-    let or_arr: [u8; 32] = {
-        let hash = env.crypto().sha256(oracle_random);
-        hash.to_array()
-    };
     let mut aggregated = [0u8; 32];
     for i in 0..32 {
-        aggregated[i] = cr_arr[i] ^ or_arr[i];
+        aggregated[i] = cr_arr[i] ^ vrf_output[i];
     }
     let aggregated_bytes = Bytes::from_slice(env, &aggregated);
 
@@ -1301,6 +1333,7 @@ impl CoinflipContract {
         fee_bps: u32,
         min_wager: i128,
         max_wager: i128,
+        oracle_vrf_pk: BytesN<32>,
     ) -> Result<(), Error> {
         // Guard: prevent re-initialization
         if env.storage().persistent().has(&StorageKey::Config) {
@@ -1340,6 +1373,8 @@ impl CoinflipContract {
             multipliers,
             multipliers: MultiplierConfig::default_config(),
             min_reserve_threshold: 0,
+            oracle_vrf_pk,
+        };
         };
         
         let stats = ContractStats {
@@ -1796,8 +1831,8 @@ impl CoinflipContract {
             wager,
             side,
             streak: 0,
-            commitment,
-            contract_random,
+            commitment: commitment.clone(),
+            contract_random: contract_random.clone(),
             fee_bps: config.fee_bps,
             phase: GamePhase::Committed,
             start_ledger: env.ledger().sequence(),
@@ -1807,6 +1842,15 @@ impl CoinflipContract {
             multipliers: config.multipliers.clone(),
             multipliers: config.multipliers,
             oracle_commitment,
+            // vrf_input = SHA-256(commitment || contract_random) — the message the oracle signs.
+            // Computed after contract_random is finalised so the oracle cannot pre-compute
+            // a signature before the contract's contribution is known.
+            vrf_input: {
+                let mut msg = Bytes::new(&env);
+                msg.append(&Bytes::from_slice(&env, &commitment.to_array()));
+                msg.append(&Bytes::from_slice(&env, &contract_random.to_array()));
+                env.crypto().sha256(&msg).into()
+            },
         };
 
         Self::save_player_game(&env, &player, &game);
@@ -1888,7 +1932,7 @@ impl CoinflipContract {
         env: Env,
         player: Address,
         secret: Bytes,
-        oracle_random: Bytes,
+        vrf_proof: BytesN<64>,
     ) -> Result<bool, Error> {
         player.require_auth();
 
@@ -1923,9 +1967,13 @@ impl CoinflipContract {
         if !verify_commitment(&env, &oracle_random, &game.oracle_commitment) {
             return Err(Error::CommitmentMismatch);
         }
+        // Guard 5: verify the oracle's VRF proof (Ed25519 signature over vrf_input).
+        // ed25519_verify panics on invalid signature, aborting the transaction.
+        let config = Self::load_config(&env);
+        verify_vrf_proof(&env, &config.oracle_vrf_pk, &game.vrf_input, &vrf_proof);
 
-        // Determine outcome by combining player secret + contract random + oracle random
-        let outcome = generate_outcome(&env, &secret, &game.contract_random, &oracle_random);
+        // Determine outcome using player secret, contract random, and VRF proof.
+        let outcome = generate_outcome(&env, &secret, &game.contract_random, &vrf_proof);
 
         let won = outcome == game.side;
 
@@ -1966,7 +2014,7 @@ impl CoinflipContract {
                 contract_random,
                 payout: 0,
                 ledger: game.start_ledger,
-                oracle_random,
+                vrf_proof,
             });
 
             Self::delete_player_game(&env, &player);
@@ -2280,7 +2328,7 @@ impl CoinflipContract {
             contract_random: game.contract_random,
             payout: total_payout,
             ledger: game.start_ledger,
-            oracle_random: Bytes::new(&env),
+            vrf_proof: BytesN::from_array(&env, &[0u8; 64]),
         });
 
         // Clear the player's game state completely after settlement
@@ -3189,7 +3237,7 @@ impl CoinflipContract {
             contract_random: game.contract_random,
             payout: 0,
             ledger: game.start_ledger,
-            oracle_random: Bytes::new(&env),
+            vrf_proof: BytesN::from_array(&env, &[0u8; 64]),
         });
 
         Self::delete_player_game(&env, &player);
@@ -3390,7 +3438,7 @@ impl CoinflipContract {
         }
 
         // 2. Re-derive outcome and compare.
-        let derived = generate_outcome(&env, &entry.secret, &entry.contract_random, &entry.oracle_random);
+        let derived = generate_outcome(&env, &entry.secret, &entry.contract_random, &entry.vrf_proof);
         Ok(derived == entry.outcome)
     }
 
@@ -3560,6 +3608,9 @@ mod timelock_tests;
 mod multiparty_tests;
 
 #[cfg(test)]
+mod vrf_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
@@ -3595,7 +3646,7 @@ mod tests {
 
         let addr = Address::generate(&env);
         let token = Address::generate(&env);
-        let result = client.try_initialize(&addr, &addr, &token, &300, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&addr, &addr, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         assert_eq!(result, Err(Ok(Error::AdminTreasuryConflict)));
     }
 
@@ -3609,10 +3660,10 @@ mod tests {
         let treasury = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
         // Second call must fail
-        let result = client.try_initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
     }
 
@@ -3726,7 +3777,7 @@ mod tests {
         let treasury = Address::generate(&env);
         let token = Address::generate(&env);
         
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         
         // Verify config was stored
         let stored_config: ContractConfig = env.as_contract(&contract_id, || {
@@ -3749,11 +3800,11 @@ mod tests {
         let token = Address::generate(&env);
         
         // Fee too low
-        let result = client.try_initialize(&admin, &treasury, &token, &100, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &treasury, &token, &100, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
         
         // Fee too high
-        let result = client.try_initialize(&admin, &treasury, &token, &600, &1_000_000, &100_000_000);
+        let result = client.try_initialize(&admin, &treasury, &token, &600, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         assert_eq!(result, Err(Ok(Error::InvalidFeePercentage)));
     }
 
@@ -3768,7 +3819,7 @@ mod tests {
         let token = Address::generate(&env);
         
         // Min >= Max
-        let result = client.try_initialize(&admin, &treasury, &token, &300, &100_000_000, &1_000_000);
+        let result = client.try_initialize(&admin, &treasury, &token, &300, &100_000_000, &1_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         assert_eq!(result, Err(Ok(Error::InvalidWagerLimits)));
     }
 
@@ -3803,7 +3854,7 @@ mod tests {
         let treasury = Address::generate(env);
         // Register a real stellar asset contract so token transfers work
         let token = env.register_stellar_asset_contract(admin.clone());
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         (contract_id, client)
     }
 
@@ -3834,7 +3885,7 @@ mod tests {
         let treasury = Address::generate(env);
         let token = Address::generate(env);
         
-        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         
         // Fund reserves
         fund_reserves(env, &contract_id, 1_000_000_000);
@@ -3845,7 +3896,7 @@ mod tests {
             let secret = Bytes::from_slice(env, &[1u8; 32]);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
             
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             
             // Force a win by setting game state directly
             env.as_contract(&contract_id, || {
@@ -3861,7 +3912,7 @@ mod tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
                 
-                    oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+                    vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
                 };
                             $$$
                             start_ledger: 0,
@@ -3892,7 +3943,7 @@ mod tests {
             &player,
             &Side::Heads,
             &10_000_000,
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::ContractPaused)));
     }
@@ -3909,7 +3960,7 @@ mod tests {
             &player,
             &Side::Heads,
             &500_000, // below min_wager of 1_000_000
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
     }
@@ -3926,7 +3977,7 @@ mod tests {
             &player,
             &Side::Heads,
             &200_000_000, // above max_wager of 100_000_000
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)));
     }
@@ -3943,7 +3994,7 @@ mod tests {
             &player,
             &Side::Heads,
             &0,
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
     }
@@ -3960,7 +4011,7 @@ mod tests {
             &player,
             &Side::Heads,
             &-1,
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
     }
@@ -3977,7 +4028,7 @@ mod tests {
             &player,
             &Side::Heads,
             &i128::MAX,
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)));
     }
@@ -3991,13 +4042,13 @@ mod tests {
 
         let player = Address::generate(&env);
         // First game succeeds
-        client.start_game(&player, &Side::Heads, &10_000_000, &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
+        client.start_game(&player, &Side::Heads, &10_000_000, &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         // Second game must be rejected
         let result = client.try_start_game(
             &player,
             &Side::Tails,
             &10_000_000,
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
     }
@@ -4015,7 +4066,7 @@ mod tests {
             &player,
             &Side::Heads,
             &10_000_000,
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
@@ -4032,7 +4083,7 @@ mod tests {
             &player,
             &Side::Heads,
             &10_000_000,
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert!(result.is_ok());
 
@@ -4071,7 +4122,7 @@ mod tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         
-            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
                     $$$
                     start_ledger: 0,
@@ -4283,7 +4334,7 @@ mod tests {
             &player,
             &Side::Tails,
             &10_000_000,
-            &dummy_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert!(result.is_ok(), "player must be able to start a new game after cash-out");
     }
@@ -4643,9 +4694,9 @@ mod tests {
         let secret = Bytes::from_slice(&env, &[1u8; 32]);
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-        client.start_game(&player, &Side::Heads, &10_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        assert_eq!(client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+        assert_eq!(client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
         // Fee changes after reveal must not alter this game's payout terms.
         client.set_fee(&admin, &500);
@@ -4669,9 +4720,9 @@ mod tests {
         let secret = Bytes::from_slice(&env, &[1u8; 32]);
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-        client.start_game(&player, &Side::Heads, &10_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &10_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        assert_eq!(client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+        assert_eq!(client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
         let expected = calculate_payout(10_000_000, 1, 500).unwrap();
         let payout = client.try_cash_out(&player);
@@ -4790,7 +4841,7 @@ mod tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
             
-                oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+                vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
             };
                         $$$
                         start_ledger: 0,
@@ -5109,7 +5160,7 @@ mod property_tests {
         let treasury = Address::generate(env);
         let token = Address::generate(env);
         
-        client.initialize(&admin, &treasury, &token, &300, &min_wager, &max_wager);
+        client.initialize(&admin, &treasury, &token, &300, &min_wager, &max_wager, &BytesN::from_array(&env, &[0u8; 32]));
         
         // Fund reserves with excessive amount to avoid InsufficientReserves errors
         env.as_contract(&contract_id, || {
@@ -5151,7 +5202,7 @@ mod property_tests {
                 &player,
                 &Side::Heads,
                 &invalid_wager,
-                &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             
             prop_assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)),
@@ -5182,7 +5233,7 @@ mod property_tests {
                 &player,
                 &Side::Heads,
                 &invalid_wager,
-                &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             
             prop_assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)),
@@ -5209,7 +5260,7 @@ mod property_tests {
                 &player,
                 &Side::Heads,
                 &min_wager, // Exactly at minimum
-                &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             
             prop_assert!(result.is_ok(),
@@ -5236,7 +5287,7 @@ mod property_tests {
                 &player,
                 &Side::Heads,
                 &max_wager, // Exactly at maximum
-                &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             
             prop_assert!(result.is_ok(),
@@ -5270,7 +5321,7 @@ mod property_tests {
                 &player,
                 &Side::Heads,
                 &wager,
-                &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             
             prop_assert!(result.is_ok(),
@@ -5344,7 +5395,7 @@ mod property_tests {
             &player,
             &Side::Heads,
             &min_wager,
-            &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
 
         assert!(
@@ -5366,7 +5417,7 @@ mod property_tests {
             &player,
             &Side::Tails,
             &max_wager,
-            &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
 
         assert!(
@@ -5390,7 +5441,7 @@ mod property_tests {
             &player,
             &Side::Heads,
             &midpoint,
-            &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
 
         assert!(
@@ -5417,7 +5468,7 @@ mod property_tests {
             &player,
             &Side::Heads,
             &invalid_wager,
-            &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         
         assert_eq!(
@@ -5476,7 +5527,7 @@ mod property_tests {
             let treasury = Address::generate(&env);
             let token = Address::generate(&env);
 
-            let result = client.try_initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+            let result = client.try_initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager, &BytesN::from_array(&env, &[0u8; 32]));
             prop_assert!(result.is_ok());
         }
     }
@@ -5500,7 +5551,7 @@ mod property_tests {
             let treasury = Address::generate(&env);
             let token = Address::generate(&env);
             
-            client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+            client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager, &BytesN::from_array(&env, &[0u8; 32]));
             
             let stored_config: ContractConfig = env.as_contract(&contract_id, || {
                 env.storage().persistent().get(&StorageKey::Config).unwrap().unwrap()
@@ -5526,7 +5577,7 @@ mod property_tests {
             let treasury = Address::generate(&env);
             let token = Address::generate(&env);
             
-            client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+            client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager, &BytesN::from_array(&env, &[0u8; 32]));
             
             let stored_stats: ContractStats = env.as_contract(&contract_id, || {
                 env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
@@ -5553,7 +5604,7 @@ mod property_tests {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
         let token = env.register_stellar_asset_contract(admin.clone());
-        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager, &BytesN::from_array(&env, &[0u8; 32]));
         (contract_id, client, treasury)
     }
 
@@ -5680,7 +5731,7 @@ mod property_tests {
         let treasury = Address::generate(env);
         let token = env.register_stellar_asset_contract(admin.clone());
 
-        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager, &BytesN::from_array(&env, &[0u8; 32]));
 
         env.as_contract(&contract_id, || {
             let mut stats = CoinflipContract::load_stats(env);
@@ -5712,9 +5763,9 @@ mod property_tests {
             let secret = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            prop_assert_eq!(client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+            prop_assert_eq!(client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
             let revealed: GameState = env.as_contract(&contract_id, || {
                 CoinflipContract::load_player_game(&env, &player).unwrap()
@@ -5765,9 +5816,9 @@ mod property_tests {
             let player_one = Address::generate(&env);
             let secret_one = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment_one: BytesN<32> = env.crypto().sha256(&secret_one).into();
-            client.start_game(&player_one, &Side::Heads, &wager, &commitment_one, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player_one, &Side::Heads, &wager, &commitment_one).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            prop_assert_eq!(client.try_reveal(&player_one, &secret_one, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+            prop_assert_eq!(client.try_reveal(&player_one, &secret_one, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
             // Admin updates fee; this must only affect newly created games.
             client.set_fee(&admin, &new_fee_bps);
@@ -5776,9 +5827,9 @@ mod property_tests {
             let player_two = Address::generate(&env);
             let secret_two = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment_two: BytesN<32> = env.crypto().sha256(&secret_two).into();
-            client.start_game(&player_two, &Side::Heads, &wager, &commitment_two, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player_two, &Side::Heads, &wager, &commitment_two).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            prop_assert_eq!(client.try_reveal(&player_two, &secret_two, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+            prop_assert_eq!(client.try_reveal(&player_two, &secret_two, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
             let payout_one = client.try_cash_out(&player_one);
             let payout_two = client.try_cash_out(&player_two);
@@ -5805,9 +5856,9 @@ mod property_tests {
             let secret = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            prop_assert_eq!(client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+            prop_assert_eq!(client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
             client.set_fee(&admin, &new_fee_bps);
 
@@ -5816,7 +5867,7 @@ mod property_tests {
             let next_commitment: BytesN<32> = env.crypto().sha256(&next_secret).into();
             prop_assert_eq!(client.try_continue_streak(&player, &next_commitment), Ok(()));
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            prop_assert_eq!(client.try_reveal(&player, &next_secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+            prop_assert_eq!(client.try_reveal(&player, &next_secret, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
             let payout = client.try_cash_out(&player);
             prop_assert_eq!(payout, Ok(calculate_payout(wager, 2, initial_fee_bps).unwrap()));
@@ -5839,7 +5890,7 @@ mod property_tests {
         let treasury = Address::generate(env);
         let token = env.register_stellar_asset_contract(admin.clone());
 
-        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+        client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager, &BytesN::from_array(&env, &[0u8; 32]));
 
         env.as_contract(&contract_id, || {
             let mut stats = CoinflipContract::load_stats(env);
@@ -5877,7 +5928,7 @@ mod property_tests {
                 env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
             });
 
-            let result = client.try_start_game(&player, &side, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &side, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             prop_assert_eq!(result, Err(Ok(Error::ContractPaused)));
 
             let game: Option<GameState> = env.as_contract(&contract_id, || {
@@ -5907,11 +5958,11 @@ mod property_tests {
             let secret = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             client.set_paused(&admin, &true);
 
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             prop_assert_eq!(result, Ok(true));
 
             let game: GameState = env.as_contract(&contract_id, || {
@@ -5937,9 +5988,9 @@ mod property_tests {
             let secret = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            prop_assert_eq!(client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+            prop_assert_eq!(client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
             client.set_paused(&admin, &true);
 
@@ -5954,7 +6005,7 @@ mod property_tests {
             prop_assert_eq!(continued.streak, 1);
 
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            prop_assert_eq!(client.try_reveal(&player, &secret_round_two, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])), Ok(true));
+            prop_assert_eq!(client.try_reveal(&player, &secret_round_two, &BytesN::from_array(&env, &[0u8; 64])), Ok(true));
 
             let expected_payout = calculate_payout(wager, 2, fee_bps).unwrap().unwrap();
             let payout = client.try_cash_out(&player);
@@ -5991,7 +6042,7 @@ mod property_tests {
             let treasury = Address::generate(&env);
             let token = Address::generate(&env);
 
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
             // Ensure reserves satisfy the worst-case payout for input wager.
             let required_reserves = wager
@@ -6008,7 +6059,7 @@ mod property_tests {
                 env.storage().persistent().get(&StorageKey::Stats).unwrap().unwrap()
             });
 
-            let result = client.try_start_game(&player, &side, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &side, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             prop_assert!(result.is_ok());
 
             let game: GameState = env.as_contract(&contract_id, || {
@@ -6051,7 +6102,7 @@ mod property_tests {
         // Use a real stellar asset contract so token transfers work
         let token = env.register_stellar_asset_contract(admin.clone());
 
-        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
         // Fund reserves (accounting) and mint real tokens to the contract
         let required_reserves = wager
@@ -6073,9 +6124,9 @@ mod property_tests {
         };
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-        client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
         (admin, treasury, token, contract_id, player)
     }
@@ -6196,9 +6247,9 @@ mod property_tests {
             let player2 = Address::generate(&env);
             let secret2 = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment2: BytesN<32> = env.crypto().sha256(&secret2).into();
-            client.start_game(&player2, &Side::Heads, &wager2, &commitment2, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player2, &Side::Heads, &wager2, &commitment2).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player2, &secret2, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&player2, &secret2, &BytesN::from_array(&env, &[0u8; 64]));
 
             // Record initial balances
             let initial_treasury = token_client.balance(&treasury);
@@ -6293,7 +6344,7 @@ mod property_tests {
             // Real token so transfers don't abort
             let token = env.register_stellar_asset_contract(admin.clone());
 
-            client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+            client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
             // Ensure reserves always cover worst-case payout for this wager
             let initial_reserves = wager
@@ -6309,9 +6360,9 @@ mod property_tests {
             let secret = Bytes::from_slice(&env, &[1u8; 32]);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
             let pre_stats: ContractStats = env.as_contract(&contract_id, || {
                 CoinflipContract::load_stats(&env)
@@ -6384,7 +6435,7 @@ mod property_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         
-            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
                     $$$
                     start_ledger: 0,
@@ -6416,7 +6467,7 @@ mod property_tests {
             let treasury = Address::generate(&env);
             let token = Address::generate(&env);
 
-            client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager);
+            client.initialize(&admin, &treasury, &token, &fee_bps, &min_wager, &max_wager, &BytesN::from_array(&env, &[0u8; 32]));
 
             // Second initialization with fresh addresses must still fail.
             let admin2 = Address::generate(&env);
@@ -6530,7 +6581,7 @@ mod property_tests {
 
             let player = Address::generate(&env);
             let result = client.try_start_game(
-                &player, &Side::Heads, &invalid_wager, &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &player, &Side::Heads, &invalid_wager, &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             prop_assert_eq!(result, Err(Ok(Error::WagerBelowMinimum)));
             prop_assert_eq!(Error::WagerBelowMinimum as u32, error_codes::WAGER_BELOW_MINIMUM);
@@ -6552,7 +6603,7 @@ mod property_tests {
 
             let player = Address::generate(&env);
             let result = client.try_start_game(
-                &player, &Side::Heads, &invalid_wager, &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &player, &Side::Heads, &invalid_wager, &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             prop_assert_eq!(result, Err(Ok(Error::WagerAboveMaximum)));
             prop_assert_eq!(Error::WagerAboveMaximum as u32, error_codes::WAGER_ABOVE_MAXIMUM);
@@ -6571,7 +6622,7 @@ mod property_tests {
             inject_game_prop(&env, &contract_id, &player, GamePhase::Committed, 0, wager);
 
             let result = client.try_start_game(
-                &player, &Side::Heads, &wager, &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &player, &Side::Heads, &wager, &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             prop_assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
             prop_assert_eq!(Error::ActiveGameExists as u32, error_codes::ACTIVE_GAME_EXISTS);
@@ -6590,14 +6641,14 @@ mod property_tests {
             let admin = Address::generate(&env);
             let treasury = Address::generate(&env);
             let token = Address::generate(&env);
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
             // Zero reserves — never enough to cover any wager's worst-case payout
             fund_reserves(&env, &contract_id, 0);
 
             let player = Address::generate(&env);
             let result = client.try_start_game(
-                &player, &Side::Heads, &wager, &dummy_commitment_prop(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+                &player, &Side::Heads, &wager, &dummy_commitment_prop(&env).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
             prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
             prop_assert_eq!(Error::InsufficientReserves as u32, error_codes::INSUFFICIENT_RESERVES);
@@ -6620,7 +6671,7 @@ mod property_tests {
             let player = Address::generate(&env);
             let secret = Bytes::from_slice(&env, &[secret_byte; 32]);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             prop_assert_eq!(result, Err(Ok(Error::NoActiveGame)));
             prop_assert_eq!(Error::NoActiveGame as u32, error_codes::NO_ACTIVE_GAME);
         }
@@ -6640,7 +6691,7 @@ mod property_tests {
 
             let secret = Bytes::from_slice(&env, &[42u8; 32]);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)));
             prop_assert_eq!(Error::InvalidPhase as u32, error_codes::INVALID_PHASE);
         }
@@ -6659,7 +6710,7 @@ mod property_tests {
 
             let secret = Bytes::from_slice(&env, &[42u8; 32]);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)));
         }
 
@@ -6681,7 +6732,7 @@ mod property_tests {
             prop_assume!(bad_byte != 42);
             let wrong_secret = Bytes::from_slice(&env, &[bad_byte; 32]);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let result = client.try_reveal(&player, &wrong_secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.try_reveal(&player, &wrong_secret, &BytesN::from_array(&env, &[0u8; 64]));
             prop_assert_eq!(result, Err(Ok(Error::CommitmentMismatch)));
             prop_assert_eq!(Error::CommitmentMismatch as u32, error_codes::COMMITMENT_MISMATCH);
         }
@@ -6831,7 +6882,7 @@ mod property_tests {
             let admin = Address::generate(&env);
             let treasury = Address::generate(&env);
             let token = Address::generate(&env);
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
             let player = Address::generate(&env);
             inject_game_prop(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
@@ -7010,7 +7061,7 @@ mod property_tests {
             let admin    = Address::generate(&env);
             let treasury = Address::generate(&env);
             let token    = Address::generate(&env);
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
             // Fund reserves to cover the next streak's worst-case payout.
             fund_reserves(&env, &contract_id, i128::MAX / 4);
@@ -7270,7 +7321,7 @@ mod property_tests {
 
             let secret = Bytes::from_slice(&env, &[42u8; 32]);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             prop_assert_eq!(result, Err(Ok(Error::InvalidPhase)));
         }
     }
@@ -7317,7 +7368,7 @@ mod cumulative_fee_tests {
         let treasury = Address::generate(env);
         let token    = Address::generate(env);
 
-        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
         // Inject large reserves so no payout is blocked by InsufficientReserves.
         env.as_contract(&contract_id, || {
@@ -7360,7 +7411,7 @@ mod cumulative_fee_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         
-            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
                     $$$
                     start_ledger: 0,
@@ -7827,7 +7878,7 @@ mod streak_increment_tests {
             let admin    = Address::generate(&env);
             let treasury = Address::generate(&env);
             let token    = Address::generate(&env);
-            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+            client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
             // Fund reserves to cover worst-case payout.
             env.as_contract(&contract_id, || {
@@ -7843,7 +7894,7 @@ mod streak_increment_tests {
             let player     = Address::generate(&env);
             let commitment = BytesN::from_array(&env, &commitment_bytes);
 
-            client.start_game(&player, &side, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &side, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
             let game: GameState = env.as_contract(&contract_id, || {
                 CoinflipContract::load_player_game(&env, &player).unwrap()
@@ -7968,13 +8019,13 @@ mod outcome_determinism_tests {
         fn prop_generate_outcome_is_deterministic(
             secret_bytes   in prop::array::uniform32(any::<u8>()),
             contract_bytes in prop::array::uniform32(any::<u8>()),
-            oracle_bytes   in prop::array::uniform32(any::<u8>()),
+            proof_bytes    in prop::array::uniform32(any::<u8>()),
         ) {
             let env = soroban_sdk::Env::default();
-            let secret   = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
-            let oracle   = soroban_sdk::Bytes::from_slice(&env, &oracle_bytes);
+            let secret = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
+            let proof: BytesN<64> = BytesN::from_array(&env, &[proof_bytes[0]; 64]);
             let cr: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
-            prop_assert_eq!(generate_outcome(&env, &secret, &cr, &oracle), generate_outcome(&env, &secret, &cr, &oracle));
+            prop_assert_eq!(generate_outcome(&env, &secret, &cr, &proof), generate_outcome(&env, &secret, &cr, &proof));
         }
 
         /// generate_outcome returns only Heads or Tails — no other variant possible.
@@ -7982,13 +8033,13 @@ mod outcome_determinism_tests {
         fn prop_generate_outcome_returns_valid_side(
             secret_bytes   in prop::array::uniform32(any::<u8>()),
             contract_bytes in prop::array::uniform32(any::<u8>()),
-            oracle_bytes   in prop::array::uniform32(any::<u8>()),
+            proof_byte     in any::<u8>(),
         ) {
             let env = soroban_sdk::Env::default();
             let secret = soroban_sdk::Bytes::from_slice(&env, &secret_bytes);
-            let oracle = soroban_sdk::Bytes::from_slice(&env, &oracle_bytes);
+            let proof: BytesN<64> = BytesN::from_array(&env, &[proof_byte; 64]);
             let cr: BytesN<32> = BytesN::from_array(&env, &contract_bytes);
-            let side = generate_outcome(&env, &secret, &cr, &oracle);
+            let side = generate_outcome(&env, &secret, &cr, &proof);
             prop_assert!(side == Side::Heads || side == Side::Tails);
         }
 
@@ -8002,13 +8053,13 @@ mod outcome_determinism_tests {
             ),
         ) {
             let env = soroban_sdk::Env::default();
-            let oracle = soroban_sdk::Bytes::from_slice(&env, &[0u8; 32]);
+            let proof: BytesN<64> = BytesN::from_array(&env, &[0u8; 64]);
             let mut saw_heads = false;
             let mut saw_tails = false;
             for (s, c) in pairs {
                 let secret = soroban_sdk::Bytes::from_slice(&env, &s);
                 let cr: BytesN<32> = BytesN::from_array(&env, &c);
-                match generate_outcome(&env, &secret, &cr, &oracle) {
+                match generate_outcome(&env, &secret, &cr, &proof) {
                     Side::Heads => saw_heads = true,
                     Side::Tails => saw_tails = true,
                 }
@@ -8171,7 +8222,7 @@ mod loss_forfeiture_tests {
         let token    = soroban_sdk::Address::generate(env);
 
         // fee = 300 bps (3 %), wager range [1_000_000, 1_000_000_000]
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
         // Fund reserves to the safe ceiling so payout checks always pass.
         env.as_contract(&contract_id, || {
@@ -8229,11 +8280,11 @@ mod loss_forfeiture_tests {
             let secret = loss_secret_for_side(&env, &side);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &side, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &side, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
             // LF-1: must return false
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let result = client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            let result = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             prop_assert!(!result, "reveal must return false on a loss");
 
             // LF-2: game state must be fully deleted
@@ -8272,9 +8323,9 @@ mod loss_forfeiture_tests {
             let secret = loss_secret_for_side(&env, &side);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &side, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &side, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
             let reserves_after: i128 = env.as_contract(&contract_id, || {
                 CoinflipContract::load_stats(&env).reserve_balance
@@ -8309,14 +8360,14 @@ mod loss_forfeiture_tests {
             let secret = loss_secret_for_side(&env, &side);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &side, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &side, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
             // LF-4: new game must be accepted
             let new_secret = soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]);
             let new_commitment: BytesN<32> = env.crypto().sha256(&new_secret).into();
-            let result = client.try_start_game(&player, &side, &wager, &new_commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &side, &wager, &new_commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             prop_assert!(result.is_ok(),
                 "start_game must succeed after a loss (slot must be free)");
 
@@ -8352,9 +8403,9 @@ mod loss_forfeiture_tests {
             let player_h = soroban_sdk::Address::generate(&env_h);
             let secret_h = loss_secret_for_side(&env_h, &Side::Heads);
             let commitment_h: BytesN<32> = env_h.crypto().sha256(&secret_h).into();
-            client_h.start_game(&player_h, &Side::Heads, &wager, &commitment_h, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client_h.start_game(&player_h, &Side::Heads, &wager, &commitment_h).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client_h.reveal(&player_h, &secret_h, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client_h.reveal(&player_h, &secret_h, &BytesN::from_array(&env, &[0u8; 64]));
             let delta_h = env_h.as_contract(&contract_id_h, || {
                 CoinflipContract::load_stats(&env_h).reserve_balance
             }) - reserves_before_h;
@@ -8368,9 +8419,9 @@ mod loss_forfeiture_tests {
             let player_t = soroban_sdk::Address::generate(&env_t);
             let secret_t = loss_secret_for_side(&env_t, &Side::Tails);
             let commitment_t: BytesN<32> = env_t.crypto().sha256(&secret_t).into();
-            client_t.start_game(&player_t, &Side::Tails, &wager, &commitment_t, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client_t.start_game(&player_t, &Side::Tails, &wager, &commitment_t).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client_t.reveal(&player_t, &secret_t, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client_t.reveal(&player_t, &secret_t, &BytesN::from_array(&env, &[0u8; 64]));
             let delta_t = env_t.as_contract(&contract_id_t, || {
                 CoinflipContract::load_stats(&env_t).reserve_balance
             }) - reserves_before_t;
@@ -8403,7 +8454,7 @@ mod loss_forfeiture_tests {
         let admin    = soroban_sdk::Address::generate(&env);
         let treasury = soroban_sdk::Address::generate(&env);
         let token    = soroban_sdk::Address::generate(&env);
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
         // Set reserves to i128::MAX so checked_add saturates on the loss credit.
         let near_max = i128::MAX;
@@ -8418,10 +8469,10 @@ mod loss_forfeiture_tests {
         let secret = soroban_sdk::Bytes::from_slice(&env, &[3u8; 32]); // loss for Heads
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-        client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         // Must not panic or wrap — checked_add fallback keeps balance at near_max
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         assert!(result.is_ok(), "reveal must not panic on reserve overflow edge case");
 
         let stats: ContractStats = env.as_contract(&contract_id, || {
@@ -8458,7 +8509,7 @@ mod reserve_solvency_tests {
         let treasury = soroban_sdk::Address::generate(env);
         let token    = soroban_sdk::Address::generate(env);
 
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &1_000_000_000, &BytesN::from_array(&env, &[0u8; 32]));
 
         env.as_contract(&contract_id, || {
             let mut stats = CoinflipContract::load_stats(env);
@@ -8486,7 +8537,7 @@ mod reserve_solvency_tests {
             let player = soroban_sdk::Address::generate(&env);
             let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
-            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
             let max_payout = wager * 10;
             if reserves >= max_payout {
@@ -8535,7 +8586,7 @@ mod reserve_solvency_tests {
             let (_id, client) = setup_solvency_env(&env, reserves);
             let player = soroban_sdk::Address::generate(&env);
             let commitment = BytesN::from_array(&env, &[0u8; 32]);
-            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             prop_assert!(result.is_ok(),
                 "reserve ({}) >= required ({}): game must be accepted", reserves, required);
         }
@@ -8554,7 +8605,7 @@ mod reserve_solvency_tests {
             let (_id, client) = setup_solvency_env(&env, reserves);
             let player = soroban_sdk::Address::generate(&env);
             let commitment = BytesN::from_array(&env, &[0u8; 32]);
-            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
                 "reserve ({}) < required ({}): must return InsufficientReserves", reserves, required);
         }
@@ -8569,7 +8620,7 @@ mod reserve_solvency_tests {
             let (_id, client) = setup_solvency_env(&env, reserves);
             let player = soroban_sdk::Address::generate(&env);
             let commitment = BytesN::from_array(&env, &[0u8; 32]);
-            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             prop_assert!(result.is_ok(),
                 "reserve == wager*10 ({}): boundary must be accepted", reserves);
         }
@@ -8584,7 +8635,7 @@ mod reserve_solvency_tests {
             let (_id, client) = setup_solvency_env(&env, reserves);
             let player = soroban_sdk::Address::generate(&env);
             let commitment = BytesN::from_array(&env, &[0u8; 32]);
-            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             prop_assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
                 "reserve == wager*10-1 ({}): must be rejected", reserves);
         }
@@ -8600,7 +8651,7 @@ mod reserve_solvency_tests {
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
         // start_game returns () on success, not Result
-        client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         // If we reach here without panic, the test passed
     }
 
@@ -8613,7 +8664,7 @@ mod reserve_solvency_tests {
         let player = soroban_sdk::Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
-        let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
@@ -8626,7 +8677,7 @@ mod reserve_solvency_tests {
         let player = soroban_sdk::Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
-        let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)));
     }
 
@@ -8644,7 +8695,7 @@ mod reserve_solvency_tests {
             CoinflipContract::load_stats(&env)
         });
 
-        let _ = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let _ = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
         // After stats
         let stats_after: ContractStats = env.as_contract(&id, || {
@@ -8670,7 +8721,7 @@ mod reserve_solvency_tests {
         let commitment = BytesN::from_array(&env, &[0u8; 32]);
 
         // start_game returns () on success, not Result
-        client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         // If we reach here without panic, the test passed
     }
 
@@ -8689,9 +8740,9 @@ mod reserve_solvency_tests {
         let secret = soroban_sdk::Bytes::from_slice(&env, &[2u8; 32]);
         let commitment = env.crypto().sha256(&secret).into();
         
-        client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         
         // Now game is in Revealed (streak 1). Next streak is 2. Multiplier for 2 is 3.5x.
         // Let's drain reserves so it cannot cover 3.5x.
@@ -8753,7 +8804,7 @@ mod reserve_balance_accuracy_tests {
         let admin    = soroban_sdk::Address::generate(env);
         let treasury = soroban_sdk::Address::generate(env);
         let token    = soroban_sdk::Address::generate(env);
-        client.initialize(&admin, &treasury, &token, &FEE_BPS, &MIN_WAGER, &MAX_WAGER);
+        client.initialize(&admin, &treasury, &token, &FEE_BPS, &MIN_WAGER, &MAX_WAGER, &BytesN::from_array(&env, &[0u8; 32]));
         env.as_contract(&contract_id, || {
             let mut stats = CoinflipContract::load_stats(env);
             stats.reserve_balance = initial_reserves;
@@ -8796,10 +8847,10 @@ mod reserve_balance_accuracy_tests {
             let secret = loss_secret(&env);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             let before = reserve(&env, &id);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             let after = reserve(&env, &id);
 
             prop_assert_eq!(after - before, wager,
@@ -8821,9 +8872,9 @@ mod reserve_balance_accuracy_tests {
             let secret = win_secret(&env);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             // streak = 1 after win
             let gross = wager.checked_mul(get_multiplier(1) as i128) / 10_000;
 
@@ -8849,7 +8900,7 @@ mod reserve_balance_accuracy_tests {
             let commitment: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
 
             let before = reserve(&env, &id);
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             let after = reserve(&env, &id);
 
             prop_assert_eq!(before, after,
@@ -8870,9 +8921,9 @@ mod reserve_balance_accuracy_tests {
             let secret = win_secret(&env);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
             client.cash_out(&player);
 
             prop_assert!(reserve(&env, &id) >= 0,
@@ -8897,16 +8948,16 @@ mod reserve_balance_accuracy_tests {
             // Loss game
             let loss_sec = loss_secret(&env);
             let loss_com: BytesN<32> = env.crypto().sha256(&loss_sec).into();
-            client.start_game(&p_loss, &Side::Heads, &wager, &loss_com, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&p_loss, &Side::Heads, &wager, &loss_com).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&p_loss, &loss_sec, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&p_loss, &loss_sec, &BytesN::from_array(&env, &[0u8; 64]));
 
             // Win game
             let win_sec = win_secret(&env);
             let win_com: BytesN<32> = env.crypto().sha256(&win_sec).into();
-            client.start_game(&p_win, &Side::Heads, &wager, &win_com, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&p_win, &Side::Heads, &wager, &win_com).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&p_win, &win_sec, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&p_win, &win_sec, &BytesN::from_array(&env, &[0u8; 64]));
             let gross_win = wager.checked_mul(get_multiplier(1) as i128) / 10_000;
 
             let before_cashout = reserve(&env, &id);
@@ -8936,7 +8987,7 @@ mod reserve_balance_accuracy_tests {
         let player = soroban_sdk::Address::generate(&env);
         let commitment: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
 
-        client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         let before = reserve(&env, &id);
 
         // Advance ledger past the reveal timeout window.
@@ -8960,7 +9011,7 @@ mod reserve_balance_accuracy_tests {
         let commitment: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
 
         let before = reserve(&env, &id);
-        let _ = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let _ = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         let after = reserve(&env, &id);
 
         assert_eq!(before, after, "reserve must be unchanged on rejected start_game");
@@ -8981,9 +9032,9 @@ mod reserve_balance_accuracy_tests {
             let player = soroban_sdk::Address::generate(&env);
             let secret = loss_secret(&env);
             let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+            client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         }
 
         let after = reserve(&env, &id);
@@ -9013,10 +9064,10 @@ mod concurrency_edge_case_tests {
         let commitment = dummy_commitment_prop(&env);
 
         // First attempt succeeds
-        client.start_game(&player, &Side::Heads, &min_wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
         // Second attempt immediately fails with ActiveGameExists
-        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
     }
 
@@ -9032,13 +9083,13 @@ mod concurrency_edge_case_tests {
         let commitment = env.crypto().sha256(&secret).into();
 
         // Game 1: start -> reveal (win) -> cash_out (no real token needed)
-        client.start_game(&player, &Side::Heads, &min_wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         client.cash_out(&player);
 
         // Game 2 must be allowed immediately after claim
-        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         assert!(result.is_ok(), "Expected Game 2 to be accepted after Game 1 claim");
     }
 
@@ -9054,14 +9105,14 @@ mod concurrency_edge_case_tests {
         let commitment = env.crypto().sha256(&secret).into();
 
         // Game 1: start -> reveal (win) -> cash_out
-        client.start_game(&player, &Side::Heads, &min_wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         let payout = client.try_cash_out(&player);
         assert!(payout.is_ok());
 
         // Game 2 must be allowed immediately after cash_out
-        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        let result = client.try_start_game(&player, &Side::Heads, &min_wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         assert!(result.is_ok(), "Expected Game 2 to be accepted after Game 1 cash_out");
     }
 
@@ -9076,15 +9127,15 @@ mod concurrency_edge_case_tests {
         let secret = Bytes::from_slice(&env, &[1u8; 32]);
         let commitment = env.crypto().sha256(&secret).into();
 
-        client.start_game(&player, &Side::Heads, &min_wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &min_wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
         // First reveal succeeds
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
 
         // Second reveal fails with InvalidPhase because game moved to Revealed phase
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         assert_eq!(result, Err(Ok(Error::InvalidPhase)));
     }
 
@@ -9100,8 +9151,8 @@ mod concurrency_edge_case_tests {
             let player = Address::generate(&env);
             let commitment = dummy_commitment_prop(&env);
 
-            client.start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
-            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            let result = client.try_start_game(&player, &Side::Heads, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             prop_assert_eq!(result, Err(Ok(Error::ActiveGameExists)));
         }
     }
@@ -9134,7 +9185,7 @@ mod concurrency_edge_case_tests {
 // h.fund(1_000_000_000);
 // h.start(&player, Side::Heads, 10_000_000, 1);   // seed 1 → Heads win
 env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-// let won = h.reveal(&player, 1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+// let won = h.reveal(&player, 1, &BytesN::from_array(&env, &[0u8; 64]));
 // assert!(won);
 // let payout = h.cash_out(&player);
 // assert!(payout > 0);
@@ -9288,7 +9339,7 @@ mod integration_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
             
-                oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+                vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
             };
                         $$$
                         start_ledger: 0,
@@ -9329,12 +9380,12 @@ mod integration_tests {
             seed: u8,
         ) -> bool {
             let commitment = self.make_commitment(seed);
-            self.client.start_game(player, &side, &wager, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            self.client.start_game(player, &side, &wager, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             // Advance past the time-lock before revealing.
             self.env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
             let secret = self.make_secret(seed);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            self.client.reveal(player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]))
+            self.client.reveal(player, &secret, &BytesN::from_array(&env, &[0u8; 64]))
         }
 
         /// Convenience: play a round expected to result in a win.
@@ -9421,7 +9472,7 @@ mod integration_tests {
         assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
         let secret2 = h.make_secret(1);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let won2 = h.client.reveal(&player, &secret2, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let won2 = h.client.reveal(&player, &secret2, &BytesN::from_array(&env, &[0u8; 64]));
         assert!(won2, "round 2 must win");
         assert_eq!(h.game_state(&player).streak, 2);
         let expected_net = calculate_payout(wager, 2, DEFAULT_FEE_BPS).unwrap();
@@ -9444,7 +9495,7 @@ mod integration_tests {
                 h.client.continue_streak(&player, &commitment);
                 let secret = h.make_secret(1);
                 env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-                let won = h.client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+                let won = h.client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
                 assert!(won, "round {} must win", expected_streak);
             }
             assert_eq!(h.game_state(&player).streak, expected_streak);
@@ -9506,7 +9557,7 @@ mod integration_tests {
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         let wrong_secret = h.make_secret(99);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let result = h.client.try_reveal(&player, &wrong_secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let result = h.client.try_reveal(&player, &wrong_secret, &BytesN::from_array(&env, &[0u8; 64]));
         assert_eq!(result, Err(Ok(Error::CommitmentMismatch)));
         assert_eq!(h.game_state(&player).phase, GamePhase::Committed);
     }
@@ -9521,7 +9572,7 @@ mod integration_tests {
         h.fund(1_000_000_000);
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let result = h.client.reveal(&player, &h.make_secret(1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        let result = h.client.reveal(&player, &h.make_secret(1, &BytesN::from_array(&env, &[0u8; 64])));
         assert!(result, "seed 1 + Heads must win");
         let game = h.game_state(&player);
         assert_eq!(game.phase, GamePhase::Revealed);
@@ -9537,7 +9588,7 @@ mod integration_tests {
         let reserve_before = h.stats().reserve_balance;
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let result = h.client.reveal(&player, &h.make_secret(3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        let result = h.client.reveal(&player, &h.make_secret(3, &BytesN::from_array(&env, &[0u8; 64])));
         assert!(!result, "seed 3 + Heads must lose");
         // Game state must be gone.
         let game_opt = h.env.as_contract(&h.contract_id, || {
@@ -9557,7 +9608,7 @@ mod integration_tests {
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         let before = h.game_state(&player);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let _ = h.client.try_reveal(&player, &h.make_secret(2, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        let _ = h.client.try_reveal(&player, &h.make_secret(2, &BytesN::from_array(&env, &[0u8; 64])));
         let after = h.game_state(&player);
         assert_eq!(before, after, "state must be unchanged on CommitmentMismatch");
     }
@@ -9571,11 +9622,11 @@ mod integration_tests {
         // Win to reach Revealed phase.
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        h.client.reveal(&player, &h.make_secret(1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        h.client.reveal(&player, &h.make_secret(1, &BytesN::from_array(&env, &[0u8; 64])));
         assert_eq!(h.game_state(&player).phase, GamePhase::Revealed);
         // Second reveal must be rejected.
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let result = h.client.try_reveal(&player, &h.make_secret(1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        let result = h.client.try_reveal(&player, &h.make_secret(1, &BytesN::from_array(&env, &[0u8; 64])));
         assert_eq!(result, Err(Ok(Error::InvalidPhase)));
     }
 
@@ -9585,7 +9636,7 @@ mod integration_tests {
         let h = Harness::new();
         let player = h.player();
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let result = h.client.try_reveal(&player, &h.make_secret(1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        let result = h.client.try_reveal(&player, &h.make_secret(1, &BytesN::from_array(&env, &[0u8; 64])));
         assert_eq!(result, Err(Ok(Error::NoActiveGame)));
     }
 
@@ -9597,7 +9648,7 @@ mod integration_tests {
         h.fund(1_000_000_000);
         h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        h.client.reveal(&player, &h.make_secret(3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]))); // loss
+        h.client.reveal(&player, &h.make_secret(3, &BytesN::from_array(&env, &[0u8; 64]))); // loss
         let result = h.client.try_start_game(
             &player, &Side::Heads, &DEFAULT_WAGER, &h.make_commitment(1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
@@ -9618,7 +9669,7 @@ mod integration_tests {
         let secret = h.make_secret(seed);
         let expected_side = generate_outcome(&h.env, &secret, &contract_random);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let won = h.client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let won = h.client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         assert_eq!(won, expected_side == Side::Heads,
             "reveal result must match generate_outcome prediction");
     }
@@ -9710,10 +9761,10 @@ mod integration_tests {
         h.fund(1_000_000_000);
         let predicted = h.probe_outcome(1);
         let commitment = h.make_commitment(1);
-        h.client.start_game(&player, &predicted, &DEFAULT_WAGER, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        h.client.start_game(&player, &predicted, &DEFAULT_WAGER, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         let secret = h.make_secret(1);
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        let won = h.client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+        let won = h.client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
         assert!(won, "probe_outcome prediction must match actual reveal outcome");
     }
 
@@ -9783,7 +9834,7 @@ mod integration_tests {
         h.fund(1_000_000_000);
         let player = h.player();
         let commitment = h.make_commitment(1);
-        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        h.client.start_game(&player, &Side::Heads, &DEFAULT_WAGER, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         let state = h.client.get_game_state(&player).expect("game state must exist");
         assert_eq!(state.phase, GamePhase::Committed);
         assert_eq!(state.side, Side::Heads);
@@ -9856,7 +9907,7 @@ mod cash_out_availability_tests {
         #[allow(deprecated)]
         let token    = env.register_stellar_asset_contract(admin.clone());
         // fee_bps=300, min=1_000_000, max=100_000_000
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         (contract_id, client)
     }
 
@@ -9889,7 +9940,7 @@ mod cash_out_availability_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         
-            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
                     $$$
                     start_ledger: 0,
@@ -10284,8 +10335,7 @@ mod cash_out_availability_tests {
             // Player can immediately start a new game.
             let new_commitment = prop_commitment(&env);
             let result = client.try_start_game(
-                &player, &Side::Tails, &1_000_000, &new_commitment,
-            );
+                &player, &Side::Tails, &1_000_000, &new_commitment);
             prop_assert!(result.is_ok(),
                 "start_game must succeed after cash_out (slot must be free)");
         }
@@ -10372,7 +10422,7 @@ mod state_transition_tests {
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let token = Address::generate(&env);
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         (env, client, contract_id)
     }
 
@@ -10404,7 +10454,7 @@ mod state_transition_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         
-            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -10431,7 +10481,7 @@ mod state_transition_tests {
             st_inject(&env, &contract_id, &player, GamePhase::Committed, 0, wager);
             let secret = st_secret(&env, 1);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            if client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])) {
+            if client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])) {
                 let g = st_game(&env, &contract_id, &player);
                 prop_assert_eq!(g.phase, GamePhase::Revealed);
                 prop_assert!(g.streak >= 1);
@@ -10448,7 +10498,7 @@ mod state_transition_tests {
             st_inject(&env, &contract_id, &player, GamePhase::Committed, 0, wager);
             let secret = st_secret(&env, 3);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            if !client.reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])) {
+            if !client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])) {
                 prop_assert!(st_game(&env, &contract_id, &player).is_none(),
                     "game must be deleted after loss");
             }
@@ -10493,13 +10543,13 @@ mod state_transition_tests {
 
         /// Double-reveal rejected: InvalidPhase.
         #[test]
-        fn prop_no_double_reveal(wager in 1_000_000i128..=20_000_000i128, streak in 1u32..=4u32, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])) {
+        fn prop_no_double_reveal(wager in 1_000_000i128..=20_000_000i128, streak in 1u32..=4u32, &BytesN::from_array(&env, &[0u8; 64])) {
             let (env, client, contract_id) = st_setup();
             st_fund(&env, &contract_id, 1_000_000_000);
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Revealed, streak, wager);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let err = client.try_reveal(&player, &st_secret(&env, 1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+            let err = client.try_reveal(&player, &st_secret(&env, 1, &BytesN::from_array(&env, &[0u8; 64])));
             prop_assert_eq!(err, Err(Ok(Error::InvalidPhase)));
         }
 
@@ -10621,7 +10671,7 @@ mod state_transition_tests {
             let player = Address::generate(&env);
             st_inject(&env, &contract_id, &player, GamePhase::Committed, initial_streak, wager);
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            if client.reveal(&player, &st_secret(&env, 1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]))) {
+            if client.reveal(&player, &st_secret(&env, 1, &BytesN::from_array(&env, &[0u8; 64]))) {
                 let g = st_game(&env, &contract_id, &player);
                 prop_assert!(g.streak > initial_streak,
                     "streak must increase after win (was {}, now {})", initial_streak, g.streak);
@@ -10647,7 +10697,7 @@ mod security_penetration_tests {
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let token = Address::generate(&env);
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         (env, client, contract_id, admin)
     }
 
@@ -10687,7 +10737,7 @@ mod security_penetration_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         
-            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
         env.as_contract(&contract_id, || {
             CoinflipContract::save_player_game(&env, &player, &game);
@@ -10751,7 +10801,7 @@ mod security_penetration_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
             
-                oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+                vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
             };
             env.as_contract(&contract_id, || {
                 CoinflipContract::save_player_game(&env, &player, &game);
@@ -10815,14 +10865,14 @@ mod security_penetration_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
             
-                oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+                vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
             };
             env.as_contract(&contract_id, || {
                 CoinflipContract::save_player_game(&env, &victim, &game);
             });
             prop_assert_eq!(
                 env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-                client.try_reveal(&attacker, &sec_secret(&env, 1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]))),
+                client.try_reveal(&attacker, &sec_secret(&env, 1, &BytesN::from_array(&env, &[0u8; 64]))),
                 Err(Ok(Error::NoActiveGame))
             );
         }
@@ -10851,14 +10901,14 @@ mod security_penetration_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
             
-                oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+                vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
             };
             env.as_contract(&contract_id, || {
                 CoinflipContract::save_player_game(&env, &player, &game);
             });
             prop_assert_eq!(
                 env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-                client.try_reveal(&player, &sec_secret(&env, wrong_seed, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]))),
+                client.try_reveal(&player, &sec_secret(&env, wrong_seed, &BytesN::from_array(&env, &[0u8; 64]))),
                 Err(Ok(Error::CommitmentMismatch))
             );
         }
@@ -10881,7 +10931,7 @@ mod security_penetration_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
             
-                oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+                vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
             };
             env.as_contract(&contract_id, || {
                 CoinflipContract::save_player_game(&env, &player, &game);
@@ -10924,7 +10974,7 @@ mod security_penetration_tests {
         let t2 = Address::generate(&env);
         let tok2 = Address::generate(&env);
         assert_eq!(
-            client.try_initialize(&a2, &t2, &tok2, &300, &1_000_000, &100_000_000),
+            client.try_initialize(&a2, &t2, &tok2, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32])),
             Err(Ok(Error::AlreadyInitialized))
         );
     }
@@ -10936,7 +10986,7 @@ mod security_penetration_tests {
         let player = Address::generate(&env);
         let commit = sec_commit(&env, 1);
         assert_eq!(
-            client.try_start_game(&player, &Side::Heads, &5_000_000, &commit, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
+            client.try_start_game(&player, &Side::Heads, &5_000_000, &commit).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             Err(Ok(Error::ContractPaused))
         );
     }
@@ -10968,7 +11018,7 @@ mod stress_tests {
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let token = Address::generate(&env);
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         (env, client, contract_id)
     }
 
@@ -11000,7 +11050,7 @@ mod stress_tests {
             side_bet: SideBet::None,
             side_bet_amount: 0,
         
-            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
         env.as_contract(contract_id, || {
             CoinflipContract::save_player_game(env, player, &game);
@@ -11110,7 +11160,7 @@ mod stress_tests {
         for i in 0u8..50 {
             let player = Address::generate(&env);
             let commit = str_commit(&env, i.wrapping_add(1));
-            client.start_game(&player, &Side::Heads, &1_000_000, &commit, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &1_000_000, &commit).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         }
         let stats = env.as_contract(&contract_id, || CoinflipContract::load_stats(&env));
         assert_eq!(stats.total_games, 50);
@@ -11124,9 +11174,9 @@ mod stress_tests {
             let player = Address::generate(&env);
             let seed = if i % 2 == 0 { 1u8 } else { 3u8 };
             let commit = str_commit(&env, seed);
-            client.start_game(&player, &Side::Heads, &5_000_000, &commit, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+            client.start_game(&player, &Side::Heads, &5_000_000, &commit).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            let won = client.reveal(&player, &str_secret(&env, seed, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+            let won = client.reveal(&player, &str_secret(&env, seed, &BytesN::from_array(&env, &[0u8; 64])));
             if won { client.cash_out(&player); }
         }
         let stats = env.as_contract(&contract_id, || CoinflipContract::load_stats(&env));
@@ -11230,7 +11280,7 @@ mod game_history_tests {
         let admin    = Address::generate(&env);
         let treasury = Address::generate(&env);
         let token    = Address::generate(&env);
-        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
         (env, client, contract_id)
     }
 
@@ -11267,7 +11317,7 @@ mod game_history_tests {
         // seed 3 → Tails outcome → loss for Heads player
         client.start_game(&player, &Side::Heads, &10_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
 
         let history = hist_history(&env, &contract_id, &player);
         assert_eq!(history.len(), 1);
@@ -11288,7 +11338,7 @@ mod game_history_tests {
         // seed 1 → Heads outcome → win for Heads player
         client.start_game(&player, &Side::Heads, &10_000_000, &hist_commit(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &hist_secret(&env, 1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        client.reveal(&player, &hist_secret(&env, 1, &BytesN::from_array(&env, &[0u8; 64])));
         let payout = client.cash_out(&player);
 
         let history = hist_history(&env, &contract_id, &player);
@@ -11310,13 +11360,13 @@ mod game_history_tests {
         // Game 1: win
         client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &hist_secret(&env, 1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        client.reveal(&player, &hist_secret(&env, 1, &BytesN::from_array(&env, &[0u8; 64])));
         client.cash_out(&player);
 
         // Game 2: loss
         client.start_game(&player, &Side::Heads, &3_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
 
         let history = hist_history(&env, &contract_id, &player);
         assert_eq!(history.len(), 2);
@@ -11336,7 +11386,7 @@ mod game_history_tests {
         for _ in 0..101 {
             client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+            client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
         }
 
         let history = hist_history(&env, &contract_id, &player);
@@ -11356,7 +11406,7 @@ mod game_history_tests {
         for _ in 0..5 {
             client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+            client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
         }
 
         // Page 1: offset=0, limit=3 → 3 entries
@@ -11391,7 +11441,7 @@ mod game_history_tests {
         for _ in 0..30 {
             client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
             env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+            client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
         }
 
         let result = client.get_game_history(&player, &0, &100);
@@ -11408,7 +11458,7 @@ mod game_history_tests {
         let player = Address::generate(&env);
         client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
 
         let result = client.verify_past_game(&player, &0);
         assert_eq!(result, Ok(true));
@@ -11422,7 +11472,7 @@ mod game_history_tests {
         let player = Address::generate(&env);
         client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &hist_secret(&env, 1, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        client.reveal(&player, &hist_secret(&env, 1, &BytesN::from_array(&env, &[0u8; 64])));
         client.cash_out(&player);
 
         // Win entries have empty secret → cannot fully verify → Ok(false)
@@ -11447,7 +11497,7 @@ mod game_history_tests {
         let player = Address::generate(&env);
         client.start_game(&player, &Side::Heads, &5_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
 
         let result = client.try_verify_past_game(&player, &99);
         assert_eq!(result, Err(Ok(Error::InvalidPhase)));
@@ -11462,13 +11512,13 @@ mod game_history_tests {
         hist_fund(&env, &contract_id, 1_000_000_000);
         let player = Address::generate(&env);
         let commitment = hist_commit(&env, 3);
-        client.start_game(&player, &Side::Heads, &5_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+        client.start_game(&player, &Side::Heads, &5_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
         // Capture contract_random before reveal.
         let contract_random = env.as_contract(&contract_id, || {
             CoinflipContract::load_player_game(&env, &player).unwrap().unwrap().contract_random
         });
         env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-        client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+        client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
 
         let entry = hist_history(&env, &contract_id, &player).get(0).unwrap();
         assert_eq!(entry.commitment, commitment);
@@ -11490,7 +11540,7 @@ mod game_history_tests {
             for _ in 0..n_games {
                 client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
                 env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-                client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+                client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
             }
             let len = hist_history(&env, &contract_id, &player).len();
             prop_assert!(len <= HISTORY_LIMIT, "history len {} exceeds HISTORY_LIMIT {}", len, HISTORY_LIMIT);
@@ -11508,7 +11558,7 @@ mod game_history_tests {
             for _ in 0..n_games {
                 client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
                 env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-                client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+                client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
             }
             let result = client.get_game_history(&player, &offset, &10);
             prop_assert_eq!(result.len(), 0);
@@ -11523,7 +11573,7 @@ mod game_history_tests {
             for _ in 0..n_games {
                 client.start_game(&player, &Side::Heads, &1_000_000, &hist_commit(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
                 env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-                client.reveal(&player, &hist_secret(&env, 3, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])));
+                client.reveal(&player, &hist_secret(&env, 3, &BytesN::from_array(&env, &[0u8; 64])));
             }
             let history = hist_history(&env, &contract_id, &player);
             for i in 0..history.len() {

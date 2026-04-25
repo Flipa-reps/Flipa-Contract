@@ -33,7 +33,7 @@ fn timeout_reclaim_at_exact_boundary_100_ledgers() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance ledger to exactly 100 ledgers after start
     env.ledger().set_sequence(start_ledger + 100);
@@ -58,7 +58,7 @@ fn timeout_reclaim_before_boundary_99_ledgers() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance ledger to 99 ledgers after start (before timeout)
     env.ledger().set_sequence(start_ledger + 99);
@@ -83,7 +83,7 @@ fn timeout_reclaim_after_boundary_101_ledgers() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance ledger to 101 ledgers after start (after timeout)
     env.ledger().set_sequence(start_ledger + 101);
@@ -107,7 +107,7 @@ fn timeout_early_reclaim_immediate() {
     let commitment = env.crypto().sha256(&secret).into();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Try to reclaim immediately (same ledger)
     let result = client.try_reclaim_wager(&player);
@@ -128,7 +128,7 @@ fn timeout_early_reclaim_50_ledgers() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 50 ledgers
     env.ledger().set_sequence(start_ledger + 50);
@@ -154,7 +154,7 @@ fn timeout_late_reclaim_200_ledgers() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 200 ledgers
     env.ledger().set_sequence(start_ledger + 200);
@@ -178,7 +178,7 @@ fn timeout_late_reclaim_1000_ledgers() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 1000 ledgers
     env.ledger().set_sequence(start_ledger + 1000);
@@ -204,14 +204,14 @@ fn timeout_reveal_before_timeout_succeeds() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 50 ledgers (before timeout)
     env.ledger().set_sequence(start_ledger + 50);
 
     // Reveal should succeed before timeout
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(result.is_ok(), "reveal should succeed before timeout");
 }
 
@@ -229,14 +229,14 @@ fn timeout_reveal_after_timeout_succeeds() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 150 ledgers (after timeout)
     env.ledger().set_sequence(start_ledger + 150);
 
     // Reveal should still succeed after timeout
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(result.is_ok(), "reveal should succeed even after timeout");
 }
 
@@ -254,14 +254,14 @@ fn timeout_concurrent_reveal_and_reclaim() {
     let start_ledger = env.ledger().sequence();
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to exactly 100 ledgers (timeout boundary)
     env.ledger().set_sequence(start_ledger + 100);
 
     // Reveal should succeed
     env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-    let reveal_result = client.try_reveal(&player, &secret, &soroban_sdk::Bytes::from_slice(&env, &[42u8; 32]));
+    let reveal_result = client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     assert!(reveal_result.is_ok(), "reveal should succeed at timeout boundary");
 
     // After reveal, reclaim should fail (game no longer in Committed phase)
@@ -287,7 +287,7 @@ fn timeout_ledger_sequence_near_max() {
     env.ledger().set_sequence(near_max);
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to near_max + 100 (wraps around)
     // Note: This tests behavior at ledger sequence boundaries
@@ -313,7 +313,7 @@ fn timeout_ledger_sequence_at_zero() {
     env.ledger().set_sequence(0);
 
     // Start game
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 100
     env.ledger().set_sequence(100);
@@ -342,13 +342,13 @@ fn timeout_multiple_concurrent_games() {
     let start_ledger = env.ledger().sequence();
 
     // Start game 1
-    client.start_game(&player1, &Side::Heads, &1_000_000, &commitment1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player1, &Side::Heads, &1_000_000, &commitment1).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance 50 ledgers
     env.ledger().set_sequence(start_ledger + 50);
 
     // Start game 2
-    client.start_game(&player2, &Side::Tails, &1_000_000, &commitment2, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player2, &Side::Tails, &1_000_000, &commitment2).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 100 ledgers (game 1 timeout reached, game 2 at 50)
     env.ledger().set_sequence(start_ledger + 100);
@@ -385,7 +385,7 @@ fn timeout_sequential_games() {
     let start_ledger = env.ledger().sequence();
 
     // Start game 1
-    client.start_game(&player, &Side::Heads, &1_000_000, &commitment1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Heads, &1_000_000, &commitment1).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 100 ledgers (game 1 timeout)
     env.ledger().set_sequence(start_ledger + 100);
@@ -394,7 +394,7 @@ fn timeout_sequential_games() {
     client.reclaim_wager(&player);
 
     // Start game 2 at ledger 100
-    client.start_game(&player, &Side::Tails, &1_000_000, &commitment2, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&player, &Side::Tails, &1_000_000, &commitment2).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
 
     // Advance to 150 ledgers (game 2 at 50 ledgers)
     env.ledger().set_sequence(start_ledger + 150);

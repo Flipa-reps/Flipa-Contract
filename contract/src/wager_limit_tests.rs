@@ -48,7 +48,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &MIN, &MAX);
+    client.initialize(&admin, &treasury, &token, &300, &MIN, &MAX, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id, admin)
 }
 

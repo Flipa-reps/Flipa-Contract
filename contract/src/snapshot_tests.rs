@@ -317,6 +317,8 @@ fn contract_config_default() {
         min_wager: 1_000_000,
         max_wager: 100_000_000,
         paused: false,
+    
+        oracle_vrf_pk: BytesN::from_array(&env, &[0u8; 32]),
     };
 
     assert_snapshot!(borsh_to_hex(&env, &config), @r###"
@@ -345,6 +347,8 @@ fn contract_config_edge_cases() {
         min_wager: 1_000_000,
         max_wager: i128::MAX / 10, // near max
         paused: true,
+    
+        oracle_vrf_pk: BytesN::from_array(&env, &[0u8; 32]),
     };
 
     assert_snapshot!(borsh_to_hex(&env, &config_paused));
@@ -365,6 +369,8 @@ fn contract_config_roundtrip() {
         min_wager: 1_000_000,
         max_wager: 100_000_000,
         paused: false,
+    
+        oracle_vrf_pk: BytesN::from_array(&env, &[0u8; 32]),
     };
 
     // Serialize → deserialize → reserialize → must match original bytes
@@ -441,7 +447,7 @@ fn game_state_committed_streak_0() {
         phase: GamePhase::Committed,
         start_ledger: 12345,
     
-        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     assert_snapshot!(borsh_to_hex(&env, &game));
 }
@@ -461,7 +467,7 @@ fn game_state_all_phases() {
                 phase: $phase,
                 start_ledger: 12345,
             
-                oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+                vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
             };
             assert_snapshot!(format!("{:?}", borsh_to_hex(&env, &game)));
         };
@@ -486,7 +492,7 @@ fn game_state_edge_streaks() {
             phase: GamePhase::Revealed,
             start_ledger: u32::MAX,
         
-            oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
         };
         assert_snapshot!(format!("streak_{}", streak), borsh_to_hex(&env, &game));
     }
@@ -505,7 +511,7 @@ fn game_state_roundtrip() {
         phase: GamePhase::Revealed,
         start_ledger: 12345,
     
-        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
 
     let bytes = env.bytes_from_object(&original).unwrap().unwrap();
@@ -612,7 +618,7 @@ fn storage_ttl_extension_snapshot() {
         phase: GamePhase::Committed,
         start_ledger: 100,
     
-        oracle_commitment: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     
     let bytes = env.bytes_from_object(&game).unwrap().unwrap();
@@ -637,6 +643,8 @@ fn upgrade_simulation_config_compatibility() {
         min_wager: 1_000_000,
         max_wager: 100_000_000,
         paused: false,
+    
+        oracle_vrf_pk: BytesN::from_array(&env, &[0u8; 32]),
     };
     
     // Serialize
