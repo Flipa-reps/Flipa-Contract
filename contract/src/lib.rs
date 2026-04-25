@@ -1293,6 +1293,90 @@ impl CoinflipContract {
 
         Ok(game.wager)
     }
+
+    /// Partially cash out a percentage of winnings while continuing with the remainder.
+    ///
+    /// Allows a player to secure a portion of their winnings while risking the
+    /// remaining amount on the next flip. The wager for the continued game is
+    /// reduced to the remaining amount.
+    ///
+    /// # Arguments
+    /// - `player`     – must authorize; must have an active game in `Revealed` phase
+    /// - `percentage` – percentage of winnings to cash out (1–99)
+    ///
+    /// # Returns
+    /// `Ok(cashed_out_amount)` — the net payout amount cashed out in stroops.
+    ///
+    /// # Guards (evaluated in order, no state mutation on failure)
+    /// 1. `NoActiveGame`                – no game record exists for `player`
+    /// 2. `InvalidPhase`                – game is not in `Revealed` phase
+    /// 3. `NoWinningsToClaimOrContinue` – `streak == 0` (player lost)
+    /// 4. `InvalidFeePercentage`        – percentage not in range [1, 99]
+    ///
+    /// # Process (on success)
+    /// 1. Calculate gross payout and fee for the full winnings.
+    /// 2. Calculate the partial net amount based on percentage.
+    /// 3. Deduct the cashed-out portion from reserves and add fee to total_fees.
+    /// 4. Update game wager to the remaining amount (net - cashed_out).
+    /// 5. Reset game to `Committed` phase with a fresh commitment and contract randomness.
+    /// 6. Return the cashed-out net amount.
+    pub fn partial_cash_out(
+        env: Env,
+        player: Address,
+        percentage: u32,
+    ) -> Result<i128, Error> {
+        player.require_auth();
+
+        let mut game = Self::load_player_game(&env, &player)
+            .ok_or(Error::NoActiveGame)?;
+
+        if game.phase != GamePhase::Revealed {
+            return Err(Error::InvalidPhase);
+        }
+
+        if game.streak == 0 {
+            return Err(Error::NoWinningsToClaimOrContinue);
+        }
+
+        if percentage < 1 || percentage > 99 {
+            return Err(Error::InvalidFeePercentage);
+        }
+
+        let (gross, fee, net_payout) =
+            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+                .ok_or(Error::InsufficientReserves)?;
+
+        let cashed_out = net_payout
+            .checked_mul(percentage as i128)
+            .and_then(|v| v.checked_div(100))
+            .ok_or(Error::InsufficientReserves)?;
+
+        let remaining = net_payout
+            .checked_sub(cashed_out)
+            .ok_or(Error::InsufficientReserves)?;
+
+        let mut stats = Self::load_stats(&env);
+        stats.reserve_balance = stats.reserve_balance
+            .checked_sub(cashed_out)
+            .ok_or(Error::InsufficientReserves)?;
+        stats.total_fees = stats.total_fees
+            .checked_add(fee)
+            .unwrap_or(stats.total_fees);
+        Self::save_stats(&env, &stats);
+
+        // Update game wager to remaining amount and reset to Committed phase
+        game.wager = remaining;
+        game.phase = GamePhase::Committed;
+        
+        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        game.contract_random = env.crypto().sha256(
+            &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
+        ).into();
+
+        Self::save_player_game(&env, &player, &game);
+
+        Ok(cashed_out)
+    }
 }
 
 #[cfg(test)]
