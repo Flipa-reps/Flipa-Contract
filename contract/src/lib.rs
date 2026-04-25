@@ -3356,6 +3356,7 @@ mod governance_tests;
 #[cfg(test)]
 mod rbac_tests;
 mod circuit_breaker_tests;
+mod reveal_validation_tests;
 
 #[cfg(test)]
 mod tests {
