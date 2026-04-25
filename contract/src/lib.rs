@@ -583,6 +583,26 @@ pub struct EntropyPool {
     pub pool_size: u64,
     /// Number of times the pool has been mixed into outcome generation.
     pub mix_count: u64,
+/// Player-specific statistics tracking wins, losses, and streaks.
+///
+/// Stored per player and updated on game completion.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerStats {
+    /// Total games played by this player.
+    pub games_played: u64,
+    /// Total wins.
+    pub wins: u64,
+    /// Total losses.
+    pub losses: u64,
+    /// Highest streak achieved.
+    pub max_streak: u32,
+    /// Current active streak (0 if no active game or last game was a loss).
+    pub current_streak: u32,
+    /// Total volume wagered by this player.
+    pub total_wagered: i128,
+    /// Total net winnings (payouts minus wagers).
+    pub net_winnings: i128,
 }
 
 /// Persistent storage key variants for the contract's data model.
@@ -944,6 +964,8 @@ pub struct EventAdminAction {
     pub admin:  Address,
     /// Set of used commitment hashes to prevent replay attacks.
     UsedCommitments,
+    /// Per-player statistics ([`PlayerStats`]), keyed by player address.
+    PlayerStats(Address),
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -1675,6 +1697,32 @@ impl CoinflipContract {
             .remove(&StorageKey::PlayerGame(player.clone()));
     }
 
+    /// Load player statistics. Returns default stats if none exist.
+    fn load_player_stats(env: &Env, player: &Address) -> PlayerStats {
+        let key = StorageKey::PlayerStats(player.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            env.storage().persistent().get(&key).unwrap()
+        } else {
+            PlayerStats {
+                games_played: 0,
+                wins: 0,
+                losses: 0,
+                max_streak: 0,
+                current_streak: 0,
+                total_wagered: 0,
+                net_winnings: 0,
+            }
+        }
+    }
+
+    /// Save player statistics to persistent storage.
+    fn save_player_stats(env: &Env, player: &Address, stats: &PlayerStats) {
+        let key = StorageKey::PlayerStats(player.clone());
+        env.storage().persistent().set(&key, stats);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
     /// Append a [`HistoryEntry`] to the player's history ring-buffer.
     ///
     /// Maintains a FIFO cap of [`HISTORY_LIMIT`] entries: when the buffer is
@@ -2103,6 +2151,11 @@ impl CoinflipContract {
             commitment,
             ledger: env.ledger().sequence(),
         });
+        // Update player statistics
+        let mut player_stats = Self::load_player_stats(&env, &player);
+        player_stats.games_played = player_stats.games_played.saturating_add(1);
+        player_stats.total_wagered = player_stats.total_wagered.saturating_add(wager);
+        Self::save_player_stats(&env, &player, &player_stats);
 
         Ok(())
     }
@@ -2217,6 +2270,16 @@ impl CoinflipContract {
                 streak: game.streak,
                 outcome,
             });
+            
+            // Update player stats for win
+            let mut player_stats = Self::load_player_stats(&env, &player);
+            player_stats.wins = player_stats.wins.saturating_add(1);
+            player_stats.current_streak = game.streak;
+            if game.streak > player_stats.max_streak {
+                player_stats.max_streak = game.streak;
+            }
+            Self::save_player_stats(&env, &player, &player_stats);
+            
             Ok(true)
         } else {
             // Loss path — forfeiture:
@@ -2241,10 +2304,19 @@ impl CoinflipContract {
                 commitment: game.commitment,
                 secret,
                 contract_random,
+                secret: secret.clone(),
+                contract_random: game.contract_random,
                 payout: 0,
                 ledger: game.start_ledger,
                 vrf_proof,
             });
+
+            // Update player stats for loss
+            let mut player_stats = Self::load_player_stats(&env, &player);
+            player_stats.losses = player_stats.losses.saturating_add(1);
+            player_stats.current_streak = 0;
+            player_stats.net_winnings = player_stats.net_winnings.saturating_sub(game.wager);
+            Self::save_player_stats(&env, &player, &player_stats);
 
             Self::delete_player_game(&env, &player);
 
@@ -2486,7 +2558,7 @@ impl CoinflipContract {
     ) -> Result<i128, Error> {
         player.require_auth();
 
-        let mut game = Self::load_player_game(&env, &player)
+        let game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
 
         if game.phase != GamePhase::Revealed {
@@ -2559,6 +2631,11 @@ impl CoinflipContract {
             ledger: game.start_ledger,
             vrf_proof: BytesN::from_array(&env, &[0u8; 64]),
         });
+
+        // Update player stats for cash out
+        let mut player_stats = Self::load_player_stats(&env, &player);
+        player_stats.net_winnings = player_stats.net_winnings.saturating_add(net_payout).saturating_sub(game.wager);
+        Self::save_player_stats(&env, &player, &player_stats);
 
         // Clear the player's game state completely after settlement
         Self::delete_player_game(&env, &player);
@@ -3590,6 +3667,17 @@ impl CoinflipContract {
     /// - `None`            – no game record exists for `player`
     pub fn get_game_state(env: Env, player: Address) -> Option<GameState> {
         Self::load_player_game(&env, &player)
+    }
+
+    /// Return the player's statistics.
+    ///
+    /// Read-only; does not require authorization.
+    ///
+    /// # Returns
+    /// The [`PlayerStats`] for the given player, including games played,
+    /// wins, losses, streaks, total wagered, and net winnings.
+    pub fn get_player_stats(env: Env, player: Address) -> PlayerStats {
+        Self::load_player_stats(&env, &player)
     }
 
     /// Return a paginated slice of the player's completed game history.
