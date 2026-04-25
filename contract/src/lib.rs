@@ -973,12 +973,12 @@ impl CoinflipContract {
     /// | `wager`          | Unchanged — the original bet stays locked              |
     /// | `streak`         | Unchanged — incremented only by `reveal` on a win      |
     /// | `fee_bps`        | Unchanged — snapshot from game creation is honoured    |
-    /// | `side`           | Unchanged — player's chosen side carries over          |
     ///
     /// ### What is replaced
     ///
     /// | Field            | New value                                              |
     /// |------------------|--------------------------------------------------------|
+    /// | `side`           | `new_side` if provided, otherwise unchanged             |
     /// | `commitment`     | `new_commitment` supplied by the caller                |
     /// | `contract_random`| Fresh SHA-256 of the current ledger sequence number    |
     /// | `phase`          | `GamePhase::Committed`                                 |
@@ -1011,6 +1011,7 @@ impl CoinflipContract {
     /// 2. New contract randomness is derived from the current ledger sequence.
     /// 3. Game phase is reset to `Committed` with the fresh commitment and
     ///    randomness; the streak counter and wager are preserved.
+    /// 4. If `new_side` is provided, the player's side is updated for strategic gameplay.
     ///
     /// ## Errors
     ///
@@ -1025,6 +1026,7 @@ impl CoinflipContract {
         env: Env,
         player: Address,
         new_commitment: BytesN<32>,
+        new_side: Option<Side>,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -1073,6 +1075,11 @@ impl CoinflipContract {
         game.phase = GamePhase::Committed;
         game.commitment = new_commitment;
         game.contract_random = contract_random.into();
+        
+        // Allow optional side switching for strategic gameplay
+        if let Some(side) = new_side {
+            game.side = side;
+        }
 
         Self::save_player_game(&env, &player, &game);
 
