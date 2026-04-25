@@ -29,7 +29,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Bytes, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Bytes, BytesN, Env, Symbol};
 
 /// Stable error code constants for the coinflip contract.
 ///
@@ -503,6 +503,87 @@ pub struct ReferralStats {
     pub referrals_count: u32,
 }
 
+// ── Event payload types ─────────────────────────────────────────────────────
+//
+// Each `#[contracttype]` struct is the data payload for one event category.
+// Topics are `(Symbol("tossd"), Symbol("<action>"))` pairs so indexers can
+// filter by contract + action without decoding the full payload.
+
+/// Emitted once by `initialize`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventInitialized {
+    pub admin:     Address,
+    pub treasury:  Address,
+    pub token:     Address,
+    pub fee_bps:   u32,
+    pub min_wager: i128,
+    pub max_wager: i128,
+}
+
+/// Emitted by `start_game` on success.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGameStarted {
+    pub player:     Address,
+    pub side:       Side,
+    pub wager:      i128,
+    pub commitment: BytesN<32>,
+    pub ledger:     u32,
+}
+
+/// Emitted by `reveal` on both win and loss paths.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGameRevealed {
+    pub player:  Address,
+    pub won:     bool,
+    /// Post-reveal streak (0 on loss).
+    pub streak:  u32,
+    pub outcome: Side,
+}
+
+/// Emitted by `cash_out` and `claim_winnings` on success.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGameSettled {
+    pub player: Address,
+    pub payout: i128,
+    pub fee:    i128,
+    pub streak: u32,
+    /// `Symbol("cash_out")` or `Symbol("claim_winnings")`.
+    pub method: soroban_sdk::Symbol,
+}
+
+/// Emitted by `continue_streak` on success.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventStreakContinued {
+    pub player:         Address,
+    pub streak:         u32,
+    pub new_commitment: BytesN<32>,
+}
+
+/// Emitted by `reclaim_wager` on success.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventWagerReclaimed {
+    pub player: Address,
+    pub wager:  i128,
+    pub ledger: u32,
+}
+
+/// Emitted by all admin setter functions (`set_paused`, `set_treasury`,
+/// `set_wager_limits`, `set_fee`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventAdminAction {
+    /// `Symbol("set_paused")`, `Symbol("set_treasury")`,
+    /// `Symbol("set_wager_limits")`, or `Symbol("set_fee")`.
+    pub action: soroban_sdk::Symbol,
+    pub admin:  Address,
+}
+
 /// Multiplier values in basis points (1 bps = 0.0001x).
 /// Applied to the wager to compute gross payout before fees.
 ///
@@ -796,6 +877,63 @@ pub struct CoinflipContract;
 
 #[contractimpl]
 impl CoinflipContract {
+    // ── Event emission helpers ──────────────────────────────────────────────
+    //
+    // Each helper publishes one event.  Topics follow the pattern
+    // `(Symbol("tossd"), Symbol("<action>"))` so off-chain indexers can
+    // subscribe by contract + action without decoding the payload.
+    // All helpers are called AFTER state has been written so the event is
+    // always consistent with the on-chain state at the time of emission.
+
+    fn emit_initialized(env: &Env, data: EventInitialized) {
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("init")),
+            data,
+        );
+    }
+
+    fn emit_game_started(env: &Env, data: EventGameStarted) {
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("started")),
+            data,
+        );
+    }
+
+    fn emit_game_revealed(env: &Env, data: EventGameRevealed) {
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("revealed")),
+            data,
+        );
+    }
+
+    fn emit_game_settled(env: &Env, data: EventGameSettled) {
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("settled")),
+            data,
+        );
+    }
+
+    fn emit_streak_continued(env: &Env, data: EventStreakContinued) {
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("continued")),
+            data,
+        );
+    }
+
+    fn emit_wager_reclaimed(env: &Env, data: EventWagerReclaimed) {
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("reclaimed")),
+            data,
+        );
+    }
+
+    fn emit_admin_action(env: &Env, data: EventAdminAction) {
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("admin")),
+            data,
+        );
+    }
+
     /// Initialize the contract with configuration.
     ///
     /// Accepted inputs:
@@ -865,6 +1003,15 @@ impl CoinflipContract {
         env.storage().persistent().set(&StorageKey::Stats, &stats);
         env.storage().persistent().extend_ttl(&StorageKey::Stats, TTL_THRESHOLD, TTL_EXTEND_TO);
         
+        Self::emit_initialized(&env, EventInitialized {
+            admin,
+            treasury,
+            token,
+            fee_bps,
+            min_wager,
+            max_wager,
+        });
+
         Ok(())
     }
     
@@ -1226,6 +1373,14 @@ impl CoinflipContract {
         stats.total_volume = stats.total_volume.checked_add(wager).unwrap_or(stats.total_volume);
         Self::save_stats(&env, &stats);
 
+        Self::emit_game_started(&env, EventGameStarted {
+            player,
+            side,
+            wager,
+            commitment,
+            ledger: env.ledger().sequence(),
+        });
+
         Ok(())
     }
 
@@ -1303,6 +1458,12 @@ impl CoinflipContract {
             game.streak = game.streak.saturating_add(1);
             game.phase = GamePhase::Revealed;
             Self::save_player_game(&env, &player, &game);
+            Self::emit_game_revealed(&env, EventGameRevealed {
+                player,
+                won: true,
+                streak: game.streak,
+                outcome,
+            });
             Ok(true)
         } else {
             // Loss path — forfeiture:
@@ -1332,6 +1493,13 @@ impl CoinflipContract {
             });
 
             Self::delete_player_game(&env, &player);
+
+            Self::emit_game_revealed(&env, EventGameRevealed {
+                player,
+                won: false,
+                streak: 0,
+                outcome,
+            });
 
             Ok(false)
         }
@@ -1498,6 +1666,14 @@ impl CoinflipContract {
             }
         }
 
+        Self::emit_game_settled(&env, EventGameSettled {
+            player,
+            payout: net_payout,
+            fee: fee_amount,
+            streak: game.streak,
+            method: Symbol::new(&env, "claim_winnings"),
+        });
+
         Ok(())
     }
 
@@ -1596,6 +1772,15 @@ impl CoinflipContract {
         Self::delete_player_game(&env, &player);
 
         Ok(total_payout)
+        Self::emit_game_settled(&env, EventGameSettled {
+            player,
+            payout: net_payout,
+            fee,
+            streak: game.streak,
+            method: Symbol::new(&env, "cash_out"),
+        });
+
+        Ok(net_payout)
     }
 
     /// Continue to the next streak level after a confirmed win.
@@ -1726,10 +1911,16 @@ impl CoinflipContract {
 
         // Reset to Committed phase; preserve streak and wager
         game.phase = GamePhase::Committed;
-        game.commitment = new_commitment;
+        game.commitment = new_commitment.clone();
         game.contract_random = contract_random.into();
 
         Self::save_player_game(&env, &player, &game);
+
+        Self::emit_streak_continued(&env, EventStreakContinued {
+            player,
+            streak: game.streak,
+            new_commitment,
+        });
 
         Ok(())
     }
@@ -1767,6 +1958,11 @@ impl CoinflipContract {
         config.paused = paused;
         Self::save_config(&env, &config);
 
+        Self::emit_admin_action(&env, EventAdminAction {
+            action: Symbol::new(&env, "set_paused"),
+            admin,
+        });
+
         Ok(())
     }
 
@@ -1795,6 +1991,11 @@ impl CoinflipContract {
 
         config.treasury = treasury;
         Self::save_config(&env, &config);
+
+        Self::emit_admin_action(&env, EventAdminAction {
+            action: Symbol::new(&env, "set_treasury"),
+            admin,
+        });
 
         Ok(())
     }
@@ -1836,6 +2037,11 @@ impl CoinflipContract {
         config.min_wager = min_wager;
         config.max_wager = max_wager;
         Self::save_config(&env, &config);
+
+        Self::emit_admin_action(&env, EventAdminAction {
+            action: Symbol::new(&env, "set_wager_limits"),
+            admin,
+        });
 
         Ok(())
     }
@@ -1880,6 +2086,11 @@ impl CoinflipContract {
 
         config.fee_bps = fee_bps;
         Self::save_config(&env, &config);
+
+        Self::emit_admin_action(&env, EventAdminAction {
+            action: Symbol::new(&env, "set_fee"),
+            admin,
+        });
 
         Ok(())
     }
@@ -2058,6 +2269,12 @@ impl CoinflipContract {
         });
 
         Self::delete_player_game(&env, &player);
+
+        Self::emit_wager_reclaimed(&env, EventWagerReclaimed {
+            player,
+            wager: game.wager,
+            ledger: game.start_ledger,
+        });
 
         Ok(game.wager)
     }
@@ -2403,6 +2620,7 @@ mod upgrade_migration_tests;
 
 #[cfg(test)]
 mod security_validation_tests;
+mod event_tests;
 
 #[cfg(test)]
 mod tests {
