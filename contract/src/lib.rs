@@ -52,6 +52,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_sh
 /// | 13   | `RevealTimeout`              | Reveal         | `reveal` (too early), `reclaim_wager` (too late) |
 /// | 20   | `NoWinningsToClaimOrContinue`| Action         | `cash_out`, `claim_winnings`, `continue_streak` |
 /// | 21   | `InvalidCommitment`          | Action         | `continue_streak`                  |
+/// | 22   | `WeakCommitment`             | Action         | `start_game`, `continue_streak`    |
 /// | 30   | `Unauthorized`               | Admin          | `set_paused`, `set_treasury`, `set_wager_limits`, `set_fee` |
 /// | 31   | `InvalidFeePercentage`       | Admin          | `initialize`, `set_fee`            |
 /// | 32   | `InvalidWagerLimits`         | Admin          | `initialize`, `set_wager_limits`   |
@@ -74,9 +75,11 @@ pub mod error_codes {
     pub const COMMITMENT_MISMATCH: u32 = 12;
     pub const REVEAL_TIMEOUT: u32 = 13;
 
-    // Action errors (20–21)
+    // Action errors (20–22)
     pub const NO_WINNINGS_TO_CLAIM_OR_CONTINUE: u32 = 20;
     pub const INVALID_COMMITMENT: u32 = 21;
+    /// Commitment has insufficient entropy (all-same-byte or trivially weak pattern).
+    pub const WEAK_COMMITMENT: u32 = 22;
 
     // Admin errors (30–32)
     pub const UNAUTHORIZED: u32 = 30;
@@ -196,6 +199,13 @@ pub enum Error {
     /// Returned by: `continue_streak` (guard 4).
     /// Code: 21 — see [`error_codes::INVALID_COMMITMENT`]
     InvalidCommitment = 21,
+
+    /// Commitment has insufficient entropy (all-same-byte pattern).
+    /// A commitment where every byte is identical provides no randomness and
+    /// would allow a player to predict or bias outcomes.
+    /// Returned by: `start_game`, `continue_streak`.
+    /// Code: 22 — see [`error_codes::WEAK_COMMITMENT`]
+    WeakCommitment = 22,
 
     // ── Admin errors (30–32) ────────────────────────────────────────────────
 
@@ -1150,6 +1160,64 @@ pub fn verify_vrf_proof(
 /// Derives the [`Side`] outcome from three independent contributions:
 /// the player's revealed secret, the contract's randomness, and the oracle's
 /// VRF output (derived from its Ed25519 proof).
+/// Validates that a commitment has sufficient entropy to be secure.
+///
+/// A commitment is considered weak when all 32 bytes are identical — this
+/// pattern indicates a placeholder, a zeroed buffer, or a trivially
+/// constructed value that provides no randomness.  Such commitments could
+/// allow a player to predict or bias outcomes.
+///
+/// Returns `true` when the commitment passes the strength check (safe to use).
+/// Returns `false` when all bytes are the same (weak/placeholder).
+///
+/// ## Entropy requirement
+///
+/// A valid commitment must be the SHA-256 output of a secret with at least
+/// 128 bits of entropy.  SHA-256 produces 256-bit outputs; any output where
+/// all bytes are identical has probability 2^-248 under a uniform distribution,
+/// making it a reliable indicator of a non-random input.
+pub fn validate_commitment_strength(commitment: &BytesN<32>) -> bool {
+    let arr = commitment.to_array();
+    let first = arr[0];
+    // Reject if every byte equals the first byte (all-same pattern).
+    arr.iter().all(|&b| b == first) == false
+}
+
+/// Derives a commitment from a player secret using SHA-256 with domain separation.
+///
+/// ## Usage
+///
+/// Players should call this off-chain to generate their commitment before
+/// calling `start_game` or `continue_streak`.  The returned value is the
+/// commitment to submit on-chain; the `secret` must be kept private until
+/// the reveal step.
+///
+/// ## Domain separation
+///
+/// A fixed domain prefix `b"tossd:commitment:v1:"` is prepended to the secret
+/// before hashing.  This prevents cross-protocol hash collisions: a SHA-256
+/// output computed for a different purpose cannot be replayed as a valid
+/// Tossd commitment.
+///
+/// ## Security
+///
+/// The secret must have at least 128 bits of entropy (e.g. 16+ random bytes).
+/// Using a low-entropy secret (a short password, a counter, etc.) weakens the
+/// commit-reveal guarantee even though the hash itself is cryptographically
+/// sound.
+///
+/// # Arguments
+/// - `env`    – Soroban execution environment (needed for SHA-256)
+/// - `secret` – raw secret bytes; must be kept private until reveal
+pub fn derive_commitment(env: &Env, secret: &Bytes) -> BytesN<32> {
+    const DOMAIN: &[u8] = b"tossd:commitment:v1:";
+    let mut input = Bytes::from_slice(env, DOMAIN);
+    input.append(secret);
+    env.crypto().sha256(&input).into()
+}
+
+/// Deterministically derives a [`Side`] outcome from the player's revealed secret
+/// and the contract's pre-committed random value.
 ///
 /// ## Algorithm
 ///
@@ -1851,7 +1919,15 @@ impl CoinflipContract {
             }
         }
 
-        // Guard 5: reserves must cover the worst-case payout (streak 4+, no fee deduction)
+        // Guard 5: commitment must not be all-zero (placeholder) or all-same-byte (weak)
+        if commitment == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(Error::InvalidCommitment);
+        }
+        if !validate_commitment_strength(&commitment) {
+            return Err(Error::WeakCommitment);
+        }
+
+        // Guard 6: reserves must cover the worst-case payout (streak 4+, no fee deduction)
         let stats = Self::load_stats(&env);
         let max_payout = wager
             .checked_mul(config.multipliers.streak4_plus as i128)
@@ -2516,6 +2592,9 @@ impl CoinflipContract {
         // Guard 4b: reject reused commitments to prevent replay attacks.
         if Self::is_commitment_used(&env, &new_commitment) {
             return Err(Error::DuplicateCommitment);
+        // Guard 4b: commitment must not be all-same-byte (weak / low-entropy)
+        if !validate_commitment_strength(&new_commitment) {
+            return Err(Error::WeakCommitment);
         }
 
         // Guard 5: reserves must cover the next streak's worst-case payout.
@@ -3847,6 +3926,7 @@ mod tests {
         assert_eq!(Error::RevealTimeout as u32, 13);
         assert_eq!(Error::NoWinningsToClaimOrContinue as u32, 20);
         assert_eq!(Error::InvalidCommitment as u32, 21);
+        assert_eq!(Error::WeakCommitment as u32, 22);
         assert_eq!(Error::Unauthorized as u32, 30);
         assert_eq!(Error::InvalidFeePercentage as u32, 31);
         assert_eq!(Error::InvalidWagerLimits as u32, 32);
@@ -7265,6 +7345,7 @@ mod property_tests {
             prop_assert_eq!(Error::RevealTimeout as u32, error_codes::REVEAL_TIMEOUT);
             prop_assert_eq!(Error::NoWinningsToClaimOrContinue as u32, error_codes::NO_WINNINGS_TO_CLAIM_OR_CONTINUE);
             prop_assert_eq!(Error::InvalidCommitment as u32, error_codes::INVALID_COMMITMENT);
+            prop_assert_eq!(Error::WeakCommitment as u32, error_codes::WEAK_COMMITMENT);
             prop_assert_eq!(Error::Unauthorized as u32, error_codes::UNAUTHORIZED);
             prop_assert_eq!(Error::InvalidFeePercentage as u32, error_codes::INVALID_FEE_PERCENTAGE);
             prop_assert_eq!(Error::InvalidWagerLimits as u32, error_codes::INVALID_WAGER_LIMITS);
@@ -7292,6 +7373,7 @@ mod property_tests {
                 error_codes::REVEAL_TIMEOUT,
                 error_codes::NO_WINNINGS_TO_CLAIM_OR_CONTINUE,
                 error_codes::INVALID_COMMITMENT,
+                error_codes::WEAK_COMMITMENT,
                 error_codes::UNAUTHORIZED,
                 error_codes::INVALID_FEE_PERCENTAGE,
                 error_codes::INVALID_WAGER_LIMITS,
@@ -7773,6 +7855,215 @@ mod outcome_proof_property_tests {
 //   total_fees_after == total_fees_before + Σ fee_i
 //   where fee_i = floor(gross_i * fee_bps_i / 10_000)
 //   and   gross_i = floor(wager_i * multiplier(streak_i) / 10_000)
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature: secure key derivation / commitment strength
+// Module:  commitment_strength_tests
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod commitment_strength_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // ── validate_commitment_strength ─────────────────────────────────────────
+
+    #[test]
+    fn test_all_zero_is_weak() {
+        assert!(!validate_commitment_strength(&BytesN::from_array(&Env::default(), &[0u8; 32])));
+    }
+
+    #[test]
+    fn test_all_same_byte_is_weak() {
+        let env = Env::default();
+        for b in [1u8, 0xffu8, 0x42u8] {
+            assert!(!validate_commitment_strength(&BytesN::from_array(&env, &[b; 32])));
+        }
+    }
+
+    #[test]
+    fn test_sha256_output_is_strong() {
+        let env = Env::default();
+        let secret = Bytes::from_slice(&env, &[1u8; 32]);
+        let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
+        assert!(validate_commitment_strength(&commitment));
+    }
+
+    #[test]
+    fn test_mixed_bytes_is_strong() {
+        let env = Env::default();
+        let mut arr = [0u8; 32];
+        arr[0] = 1;
+        assert!(validate_commitment_strength(&BytesN::from_array(&env, &arr)));
+    }
+
+    // ── derive_commitment ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_derive_commitment_is_deterministic() {
+        let env = Env::default();
+        let secret = Bytes::from_slice(&env, &[7u8; 32]);
+        assert_eq!(derive_commitment(&env, &secret), derive_commitment(&env, &secret));
+    }
+
+    #[test]
+    fn test_derive_commitment_differs_from_plain_sha256() {
+        let env = Env::default();
+        let secret = Bytes::from_slice(&env, &[7u8; 32]);
+        let plain: BytesN<32> = env.crypto().sha256(&secret).into();
+        assert_ne!(derive_commitment(&env, &secret), plain);
+    }
+
+    #[test]
+    fn test_derive_commitment_output_is_strong() {
+        let env = Env::default();
+        let secret = Bytes::from_slice(&env, &[7u8; 32]);
+        assert!(validate_commitment_strength(&derive_commitment(&env, &secret)));
+    }
+
+    #[test]
+    fn test_derive_commitment_different_secrets_differ() {
+        let env = Env::default();
+        let s1 = Bytes::from_slice(&env, &[1u8; 32]);
+        let s2 = Bytes::from_slice(&env, &[2u8; 32]);
+        assert_ne!(derive_commitment(&env, &s1), derive_commitment(&env, &s2));
+    }
+
+    // ── start_game rejects weak commitments ──────────────────────────────────
+
+    fn setup(env: &Env) -> (soroban_sdk::Address, CoinflipContractClient) {
+        env.mock_all_auths();
+        let contract_id = env.register(CoinflipContract, ());
+        let client = CoinflipContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = Address::generate(env);
+        client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+        env.as_contract(&contract_id, || {
+            let mut stats = CoinflipContract::load_stats(env);
+            stats.reserve_balance = i128::MAX / 2;
+            CoinflipContract::save_stats(env, &stats);
+        });
+        (contract_id, client)
+    }
+
+    #[test]
+    fn test_start_game_rejects_all_zero_commitment() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player, &Side::Heads, &10_000_000,
+            &BytesN::from_array(&env, &[0u8; 32]),
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidCommitment)));
+    }
+
+    #[test]
+    fn test_start_game_rejects_all_same_byte_commitment() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let player = Address::generate(&env);
+        let result = client.try_start_game(
+            &player, &Side::Heads, &10_000_000,
+            &BytesN::from_array(&env, &[0xffu8; 32]),
+        );
+        assert_eq!(result, Err(Ok(Error::WeakCommitment)));
+    }
+
+    #[test]
+    fn test_start_game_accepts_strong_commitment() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let player = Address::generate(&env);
+        let secret = Bytes::from_slice(&env, &[1u8; 32]);
+        let commitment = derive_commitment(&env, &secret);
+        assert!(client.try_start_game(&player, &Side::Heads, &10_000_000, &commitment).is_ok());
+    }
+
+    #[test]
+    fn test_continue_streak_rejects_weak_commitment() {
+        let env = Env::default();
+        let (contract_id, client) = setup(&env);
+        let player = Address::generate(&env);
+        let dummy: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &[9u8; 32])).into();
+        let game = GameState {
+            wager: 10_000_000, side: Side::Heads, streak: 1,
+            commitment: dummy.clone(), contract_random: dummy,
+            fee_bps: 300, phase: GamePhase::Revealed, start_ledger: 0,
+        };
+        env.as_contract(&contract_id, || {
+            CoinflipContract::save_player_game(&env, &player, &game);
+        });
+        let result = client.try_continue_streak(
+            &player, &BytesN::from_array(&env, &[0xaau8; 32]),
+        );
+        assert_eq!(result, Err(Ok(Error::WeakCommitment)));
+    }
+
+    // ── error code stability ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_weak_commitment_error_code() {
+        assert_eq!(Error::WeakCommitment as u32, error_codes::WEAK_COMMITMENT);
+        assert_eq!(error_codes::WEAK_COMMITMENT, 22);
+    }
+
+    // ── property tests ───────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Any SHA-256 output used as a commitment must pass the strength check.
+        #[test]
+        fn prop_sha256_output_always_strong(
+            input in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let bytes = Bytes::from_slice(&env, &input);
+            let commitment: BytesN<32> = env.crypto().sha256(&bytes).into();
+            prop_assert!(validate_commitment_strength(&commitment));
+        }
+
+        /// derive_commitment output always passes the strength check.
+        #[test]
+        fn prop_derive_commitment_always_strong(
+            secret_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret = Bytes::from_slice(&env, &secret_bytes);
+            prop_assert!(validate_commitment_strength(&derive_commitment(&env, &secret)));
+        }
+
+        /// All-same-byte arrays are always weak.
+        #[test]
+        fn prop_all_same_byte_always_weak(byte in any::<u8>()) {
+            let env = soroban_sdk::Env::default();
+            prop_assert!(!validate_commitment_strength(&BytesN::from_array(&env, &[byte; 32])));
+        }
+
+        /// derive_commitment is deterministic across calls.
+        #[test]
+        fn prop_derive_commitment_deterministic(
+            secret_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret = Bytes::from_slice(&env, &secret_bytes);
+            prop_assert_eq!(derive_commitment(&env, &secret), derive_commitment(&env, &secret));
+        }
+
+        /// derive_commitment with domain separation differs from plain SHA-256.
+        #[test]
+        fn prop_derive_commitment_differs_from_plain_sha256(
+            secret_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let env = soroban_sdk::Env::default();
+            let secret = Bytes::from_slice(&env, &secret_bytes);
+            let plain: BytesN<32> = env.crypto().sha256(&secret).into();
+            prop_assert_ne!(derive_commitment(&env, &secret), plain);
+        }
+    }
+}
+
 //
 // Properties:
 //   P-1  After N sequential cash-outs, total_fees equals the sum of each
