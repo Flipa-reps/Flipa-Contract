@@ -1062,11 +1062,31 @@ pub fn get_multiplier_from_tiers(streak: u32, multipliers: &Vec<u32>) -> u32 {
 }
 
 /// Calculates the full payout breakdown for a winning streak.
+/// Returns the milestone bonus in basis points for reaching specific streak thresholds.
 ///
-/// Returns `(gross, fee, net)` in stroops, or `None` on arithmetic overflow.
+/// Milestone bonuses incentivize long winning streaks:
+/// - Streak 5:  500 bps (5% bonus)
+/// - Streak 10: 1000 bps (10% bonus)
+/// - Streak 20: 2000 bps (20% bonus)
+///
+/// Returns 0 for non-milestone streaks.
+pub fn get_milestone_bonus_bps(streak: u32) -> u32 {
+    match streak {
+        20 => 2000, // 20% bonus at 20 wins
+        10 => 1000, // 10% bonus at 10 wins
+        5 => 500,   // 5% bonus at 5 wins
+        _ => 0,     // No bonus for other streaks
+    }
+}
+
+/// Calculates the full payout breakdown for a winning streak, including milestone bonuses.
+///
+/// Returns `(gross, fee, net, bonus)` in stroops, or `None` on arithmetic overflow.
 ///
 /// Formulas (all in stroops):
-/// - gross = wager × multiplier_bps / 10_000
+/// - base_gross = wager × multiplier_bps / 10_000
+/// - bonus = base_gross × milestone_bonus_bps / 10_000
+/// - gross = base_gross + bonus
 /// - fee   = gross × fee_bps / 10_000
 /// - net   = gross − fee
 ///
@@ -1086,12 +1106,18 @@ pub fn get_multiplier_from_tiers(streak: u32, multipliers: &Vec<u32>) -> u32 {
 /// - `wager`   – original wager in stroops (must be > 0)
 /// - `streak`  – current win streak (passed to `get_multiplier`)
 /// - `fee_bps` – protocol fee in basis points (200–500)
-pub fn calculate_payout_breakdown(wager: i128, streak: u32, fee_bps: u32) -> Option<(i128, i128, i128)> {
+pub fn calculate_payout_breakdown(wager: i128, streak: u32, fee_bps: u32) -> Option<(i128, i128, i128, i128)> {
     let multiplier = get_multiplier(streak) as i128;
-    let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
+    let base_gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
+    
+    // Calculate milestone bonus
+    let bonus_bps = get_milestone_bonus_bps(streak) as i128;
+    let bonus = base_gross.checked_mul(bonus_bps)?.checked_div(10_000)?;
+    
+    let gross = base_gross.checked_add(bonus)?;
     let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
     let net   = gross.checked_sub(fee)?;
-    Some((gross, fee, net))
+    Some((gross, fee, net, bonus))
 }
 
 /// Calculates payout breakdown using dynamic multiplier tiers.
@@ -1120,7 +1146,7 @@ pub fn calculate_payout_breakdown_with_tiers(
 /// - `streak`  – current win streak (passed to `get_multiplier`)
 /// - `fee_bps` – protocol fee in basis points (200–500)
 pub fn calculate_payout(wager: i128, streak: u32, fee_bps: u32) -> Option<i128> {
-    calculate_payout_breakdown(wager, streak, fee_bps).map(|(_, _, net)| net)
+    calculate_payout_breakdown(wager, streak, fee_bps).map(|(_, _, net, _)| net)
 }
 
 /// Calculate the side bet payout for a given bet type and achieved streak.
@@ -2394,6 +2420,8 @@ impl CoinflipContract {
         // result from calling calculate_payout and then recomputing gross/fee.
         let (gross_payout, fee_amount, net_payout) =
             calculate_payout_breakdown_with_tiers(game.wager, game.streak, game.fee_bps, &game.multipliers)
+        let (gross_payout, fee_amount, net_payout, _bonus) =
+            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
                 .ok_or(Error::InsufficientReserves)?;
         // Single-pass payout breakdown using the snapshotted multiplier so that
         // admin changes to multipliers never reprice in-flight games.
@@ -2574,6 +2602,8 @@ impl CoinflipContract {
         // result from calling calculate_payout and then recomputing gross/fee.
         let (gross, fee, net_payout) =
             calculate_payout_breakdown_with_tiers(game.wager, game.streak, game.fee_bps, &game.multipliers)
+        let (gross, fee, net_payout, _bonus) =
+            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
                 .ok_or(Error::InsufficientReserves)?;
         // Single-pass payout breakdown using the snapshotted multiplier so that
         // admin changes to multipliers never reprice in-flight games.
@@ -4107,7 +4137,7 @@ mod tests {
         // net   = 18_430_000
         assert_eq!(
             calculate_payout_breakdown(10_000_000, 1, 300).unwrap(),
-            Some((19_000_000, 570_000, 18_430_000))
+            Some((19_000_000, 570_000, 18_430_000, 0)) // No milestone bonus at streak 1
         );
     }
 
@@ -4115,7 +4145,7 @@ mod tests {
     fn test_calculate_payout_breakdown_net_equals_calculate_payout() {
         // calculate_payout must return the same net as the breakdown helper
         for (wager, streak, fee_bps) in [(10_000_000, 1, 300), (5_000_000, 2, 500), (1_000_000, 4, 200)] {
-            let (_, _, net) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap().unwrap();
+            let (_, _, net, _) = calculate_payout_breakdown(wager, streak, fee_bps).unwrap().unwrap();
             assert_eq!(calculate_payout(wager, streak, fee_bps).unwrap(), Some(net));
         }
     }
@@ -4123,7 +4153,7 @@ mod tests {
     #[test]
     fn test_calculate_payout_breakdown_gross_minus_fee_equals_net() {
         // Invariant: gross - fee == net for all valid inputs
-        let (gross, fee, net) = calculate_payout_breakdown(10_000_000, 3, 400).unwrap().unwrap();
+        let (gross, fee, net, _) = calculate_payout_breakdown(10_000_000, 3, 400).unwrap().unwrap();
         assert_eq!(gross - fee, net);
     }
 
@@ -11653,7 +11683,7 @@ mod cash_out_availability_tests {
             let net = client.cash_out(&player);
 
             // Compute expected values using the same helpers the contract uses.
-            let (expected_gross, expected_fee, expected_net) =
+            let             (expected_gross, expected_fee, expected_net, _bonus) =
                 calculate_payout_breakdown(wager, streak, 300).unwrap();
 
             prop_assert_eq!(net, expected_net,
