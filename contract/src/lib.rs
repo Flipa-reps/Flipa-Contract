@@ -2110,6 +2110,7 @@ impl CoinflipContract {
 
         // Guard 6: reserves must cover the worst-case payout (streak 4+, no fee deduction)
         let stats = Self::load_stats(&env);
+        let max_multiplier = config.multipliers[3]; // streak 4+ multiplier
         let max_payout = wager
             .checked_mul(config.multipliers.streak4_plus as i128)
             .and_then(|v| v.checked_div(10_000))
@@ -2912,6 +2913,7 @@ impl CoinflipContract {
         let stats = Self::load_stats(&env);
 
         let next_streak = game.streak.saturating_add(1);
+        let next_multiplier = get_multiplier_from_array(&game.multipliers, next_streak);
         let max_payout = game.wager
             .checked_mul(get_multiplier_from_tiers(next_streak, &game.multipliers) as i128)
             .checked_mul(game.multipliers.for_streak(next_streak) as i128)
