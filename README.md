@@ -14,6 +14,7 @@ Implemented today:
 - Contract initialization with fee and wager validation
 - Basic unit tests
 - Basic property tests for config and stats storage
+- Timeout-based wager reclaim (forfeiture recovery)
 
 Not implemented yet:
 - Multiplier and payout logic
@@ -21,7 +22,6 @@ Not implemented yet:
 - Game lifecycle functions (`start_game`, `reveal`, `cash_out`, `continue_game`)
 - Admin update functions
 - Query functions
-- Timeout recovery
 - Integration flow tests
 - Frontend and backend integration
 
