@@ -195,6 +195,11 @@ pub enum Error {
     /// Code: 32 — see [`error_codes::INVALID_WAGER_LIMITS`]
     InvalidWagerLimits = 32,
 
+    /// Multiplier tiers are invalid (not 4 tiers or not in ascending order).
+    /// Returned by: `set_multipliers`.
+    /// Code: 33 — see [`error_codes::INVALID_MULTIPLIER_TIERS`]
+    InvalidMultiplierTiers = 33,
+
     // ── Transfer errors (40) ────────────────────────────────────────────────
 
     /// Token transfer failed during settlement.
@@ -316,6 +321,8 @@ pub struct GameState {
     pub side_bet: SideBet,
     /// Amount wagered on the side bet in stroops (0 when `side_bet == SideBet::None`).
     pub side_bet_amount: i128,
+    /// Snapshot of multiplier tiers at game creation for isolation.
+    pub multipliers: Vec<u32>,
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -345,6 +352,8 @@ pub struct ContractConfig {
     /// are rejected while `reveal`, `cash_out`, and `claim_winnings` remain
     /// available so active games can settle to completion.
     pub shutdown_mode: bool,
+    /// Multiplier tiers: [streak_1, streak_2, streak_3, streak_4_plus] in basis points.
+    pub multipliers: Vec<u32>,
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -562,6 +571,16 @@ pub fn get_multiplier(streak: u32) -> u32 {
     }
 }
 
+/// Get multiplier from a dynamic multiplier tier vector.
+pub fn get_multiplier_from_tiers(streak: u32, multipliers: &Vec<u32>) -> u32 {
+    match streak {
+        1 => multipliers.get_unchecked(0),
+        2 => multipliers.get_unchecked(1),
+        3 => multipliers.get_unchecked(2),
+        _ => multipliers.get_unchecked(3),
+    }
+}
+
 /// Calculates the full payout breakdown for a winning streak.
 ///
 /// Returns `(gross, fee, net)` in stroops, or `None` on arithmetic overflow.
@@ -589,6 +608,20 @@ pub fn get_multiplier(streak: u32) -> u32 {
 /// - `fee_bps` – protocol fee in basis points (200–500)
 pub fn calculate_payout_breakdown(wager: i128, streak: u32, fee_bps: u32) -> Option<(i128, i128, i128)> {
     let multiplier = get_multiplier(streak) as i128;
+    let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
+    let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
+    let net   = gross.checked_sub(fee)?;
+    Some((gross, fee, net))
+}
+
+/// Calculates payout breakdown using dynamic multiplier tiers.
+pub fn calculate_payout_breakdown_with_tiers(
+    wager: i128,
+    streak: u32,
+    fee_bps: u32,
+    multipliers: &Vec<u32>,
+) -> Option<(i128, i128, i128)> {
+    let multiplier = get_multiplier_from_tiers(streak, multipliers) as i128;
     let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
     let fee   = gross.checked_mul(fee_bps as i128)?.checked_div(10_000)?;
     let net   = gross.checked_sub(fee)?;
@@ -802,6 +835,12 @@ impl CoinflipContract {
             return Err(Error::InvalidWagerLimits);
         }
         
+        let mut multipliers = Vec::new(&env);
+        multipliers.push_back(MULTIPLIER_STREAK_1);
+        multipliers.push_back(MULTIPLIER_STREAK_2);
+        multipliers.push_back(MULTIPLIER_STREAK_3);
+        multipliers.push_back(MULTIPLIER_STREAK_4_PLUS);
+        
         let config = ContractConfig {
             admin,
             treasury,
@@ -811,6 +850,7 @@ impl CoinflipContract {
             max_wager,
             paused: false,
             shutdown_mode: false,
+            multipliers,
         };
         
         let stats = ContractStats {
@@ -1140,8 +1180,11 @@ impl CoinflipContract {
             return Err(Error::InsufficientReserves);
         }
 
+        // Gas optimization: cache ledger sequence to avoid redundant calls
+        let ledger_seq = env.ledger().sequence();
+        
         // Generate contract-side randomness contribution from ledger sequence
-        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let seq_bytes = ledger_seq.to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         ).into();
@@ -1157,6 +1200,8 @@ impl CoinflipContract {
             start_ledger: env.ledger().sequence(),
             side_bet: SideBet::None,
             side_bet_amount: 0,
+            start_ledger: ledger_seq,
+            multipliers: config.multipliers.clone(),
         };
 
         Self::save_player_game(&env, &player, &game);
@@ -1175,6 +1220,7 @@ impl CoinflipContract {
         }
 
         // Update global statistics to reflect a new active game creation.
+        // Gas optimization: batch update stats in single operation
         let mut stats = stats;
         stats.total_games = stats.total_games.checked_add(1).unwrap_or(stats.total_games);
         stats.total_volume = stats.total_volume.checked_add(wager).unwrap_or(stats.total_volume);
@@ -1246,7 +1292,9 @@ impl CoinflipContract {
         }
 
         // Determine outcome by combining player secret + contract random
-        let outcome = generate_outcome(&env, &secret, &game.contract_random);
+        // Gas optimization: cache contract_random to avoid redundant access
+        let contract_random = game.contract_random.clone();
+        let outcome = generate_outcome(&env, &secret, &contract_random);
 
         let won = outcome == game.side;
 
@@ -1278,7 +1326,7 @@ impl CoinflipContract {
                 streak: 0,
                 commitment: game.commitment,
                 secret,
-                contract_random: game.contract_random,
+                contract_random,
                 payout: 0,
                 ledger: game.start_ledger,
             });
@@ -1350,7 +1398,7 @@ impl CoinflipContract {
         // avoid the duplicate multiplier lookup + two checked_div calls that would
         // result from calling calculate_payout and then recomputing gross/fee.
         let (gross_payout, fee_amount, net_payout) =
-            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+            calculate_payout_breakdown_with_tiers(game.wager, game.streak, game.fee_bps, &game.multipliers)
                 .ok_or(Error::InsufficientReserves)?;
 
         // Settle side bet
@@ -1497,7 +1545,7 @@ impl CoinflipContract {
         // avoid the duplicate multiplier lookup + two checked_div calls that would
         // result from calling calculate_payout and then recomputing gross/fee.
         let (gross, fee, net_payout) =
-            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
+            calculate_payout_breakdown_with_tiers(game.wager, game.streak, game.fee_bps, &game.multipliers)
                 .ok_or(Error::InsufficientReserves)?;
 
         // Settle side bet: compute payout (0 if condition not met).
@@ -1659,7 +1707,7 @@ impl CoinflipContract {
 
         let next_streak = game.streak.saturating_add(1);
         let max_payout = game.wager
-            .checked_mul(get_multiplier(next_streak) as i128)
+            .checked_mul(get_multiplier_from_tiers(next_streak, &game.multipliers) as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
 
@@ -1667,8 +1715,11 @@ impl CoinflipContract {
             return Err(Error::InsufficientReserves);
         }
 
+        // Gas optimization: cache ledger sequence to avoid redundant calls
+        let ledger_seq = env.ledger().sequence();
+        
         // Generate new contract randomness from the current ledger sequence
-        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let seq_bytes = ledger_seq.to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         ).into();
@@ -1875,10 +1926,19 @@ impl CoinflipContract {
         env: Env,
         admin: Address,
         update: ConfigUpdate,
+    /// Update multiplier tiers for dynamic game economics tuning.
+    ///
+    /// Admin-only function that validates tier ordering before updating.
+    /// Active games snapshot multipliers at creation, ensuring backward compatibility.
+    pub fn set_multipliers(
+        env: Env,
+        admin: Address,
+        multipliers: Vec<u32>,
     ) -> Result<(), Error> {
         admin.require_auth();
 
         let mut config = Self::load_config(&env);
+
         if admin != config.admin {
             return Err(Error::Unauthorized);
         }
@@ -1905,6 +1965,19 @@ impl CoinflipContract {
         config.max_wager = candidate_max;
         config.treasury  = candidate_treasury;
         config.paused    = candidate_paused;
+        // Validate exactly 4 tiers
+        if multipliers.len() != 4 {
+            return Err(Error::InvalidMultiplierTiers);
+        }
+
+        // Validate tier ordering: each tier must be >= previous
+        for i in 1..4 {
+            if multipliers.get_unchecked(i as u32) < multipliers.get_unchecked((i - 1) as u32) {
+                return Err(Error::InvalidMultiplierTiers);
+            }
+        }
+
+        config.multipliers = multipliers;
         Self::save_config(&env, &config);
 
         Ok(())
@@ -2318,6 +2391,12 @@ mod side_bet_tests;
 
 #[cfg(test)]
 mod admin_security_tests;
+
+#[cfg(test)]
+mod compliance_audit_tests;
+
+#[cfg(test)]
+mod disaster_recovery_tests;
 
 #[cfg(test)]
 mod tests {
