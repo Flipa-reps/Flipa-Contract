@@ -3,8 +3,14 @@
   "scripts": {
     "contract:build": "cargo build --manifest-path contract/Cargo.toml",
     "contract:test": "cargo test --manifest-path contract/Cargo.toml",
+    "contract:load": "cargo test --release --manifest-path contract/Cargo.toml load_tests -- --nocapture",
+    "contract:load:heavy": "cargo test --release --manifest-path contract/Cargo.toml load_tests -- --ignored --nocapture",
     "frontend:dev": "npm --prefix frontend run dev",
-    "frontend:start": "npm --prefix frontend run start"
+    "frontend:start": "npm --prefix frontend run start",
+    "load:basic": "k6 run frontend/tests/load/basic.js",
+    "load:game-flow": "k6 run frontend/tests/load/game-flow.js",
+    "load:stress": "k6 run frontend/tests/load/stress.js",
+    "load:all": "npm run load:basic && npm run load:game-flow && npm run load:stress"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2"

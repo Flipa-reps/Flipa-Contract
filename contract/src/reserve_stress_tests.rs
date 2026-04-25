@@ -23,7 +23,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id, admin)
 }
 
@@ -70,6 +70,8 @@ fn inject_game(
         fee_bps: 300,
         phase,
         start_ledger: env.ledger().sequence(),
+    
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(contract_id, || {
         CoinflipContract::save_player_game(env, player, &game);
@@ -149,7 +151,7 @@ fn reserve_exhaustion_start_game_rejected() {
         &player,
         &Side::Heads,
         &100_000_000,
-        &make_commitment(&env, 1),
+        &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
         "start_game should be rejected when reserve < worst-case payout");
@@ -167,7 +169,7 @@ fn reserve_exhaustion_zero_reserve_rejects_all_games() {
             &player,
             &Side::Heads,
             &wager,
-            &make_commitment(&env, 1),
+            &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
             "zero reserve should reject all games (wager={wager})");
@@ -185,7 +187,7 @@ fn reserve_exhaustion_near_zero_reserve_rejects_all_games() {
         &player,
         &Side::Heads,
         &1_000_000,
-        &make_commitment(&env, 1),
+        &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
         "near-zero reserve should reject games");
@@ -206,7 +208,7 @@ fn reserve_exhaustion_exact_boundary_accepted() {
         &player,
         &Side::Heads,
         &100_000_000,
-        &make_commitment(&env, 1),
+        &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert!(result.is_ok(), "start_game should succeed at exact reserve boundary");
 }
@@ -223,7 +225,7 @@ fn reserve_exhaustion_one_stroop_below_boundary_rejected() {
         &player,
         &Side::Heads,
         &100_000_000,
-        &make_commitment(&env, 1),
+        &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
         "start_game should be rejected one stroop below boundary");
@@ -350,7 +352,7 @@ fn solvency_check_zero_reserve_boundary() {
             &player,
             &Side::Heads,
             &wager,
-            &make_commitment(&env, 1),
+            &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
         assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
             "solvency check should reject at zero reserve (wager={wager})");
@@ -371,7 +373,7 @@ fn solvency_check_prevents_insolvency() {
         &player,
         &Side::Heads,
         &100_000_000,
-        &make_commitment(&env, 1),
+        &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert_eq!(result, Err(Ok(Error::InsufficientReserves)),
         "solvency check should prevent insolvency");
@@ -392,7 +394,7 @@ fn solvency_check_multiple_concurrent_games() {
         &player1,
         &Side::Heads,
         &100_000_000,
-        &make_commitment(&env, 1),
+        &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert!(result1.is_ok(), "first game should be accepted");
 
@@ -401,7 +403,7 @@ fn solvency_check_multiple_concurrent_games() {
         &player2,
         &Side::Heads,
         &100_000_000,
-        &make_commitment(&env, 2),
+        &make_commitment(&env, 2, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert!(result2.is_ok(), "second game should be accepted");
 
@@ -411,7 +413,7 @@ fn solvency_check_multiple_concurrent_games() {
         &player3,
         &Side::Heads,
         &100_000_000,
-        &make_commitment(&env, 3),
+        &make_commitment(&env, 3, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
     );
     assert_eq!(result3, Err(Ok(Error::InsufficientReserves)),
         "third game should be rejected (would exceed reserve)");
@@ -499,7 +501,7 @@ proptest! {
                 &player,
                 &Side::Heads,
                 &wager,
-                &make_commitment(&env, i as u8),
+                &make_commitment(&env, i as u8, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
             );
 
             if result.is_ok() {
@@ -526,7 +528,7 @@ proptest! {
             &player,
             &Side::Heads,
             &wager,
-            &make_commitment(&env, 1),
+            &make_commitment(&env, 1, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()),
         );
 
         if result.is_ok() {

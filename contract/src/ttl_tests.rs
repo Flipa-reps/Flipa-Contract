@@ -53,7 +53,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id, admin)
 }
 
@@ -103,7 +103,7 @@ fn start_game_extends_player_game_ttl() {
     let (env, client, contract_id, _) = setup();
     fund(&env, &contract_id);
     let player = Address::generate(&env);
-    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
+    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let ttl = get_ttl(&env, &contract_id, &StorageKey::PlayerGame(player));
     assert_eq!(ttl, TTL_EXTEND_TO);
 }
@@ -116,7 +116,7 @@ fn start_game_extends_stats_ttl() {
     // Decay the Stats TTL below TTL_EXTEND_TO by advancing the ledger
     env.ledger().with_mut(|l| l.sequence_number += TTL_THRESHOLD + 1);
     let player = Address::generate(&env);
-    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env));
+    client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     let ttl = get_ttl(&env, &contract_id, &StorageKey::Stats);
     assert_eq!(ttl, TTL_EXTEND_TO);
 }
@@ -163,6 +163,8 @@ fn cash_out_extends_stats_ttl() {
         wager: 10_000_000, side: Side::Heads, streak: 1,
         commitment: c, contract_random: cr, fee_bps: 300,
         phase: GamePhase::Revealed, start_ledger: env.ledger().sequence(),
+    
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(&contract_id, || {
         CoinflipContract::save_player_game(&env, &player, &game);
@@ -189,6 +191,8 @@ fn continue_streak_extends_player_game_ttl() {
         wager: 10_000_000, side: Side::Heads, streak: 1,
         commitment: c, contract_random: cr, fee_bps: 300,
         phase: GamePhase::Revealed, start_ledger: env.ledger().sequence(),
+    
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(&contract_id, || {
         CoinflipContract::save_player_game(&env, &player, &game);
@@ -246,7 +250,7 @@ fn player_game_persists_across_ledger_advance() {
     let (env, client, contract_id, _) = setup();
     fund(&env, &contract_id);
     let player = Address::generate(&env);
-    client.start_game(&player, &Side::Tails, &10_000_000, &commitment(&env));
+    client.start_game(&player, &Side::Tails, &10_000_000, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     env.ledger().with_mut(|l| l.sequence_number += TTL_EXTEND_TO / 2);
     // get_game_state triggers load_player_game → extend_ttl
     let game = client.get_game_state(&player);
@@ -278,8 +282,8 @@ fn player_game_ttl_independent_per_player() {
     fund(&env, &contract_id);
     let p1 = Address::generate(&env);
     let p2 = Address::generate(&env);
-    client.start_game(&p1, &Side::Heads, &10_000_000, &commitment(&env));
-    client.start_game(&p2, &Side::Tails, &10_000_000, &commitment(&env));
+    client.start_game(&p1, &Side::Heads, &10_000_000, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
+    client.start_game(&p2, &Side::Tails, &10_000_000, &commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
 
     // Advance ledger to decay both TTLs below TTL_EXTEND_TO
     env.ledger().with_mut(|l| l.sequence_number += TTL_THRESHOLD + 1);

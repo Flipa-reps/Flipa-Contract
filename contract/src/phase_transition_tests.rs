@@ -60,7 +60,7 @@ fn setup() -> (Env, CoinflipContractClient<'static>, Address) {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token = Address::generate(&env);
-    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
     (env, client, contract_id)
 }
 
@@ -88,6 +88,8 @@ fn inject(env: &Env, contract_id: &Address, player: &Address, phase: GamePhase, 
         fee_bps: 300,
         phase,
         start_ledger: env.ledger().sequence(),
+    
+        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
     };
     env.as_contract(contract_id, || {
         CoinflipContract::save_player_game(env, player, &game);
@@ -119,7 +121,7 @@ fn start_game_produces_committed_phase() {
     fund(&env, &contract_id, 1_000_000_000);
     let player = Address::generate(&env);
     let commitment = new_commitment(&env);
-    client.start_game(&player, &Side::Tails, &WAGER, &commitment);
+    client.start_game(&player, &Side::Tails, &WAGER, &commitment).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     let g = game(&env, &contract_id, &player).unwrap();
     assert_eq!(g.phase, GamePhase::Committed);
     assert_eq!(g.wager, WAGER);
@@ -139,7 +141,8 @@ fn reveal_win_transitions_to_revealed() {
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     // The injected commitment = sha256([1u8;32]), so this is a valid reveal.
     // Outcome depends on sha256(secret || contract_random); we accept either result.
-    let won = client.reveal(&player, &secret);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if won {
         let g = game(&env, &contract_id, &player).unwrap();
         assert_eq!(g.phase, GamePhase::Revealed);
@@ -158,7 +161,8 @@ fn reveal_loss_deletes_game() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 0);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
-    let won = client.reveal(&player, &secret);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if !won {
         assert!(game(&env, &contract_id, &player).is_none());
     }
@@ -207,7 +211,7 @@ fn completed_slot_allows_new_start_game() {
     inject(&env, &contract_id, &player, GamePhase::Completed, 0);
     let nc = new_commitment(&env);
     // Must succeed — Completed is treated as "no active game"
-    assert!(client.try_start_game(&player, &Side::Tails, &WAGER, &nc).is_ok());
+    assert!(client.try_start_game(&player, &Side::Tails, &WAGER, &nc).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()).is_ok());
     let g = game(&env, &contract_id, &player).unwrap();
     assert_eq!(g.phase, GamePhase::Committed);
 }
@@ -236,7 +240,8 @@ fn reveal_from_revealed_is_invalid_phase() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Revealed, 1);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
-    assert_eq!(client.try_reveal(&player, &secret), Err(Ok(Error::InvalidPhase)));
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+    assert_eq!(client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), Err(Ok(Error::InvalidPhase)));
 }
 
 /// cash_out from Committed → InvalidPhase.
@@ -256,7 +261,7 @@ fn claim_winnings_from_committed_is_invalid_phase() {
     fund(&env, &contract_id, 1_000_000_000);
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 1);
-    assert_eq!(client.try_claim_winnings(&player), Err(Ok(Error::InvalidPhase)));
+    assert_eq!(client.try_claim_winnings(&player, &soroban_sdk::Bytes::new(&env)), Err(Ok(Error::InvalidPhase)));
 }
 
 /// continue_streak from Committed → InvalidPhase.
@@ -282,7 +287,8 @@ fn reveal_from_completed_is_no_active_game() {
     // In practice Completed games are deleted by cash_out; inject here to test the guard.
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     // Completed phase → reveal guard fires InvalidPhase (game record still present)
-    assert_eq!(client.try_reveal(&player, &secret), Err(Ok(Error::InvalidPhase)));
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+    assert_eq!(client.try_reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64])), Err(Ok(Error::InvalidPhase)));
 }
 
 /// cash_out on Completed slot → NoActiveGame (slot deleted after cash_out).
@@ -364,7 +370,8 @@ fn streak_only_increases_on_win() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 2);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
-    let won = client.reveal(&player, &secret);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+    let won = client.reveal(&player, &secret, &BytesN::from_array(&env, &[0u8; 64]));
     if won {
         assert_eq!(game(&env, &contract_id, &player).unwrap().streak, 3);
     }
@@ -399,7 +406,7 @@ fn new_game_does_not_affect_other_player() {
     let p2 = Address::generate(&env);
     inject(&env, &contract_id, &p1, GamePhase::Revealed, 2);
     // p2 starts a fresh game
-    client.start_game(&p2, &Side::Tails, &WAGER, &new_commitment(&env));
+    client.start_game(&p2, &Side::Tails, &WAGER, &new_commitment(&env, &env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into()));
     // p1's state must be unchanged
     let g1 = game(&env, &contract_id, &p1).unwrap();
     assert_eq!(g1.phase, GamePhase::Revealed);
@@ -419,8 +426,8 @@ fn concurrent_start_games_are_independent() {
     let c2: BytesN<32> = env.crypto()
         .sha256(&soroban_sdk::Bytes::from_slice(&env, &[22u8; 32]))
         .into();
-    client.start_game(&p1, &Side::Heads, &WAGER, &c1);
-    client.start_game(&p2, &Side::Tails, &WAGER, &c2);
+    client.start_game(&p1, &Side::Heads, &WAGER, &c1).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
+    client.start_game(&p2, &Side::Tails, &WAGER, &c2).sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into());
     assert_eq!(game(&env, &contract_id, &p1).unwrap().phase, GamePhase::Committed);
     assert_eq!(game(&env, &contract_id, &p2).unwrap().phase, GamePhase::Committed);
     assert_eq!(game(&env, &contract_id, &p1).unwrap().side, Side::Heads);
