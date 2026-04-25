@@ -433,6 +433,8 @@ pub struct ContractConfig {
 /// - `reserve_balance`: Must always be sufficient to cover the worst-case payout (10x wager).
 ///   Decreases when players cash out or claim winnings (gross deducted), increases when players
 ///   lose and forfeit their wager.
+/// - `pool_size`: Monotonically increasing count of entropy contributions.
+/// - `mix_count`: Monotonically increasing count of entropy mix operations.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractStats {
@@ -445,6 +447,10 @@ pub struct ContractStats {
     /// Current contract reserve balance in stroops; decremented on payouts,
     /// incremented when the house wins (loss forfeiture).
     pub reserve_balance: i128,
+    /// Total number of entropy contributions accumulated into the pool.
+    pub pool_size: u64,
+    /// Total number of times entropy has been mixed into outcome generation.
+    pub mix_count: u64,
 }
 
 /// A single completed game record stored in a player's history ring-buffer.
@@ -502,6 +508,27 @@ pub struct ConfigUpdate {
     pub max_wager: Option<i128>,
     pub treasury:  Option<Address>,
     pub paused:    Option<bool>,
+/// Entropy pool accumulating randomness from multiple on-chain sources.
+///
+/// The pool is updated on every `start_game` and `continue_streak` call by
+/// XOR-folding the current ledger sequence and timestamp into the running
+/// 32-byte pool value.  The accumulated entropy is then mixed into outcome
+/// generation via XOR, making it harder for any single party to predict or
+/// bias the result.
+///
+/// Fields:
+/// - `pool`       – 32-byte running entropy accumulator
+/// - `pool_size`  – number of entropy contributions folded in so far
+/// - `mix_count`  – number of times the pool has been mixed into an outcome
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntropyPool {
+    /// Running 32-byte entropy accumulator (XOR of all contributions).
+    pub pool: BytesN<32>,
+    /// Number of entropy contributions accumulated so far.
+    pub pool_size: u64,
+    /// Number of times the pool has been mixed into outcome generation.
+    pub mix_count: u64,
 }
 
 /// Persistent storage key variants for the contract's data model.
@@ -514,6 +541,8 @@ pub enum StorageKey {
     Config,
     /// Global aggregate statistics ([`ContractStats`]).
     Stats,
+    /// Global entropy pool ([`EntropyPool`]).
+    EntropyPool,
     /// Per-player game state ([`GameState`]), keyed by player address.
     PlayerGame(Address),
     /// Per-player game history ring-buffer ([`Vec<HistoryEntry>`]), keyed by player address.
@@ -1277,12 +1306,23 @@ impl CoinflipContract {
             total_volume: 0,
             total_fees: 0,
             reserve_balance: 0,
+            pool_size: 1, // seeded below with the ledger sequence hash
+            mix_count: 0,
         };
         
         env.storage().persistent().set(&StorageKey::Config, &config);
         env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
         env.storage().persistent().set(&StorageKey::Stats, &stats);
         env.storage().persistent().extend_ttl(&StorageKey::Stats, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Initialize entropy pool with ledger sequence as the seed.
+        let seed_bytes = env.ledger().sequence().to_be_bytes();
+        let seed_hash: BytesN<32> = env.crypto().sha256(
+            &soroban_sdk::Bytes::from_slice(&env, &seed_bytes),
+        ).into();
+        let entropy = EntropyPool { pool: seed_hash, pool_size: 1, mix_count: 0 };
+        env.storage().persistent().set(&StorageKey::EntropyPool, &entropy);
+        env.storage().persistent().extend_ttl(&StorageKey::EntropyPool, TTL_THRESHOLD, TTL_EXTEND_TO);
         
         Self::emit_initialized(&env, EventInitialized {
             admin,
@@ -1512,6 +1552,78 @@ impl CoinflipContract {
     }
 
 
+    /// Load the entropy pool. Returns a zero-seeded pool if none exists yet.
+    fn load_entropy_pool(env: &Env) -> EntropyPool {
+        let key = StorageKey::EntropyPool;
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            env.storage().persistent().get(&key).unwrap()
+        } else {
+            EntropyPool {
+                pool: BytesN::from_array(env, &[0u8; 32]),
+                pool_size: 0,
+                mix_count: 0,
+            }
+        }
+    }
+
+    /// Persist the entropy pool to permanent storage.
+    fn save_entropy_pool(env: &Env, entropy: &EntropyPool) {
+        env.storage().persistent().set(&StorageKey::EntropyPool, entropy);
+        env.storage().persistent().extend_ttl(&StorageKey::EntropyPool, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Accumulate entropy from the current ledger sequence and timestamp.
+    ///
+    /// Folds `SHA-256(sequence || timestamp)` into the pool via XOR, then
+    /// increments `pool_size`.  Also updates `stats.pool_size`.
+    fn accumulate_entropy(env: &Env, stats: &mut ContractStats) {
+        let mut entropy = Self::load_entropy_pool(env);
+
+        // Build a 12-byte input: 4-byte sequence (big-endian) || 8-byte timestamp (big-endian)
+        let seq = env.ledger().sequence();
+        let ts  = env.ledger().timestamp();
+        let mut input = [0u8; 12];
+        input[..4].copy_from_slice(&seq.to_be_bytes());
+        input[4..].copy_from_slice(&ts.to_be_bytes());
+
+        let contribution: [u8; 32] = env.crypto()
+            .sha256(&soroban_sdk::Bytes::from_slice(env, &input))
+            .to_array();
+
+        // XOR the contribution into the pool.
+        let mut pool_arr = entropy.pool.to_array();
+        for i in 0..32 {
+            pool_arr[i] ^= contribution[i];
+        }
+        entropy.pool = BytesN::from_array(env, &pool_arr);
+        entropy.pool_size = entropy.pool_size.saturating_add(1);
+
+        Self::save_entropy_pool(env, &entropy);
+        stats.pool_size = entropy.pool_size;
+    }
+
+    /// Mix the entropy pool into a 32-byte value via XOR and increment `mix_count`.
+    ///
+    /// Returns the XOR of `base` and the current pool value.
+    /// Also updates `stats.mix_count`.
+    fn mix_entropy(env: &Env, base: &BytesN<32>, stats: &mut ContractStats) -> BytesN<32> {
+        let mut entropy = Self::load_entropy_pool(env);
+
+        let base_arr  = base.to_array();
+        let pool_arr  = entropy.pool.to_array();
+        let mut mixed = [0u8; 32];
+        for i in 0..32 {
+            mixed[i] = base_arr[i] ^ pool_arr[i];
+        }
+
+        entropy.mix_count = entropy.mix_count.saturating_add(1);
+        Self::save_entropy_pool(env, &entropy);
+        stats.mix_count = entropy.mix_count;
+
+        BytesN::from_array(env, &mixed)
+    }
+
     /// Begin a new coinflip game for `player`.
     ///
     /// Acceptance invariants:
@@ -1624,8 +1736,19 @@ impl CoinflipContract {
         // Generate contract-side randomness contribution from ledger sequence
         let seq_bytes = ledger_seq.to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
+        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let base_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         ).into();
+
+        // Update global statistics to reflect a new active game creation.
+        // Accumulate entropy first so the mix below uses the freshest pool.
+        let mut stats = stats;
+        stats.total_games = stats.total_games.checked_add(1).unwrap_or(stats.total_games);
+        stats.total_volume = stats.total_volume.checked_add(wager).unwrap_or(stats.total_volume);
+        Self::accumulate_entropy(&env, &mut stats);
+        let contract_random = Self::mix_entropy(&env, &base_random, &mut stats);
+        Self::save_stats(&env, &stats);
 
         let game = GameState {
             wager,
@@ -2242,8 +2365,16 @@ impl CoinflipContract {
         // Generate new contract randomness from the current ledger sequence
         let seq_bytes = ledger_seq.to_be_bytes();
         let contract_random: BytesN<32> = env.crypto().sha256(
+        let seq_bytes = env.ledger().sequence().to_be_bytes();
+        let base_random: BytesN<32> = env.crypto().sha256(
             &soroban_sdk::Bytes::from_slice(&env, &seq_bytes),
         ).into();
+
+        // Accumulate entropy and mix into contract_random.
+        let mut stats = Self::load_stats(&env);
+        Self::accumulate_entropy(&env, &mut stats);
+        let contract_random = Self::mix_entropy(&env, &base_random, &mut stats);
+        Self::save_stats(&env, &stats);
 
         // Reset to Committed phase; preserve streak and wager
         game.phase = GamePhase::Committed;
@@ -3357,6 +3488,7 @@ mod governance_tests;
 mod rbac_tests;
 mod circuit_breaker_tests;
 mod reveal_validation_tests;
+mod entropy_tests;
 
 #[cfg(test)]
 mod tests {
