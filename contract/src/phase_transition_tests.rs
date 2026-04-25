@@ -139,6 +139,7 @@ fn reveal_win_transitions_to_revealed() {
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     // The injected commitment = sha256([1u8;32]), so this is a valid reveal.
     // Outcome depends on sha256(secret || contract_random); we accept either result.
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if won {
         let g = game(&env, &contract_id, &player).unwrap();
@@ -158,6 +159,7 @@ fn reveal_loss_deletes_game() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 0);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if !won {
         assert!(game(&env, &contract_id, &player).is_none());
@@ -236,6 +238,7 @@ fn reveal_from_revealed_is_invalid_phase() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Revealed, 1);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     assert_eq!(client.try_reveal(&player, &secret), Err(Ok(Error::InvalidPhase)));
 }
 
@@ -282,6 +285,7 @@ fn reveal_from_completed_is_no_active_game() {
     // In practice Completed games are deleted by cash_out; inject here to test the guard.
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
     // Completed phase → reveal guard fires InvalidPhase (game record still present)
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     assert_eq!(client.try_reveal(&player, &secret), Err(Ok(Error::InvalidPhase)));
 }
 
@@ -364,6 +368,7 @@ fn streak_only_increases_on_win() {
     let player = Address::generate(&env);
     inject(&env, &contract_id, &player, GamePhase::Committed, 2);
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
     if won {
         assert_eq!(game(&env, &contract_id, &player).unwrap().streak, 3);

@@ -144,6 +144,7 @@ fn error_no_active_game_reachable() {
     let secret = Bytes::random(&env, 32);
 
     // Try to reveal without starting game
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let result = client.try_reveal(&player, &secret);
     assert!(result.is_err(), "should reject reveal without active game");
 }
@@ -163,9 +164,11 @@ fn error_invalid_phase_reachable() {
     client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
 
     // Reveal to move to Revealed phase
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player, &secret);
 
     // Try to reveal again (should be in Revealed phase, not Committed)
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let result = client.try_reveal(&player, &secret);
     assert!(result.is_err(), "should reject reveal in wrong phase");
 }
@@ -186,6 +189,7 @@ fn error_commitment_mismatch_reachable() {
     client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
 
     // Try to reveal with wrong secret
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let result = client.try_reveal(&player, &wrong_secret);
     assert!(result.is_err(), "should reject reveal with mismatched commitment");
 }
@@ -205,6 +209,7 @@ fn error_no_winnings_to_claim_reachable() {
     client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
 
     // Reveal (may lose)
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let won = client.reveal(&player, &secret);
 
     if !won {
@@ -229,6 +234,7 @@ fn error_invalid_commitment_reachable() {
     client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
 
     // Reveal to win
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player, &secret);
 
     // Try to continue with all-zero commitment (invalid)

@@ -210,6 +210,7 @@ fn timeout_reveal_before_timeout_succeeds() {
     env.ledger().set_sequence(start_ledger + 50);
 
     // Reveal should succeed before timeout
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let result = client.try_reveal(&player, &secret);
     assert!(result.is_ok(), "reveal should succeed before timeout");
 }
@@ -234,6 +235,7 @@ fn timeout_reveal_after_timeout_succeeds() {
     env.ledger().set_sequence(start_ledger + 150);
 
     // Reveal should still succeed after timeout
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let result = client.try_reveal(&player, &secret);
     assert!(result.is_ok(), "reveal should succeed even after timeout");
 }
@@ -258,6 +260,7 @@ fn timeout_concurrent_reveal_and_reclaim() {
     env.ledger().set_sequence(start_ledger + 100);
 
     // Reveal should succeed
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     let reveal_result = client.try_reveal(&player, &secret);
     assert!(reveal_result.is_ok(), "reveal should succeed at timeout boundary");
 

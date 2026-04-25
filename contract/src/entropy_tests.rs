@@ -97,6 +97,7 @@ fn test_continue_streak_accumulates_and_mixes_entropy() {
     // Start and win a game (seed 1 → Heads win).
     client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1));
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     assert_eq!(client.reveal(&player, &secret), true);
 
     let before = load_entropy(&env, &contract_id);
@@ -297,6 +298,7 @@ fn test_mix_count_increments_on_continue_streak() {
     let player = Address::generate(&env);
     client.start_game(&player, &Side::Heads, &10_000_000, &commitment(&env, 1));
     let secret = soroban_sdk::Bytes::from_slice(&env, &[1u8; 32]);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     assert_eq!(client.reveal(&player, &secret), true);
 
     let before = load_stats(&env, &contract_id).mix_count;

@@ -93,6 +93,7 @@ fn gas_reveal_baseline() {
     client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
 
     let gas_used = measure_gas(&env, || {
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
         client.reveal(&player, &secret);
     });
 
@@ -113,6 +114,7 @@ fn gas_cash_out_baseline() {
     let commitment = env.crypto().sha256(&secret).into();
 
     client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player, &secret);
 
     let gas_used = measure_gas(&env, || {
@@ -175,6 +177,7 @@ fn gas_reveal_consistency() {
         client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
 
         let gas_used = measure_gas(&env, || {
+            env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
             client.reveal(&player, &secret);
         });
 
@@ -244,6 +247,7 @@ fn gas_full_game_flow_within_budget() {
 
     let total_gas = measure_gas(&env, || {
         client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
         client.reveal(&player, &secret);
         client.cash_out(&player);
     });
@@ -269,6 +273,7 @@ fn gas_multiple_games_efficiency() {
 
         total_gas += measure_gas(&env, || {
             client.start_game(&player, &Side::Heads, &1_000_000, &commitment);
+            env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
             client.reveal(&player, &secret);
             client.cash_out(&player);
         });

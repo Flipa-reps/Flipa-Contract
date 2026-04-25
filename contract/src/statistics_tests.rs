@@ -119,6 +119,7 @@ fn test_total_games_does_not_increment_on_reveal_or_cash_out() {
     let player = Address::generate(&env);
     client.start_game(&player, &Side::Heads, &5_000_000, &make_commitment(&env, 1));
     let before = load_stats(&env, &contract_id).total_games;
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player, &make_secret(&env, 1));
     client.cash_out(&player);
     assert_eq!(load_stats(&env, &contract_id).total_games, before);
@@ -162,6 +163,7 @@ fn test_total_volume_does_not_change_on_cash_out() {
     let player = Address::generate(&env);
     client.start_game(&player, &Side::Heads, &5_000_000, &make_commitment(&env, 1));
     let before = load_stats(&env, &contract_id).total_volume;
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player, &make_secret(&env, 1));
     client.cash_out(&player);
     assert_eq!(load_stats(&env, &contract_id).total_volume, before);
@@ -213,6 +215,7 @@ fn test_total_fees_does_not_accumulate_on_loss() {
     let secret = make_secret(&env, 3);
     let commitment = make_commitment(&env, 3);
     client.start_game(&player, &Side::Heads, &5_000_000, &commitment);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player, &secret);
     assert_eq!(load_stats(&env, &contract_id).total_fees, 0);
 }
@@ -244,6 +247,7 @@ fn test_reserve_balance_increases_on_loss() {
     let secret = make_secret(&env, 3);
     let commitment = make_commitment(&env, 3);
     client.start_game(&player, &Side::Heads, &wager, &commitment);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player, &secret);
     assert_eq!(
         load_stats(&env, &contract_id).reserve_balance,
@@ -423,6 +427,7 @@ proptest! {
         let commitment: BytesN<32> = env.crypto().sha256(&secret).into();
         client.start_game(&player, &Side::Heads, &wager, &commitment);
         let before = load_stats(&env, &contract_id).reserve_balance;
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
         let won = client.reveal(&player, &secret);
         prop_assume!(!won);
         let after = load_stats(&env, &contract_id).reserve_balance;
@@ -531,6 +536,7 @@ fn test_concurrent_wins_and_losses_update_reserve() {
         let secret = make_secret(&env, 3);
         let commitment = make_commitment(&env, 3);
         client.start_game(&player, &Side::Heads, &wager, &commitment);
+        env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
         client.reveal(&player, &secret);
         net_change += wager;
     }
@@ -552,6 +558,7 @@ fn test_statistics_consistency_with_mixed_operations() {
     
     // Player 1: start and win
     client.start_game(&player1, &Side::Heads, &10_000_000, &make_commitment(&env, 1));
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player1, &make_secret(&env, 1));
     client.cash_out(&player1);
     
@@ -559,10 +566,12 @@ fn test_statistics_consistency_with_mixed_operations() {
     let secret2 = make_secret(&env, 3);
     let commitment2 = make_commitment(&env, 3);
     client.start_game(&player2, &Side::Heads, &5_000_000, &commitment2);
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player2, &secret2);
     
     // Player 3: start, win, continue
     client.start_game(&player3, &Side::Heads, &7_000_000, &make_commitment(&env, 2));
+    env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
     client.reveal(&player3, &make_secret(&env, 2));
     client.continue_streak(&player3, &make_commitment(&env, 42));
     
