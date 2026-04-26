@@ -453,6 +453,8 @@ pub struct GameState {
     /// signs as its VRF proof input.  Computed and stored at `start_game` time so
     /// the oracle cannot change what it signs after seeing the player's secret.
     pub vrf_input: BytesN<32>,
+    /// Token used for this game's wager and payout (snapshotted from the whitelist at start_game).
+    pub token: Address,
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -2109,6 +2111,7 @@ impl CoinflipContract {
         commitment: BytesN<32>,
         referrer: Option<Address>,
         oracle_commitment: BytesN<32>,
+        token: Address,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -2152,6 +2155,11 @@ impl CoinflipContract {
         }
         if wager > config.max_wager {
             return Err(Error::WagerAboveMaximum);
+        }
+
+        // Guard: token must be whitelisted
+        if !Self::is_token_whitelisted(&env, &token) {
+            return Err(Error::Unauthorized);
         }
 
         // Guard 4: player must not have an active game
@@ -2234,6 +2242,7 @@ impl CoinflipContract {
                 msg.append(&Bytes::from_slice(&env, &contract_random.to_array()));
                 env.crypto().sha256(&msg).into()
             },
+            token: token.clone(),
         };
 
         Self::save_player_game(&env, &player, &game);
@@ -2258,6 +2267,13 @@ impl CoinflipContract {
         stats.total_games = stats.total_games.checked_add(1).unwrap_or(stats.total_games);
         stats.total_volume = stats.total_volume.checked_add(wager).unwrap_or(stats.total_volume);
         Self::save_stats(&env, &stats);
+
+        // Track per-token reserve: credit the wager to the token's reserve bucket.
+        let token_reserve_key = StorageKey::TokenReserve(token.clone());
+        let prev_token_reserve: i128 = env.storage().persistent()
+            .get(&token_reserve_key).unwrap_or(0i128);
+        env.storage().persistent().set(&token_reserve_key, &prev_token_reserve.saturating_add(wager));
+        env.storage().persistent().extend_ttl(&token_reserve_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         Self::emit_game_started(&env, EventGameStarted {
             player,
@@ -2578,7 +2594,7 @@ impl CoinflipContract {
         }
 
         let config = Self::load_config(&env);
-        let token_client = token::Client::new(&env, &config.token);
+        let token_client = token::Client::new(&env, &game.token);
 
         // Single-pass payout breakdown: gross, fee, and net computed together to
         // avoid the duplicate multiplier lookup + two checked_div calls that would
