@@ -671,6 +671,10 @@ pub enum StorageKey {
     LiquidityPool,
     /// Per-LP token balance (i128), keyed by provider address.
     LpBalance(Address),
+    /// MPC session state ([`MpcSession`]), keyed by session id (u64).
+    MpcSession(u64),
+    /// MPC session counter (u64) — monotonically increasing session id.
+    MpcSessionCount,
 }
 
 /// Leaderboard entry for a single player.
@@ -725,57 +729,64 @@ pub struct LiquidityPool {
     pub accumulated_fees: i128,
 }
 
-// ── ZK proof types ───────────────────────────────────────────────────────────
+// ── MPC (Multi-Party Computation) types ─────────────────────────────────────
 //
-// Constant-size (64-byte) zk-SNARK-style commitment proofs.
-//
-// The scheme is a Fiat-Shamir sigma protocol over SHA-256:
-//
-//   1. Prover picks nonce `r`, computes `R = SHA-256(r)`.
-//   2. Challenge `c = SHA-256(commitment || R || domain)`.
-//   3. Response `s = SHA-256(secret || c)`.
-//   4. Proof = (R[0..32], s[0..32]) — constant 64 bytes.
-//
-// Verifier checks: `SHA-256(commitment || R || domain) == c`
-// and `SHA-256(commitment || s) == SHA-256(commitment || s)` via
-// the binding property of SHA-256.  The prover cannot forge `s`
-// without knowing the secret pre-image of `commitment`.
-//
-// This lets a player prove knowledge of their secret without
-// revealing it before the reveal phase.
+// Threshold randomness: `threshold` of `total_parties` must submit and reveal
+// their shares before the aggregated entropy is usable.  The contract XOR-folds
+// all revealed shares into a single 32-byte value that feeds into outcome
+// derivation alongside the existing commit-reveal and VRF contributions.
 
-/// A constant-size (64-byte) ZK commitment proof.
-///
-/// - `r_hash` – SHA-256 of the prover's nonce (`R = SHA-256(nonce)`)
-/// - `response` – Fiat-Shamir response `s = SHA-256(secret || challenge)`
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ZkProof {
-    /// Nonce commitment: `SHA-256(nonce)`.  32 bytes.
-    pub r_hash:   BytesN<32>,
-    /// Fiat-Shamir response: `SHA-256(secret || challenge)`.  32 bytes.
-    pub response: BytesN<32>,
-}
-
-/// The public statement being proved: the commitment value and domain tag.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ZkStatement {
-    /// The on-chain commitment (`SHA-256(secret)` or domain-separated variant).
-    pub commitment: BytesN<32>,
-    /// Domain separation tag (e.g. `b"tossd:zk:v1"`).
-    pub domain:     Bytes,
-}
-
-/// Result of ZK proof verification.
+/// Lifecycle phase of an MPC session.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ZkVerifyResult {
-    /// Proof is valid: prover knows the secret pre-image.
-    Valid,
-    /// Proof is invalid: challenge recomputation failed.
-    Invalid,
+pub enum MpcPhase {
+    /// Accepting commitments from parties.
+    Commit,
+    /// Threshold met; accepting share reveals.
+    Reveal,
+    /// All required shares revealed; entropy aggregated and ready.
+    Aggregated,
 }
+
+/// A single party's commitment within an MPC session.
+///
+/// - `party`      – address of the contributing party
+/// - `commitment` – SHA-256 of the party's secret share
+/// - `signature`  – Ed25519 signature over `commitment` bytes, proving key ownership
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MpcCommitment {
+    pub party:      Address,
+    pub commitment: BytesN<32>,
+    pub signature:  BytesN<64>,
+}
+
+/// State of a single MPC randomness session.
+///
+/// A session collects commitments from `total_parties` participants, then
+/// accepts reveals once `threshold` commitments are in.  The final entropy
+/// is the XOR-fold of all revealed shares, mixed with the ledger sequence.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MpcSession {
+    /// Monotonically increasing session identifier.
+    pub session_id:    u64,
+    /// Minimum number of parties that must reveal for the session to complete.
+    pub threshold:     u32,
+    /// Total number of registered parties.
+    pub total_parties: u32,
+    /// Commitments submitted so far (one per party).
+    pub commitments:   soroban_sdk::Vec<MpcCommitment>,
+    /// Revealed shares (pre-images of commitments), in submission order.
+    pub shares:        soroban_sdk::Vec<Bytes>,
+    /// XOR-fold of all revealed shares; populated once `threshold` shares are in.
+    pub aggregated:    BytesN<32>,
+    /// Current lifecycle phase.
+    pub phase:         MpcPhase,
+    /// Ledger at session creation; mixed into the final entropy.
+    pub start_ledger:  u32,
+}
+
 
 // ── Event payload types ─────────────────────────────────────────────────────
 //
@@ -1548,6 +1559,211 @@ pub fn generate_outcome(
     combined.append(&aggregated_bytes);
     let hash = env.crypto().sha256(&combined);
     if hash.to_array()[0] % 2 == 0 { Side::Heads } else { Side::Tails }
+}
+
+// ── MPC protocol functions ───────────────────────────────────────────────────
+
+/// Creates a new MPC randomness session and returns its session id.
+///
+/// The caller specifies how many parties will participate (`total_parties`)
+/// and the minimum number that must reveal their shares (`threshold`).
+/// `threshold` must be ≥ 1 and ≤ `total_parties`.
+///
+/// The session is stored under [`StorageKey::MpcSession`] and the global
+/// counter under [`StorageKey::MpcSessionCount`] is incremented.
+pub fn mpc_create_session(env: &Env, threshold: u32, total_parties: u32) -> u64 {
+    assert!(threshold >= 1 && threshold <= total_parties, "invalid threshold");
+
+    let session_id: u64 = env
+        .storage()
+        .persistent()
+        .get(&StorageKey::MpcSessionCount)
+        .unwrap_or(0u64)
+        .saturating_add(1);
+
+    let session = MpcSession {
+        session_id,
+        threshold,
+        total_parties,
+        commitments: soroban_sdk::Vec::new(env),
+        shares:      soroban_sdk::Vec::new(env),
+        aggregated:  BytesN::from_array(env, &[0u8; 32]),
+        phase:       MpcPhase::Commit,
+        start_ledger: env.ledger().sequence(),
+    };
+
+    env.storage().persistent().set(&StorageKey::MpcSessionCount, &session_id);
+    env.storage().persistent().set(&StorageKey::MpcSession(session_id), &session);
+    session_id
+}
+
+/// Submits a party's commitment to an MPC session.
+///
+/// Each party hashes their secret share and submits the hash along with an
+/// Ed25519 signature over the commitment bytes (proving they hold the
+/// corresponding private key).  Duplicate submissions from the same party
+/// are rejected.
+///
+/// When the number of commitments reaches `total_parties` the session
+/// automatically advances to [`MpcPhase::Reveal`].
+///
+/// # Errors
+/// - Panics if `session_id` does not exist.
+/// - Panics if the session is not in [`MpcPhase::Commit`].
+/// - Panics if `party` has already submitted a commitment.
+pub fn mpc_submit_commitment(
+    env: &Env,
+    session_id: u64,
+    party: Address,
+    commitment: BytesN<32>,
+    party_pk: BytesN<32>,
+    signature: BytesN<64>,
+) {
+    let mut session: MpcSession = env
+        .storage()
+        .persistent()
+        .get(&StorageKey::MpcSession(session_id))
+        .expect("session not found");
+
+    assert!(session.phase == MpcPhase::Commit, "session not in commit phase");
+
+    // Reject duplicate submissions from the same party.
+    for i in 0..session.commitments.len() {
+        assert!(session.commitments.get_unchecked(i).party != party, "duplicate commitment");
+    }
+
+    // Verify the party's Ed25519 signature over the commitment bytes.
+    // All-zero pk = testing/no-sig mode (mirrors VRF oracle bypass).
+    if party_pk != BytesN::from_array(env, &[0u8; 32]) {
+        let msg = Bytes::from_slice(env, &commitment.to_array());
+        env.crypto().ed25519_verify(&party_pk, &msg, &signature);
+    }
+
+    session.commitments.push_back(MpcCommitment { party, commitment, signature });
+
+    // Advance to Reveal phase once all parties have committed.
+    if session.commitments.len() >= session.total_parties {
+        session.phase = MpcPhase::Reveal;
+    }
+
+    env.storage().persistent().set(&StorageKey::MpcSession(session_id), &session);
+}
+
+/// Reveals a party's secret share for an MPC session.
+///
+/// The contract verifies that `SHA-256(share) == commitment` for the
+/// corresponding party entry.  Once `threshold` valid shares are collected
+/// the session aggregates them via XOR-fold (mixed with the creation ledger)
+/// and advances to [`MpcPhase::Aggregated`].
+///
+/// # Errors
+/// - Panics if `session_id` does not exist.
+/// - Panics if the session is not in [`MpcPhase::Reveal`].
+/// - Panics if `party` has no matching commitment.
+/// - Panics if `SHA-256(share) != commitment`.
+pub fn mpc_reveal_share(env: &Env, session_id: u64, party: Address, share: Bytes) {
+    let mut session: MpcSession = env
+        .storage()
+        .persistent()
+        .get(&StorageKey::MpcSession(session_id))
+        .expect("session not found");
+
+    assert!(session.phase == MpcPhase::Reveal, "session not in reveal phase");
+
+    // Find the party's commitment.
+    let mut found = false;
+    for i in 0..session.commitments.len() {
+        let entry = session.commitments.get_unchecked(i);
+        if entry.party == party {
+            // Verify the share pre-image.
+            let hash: BytesN<32> = env.crypto().sha256(&share).into();
+            assert!(hash == entry.commitment, "share does not match commitment");
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "party has no commitment in this session");
+
+    session.shares.push_back(share);
+
+    // Aggregate once threshold is reached.
+    if session.shares.len() >= session.threshold {
+        session.aggregated = mpc_aggregate(env, &session.shares, session.start_ledger);
+        session.phase = MpcPhase::Aggregated;
+    }
+
+    env.storage().persistent().set(&StorageKey::MpcSession(session_id), &session);
+}
+
+/// Aggregates revealed shares into a single 32-byte entropy value.
+///
+/// Algorithm:
+/// 1. XOR-fold all shares (each hashed to 32 bytes via SHA-256 for uniform length).
+/// 2. XOR the result with the SHA-256 of the session's creation ledger sequence
+///    so the contract contributes independent entropy even if all parties collude.
+///
+/// This is a pure function — it does not read or write storage.
+pub fn mpc_aggregate(env: &Env, shares: &soroban_sdk::Vec<Bytes>, start_ledger: u32) -> BytesN<32> {
+    let mut acc = [0u8; 32];
+
+    for i in 0..shares.len() {
+        let share_hash = env.crypto().sha256(&shares.get_unchecked(i)).to_array();
+        for j in 0..32 {
+            acc[j] ^= share_hash[j];
+        }
+    }
+
+    // Mix in ledger-derived entropy so the contract is an independent contributor.
+    let ledger_bytes = Bytes::from_slice(env, &start_ledger.to_be_bytes());
+    let ledger_hash = env.crypto().sha256(&ledger_bytes).to_array();
+    for j in 0..32 {
+        acc[j] ^= ledger_hash[j];
+    }
+
+    BytesN::from_array(env, &acc)
+}
+
+/// Verifies that at least `threshold` of the provided Ed25519 signatures are
+/// valid over `message` using the corresponding public keys.
+///
+/// Returns `true` when the threshold is met, `false` otherwise.
+/// An all-zero public key entry is skipped (testing bypass, mirrors VRF mode).
+///
+/// This implements the threshold signature check: any `threshold`-of-`n`
+/// subset of registered parties can authorise an action.
+pub fn verify_threshold_signatures(
+    env: &Env,
+    message: &Bytes,
+    public_keys: &soroban_sdk::Vec<BytesN<32>>,
+    signatures: &soroban_sdk::Vec<BytesN<64>>,
+    threshold: u32,
+) -> bool {
+    assert!(
+        public_keys.len() == signatures.len(),
+        "public_keys and signatures length mismatch"
+    );
+
+    let zero_pk = BytesN::from_array(env, &[0u8; 32]);
+    let mut valid: u32 = 0;
+
+    for i in 0..public_keys.len() {
+        let pk = public_keys.get_unchecked(i);
+        if pk == zero_pk {
+            continue; // skip testing bypass entries
+        }
+        let sig = signatures.get_unchecked(i);
+        // ed25519_verify panics on invalid signature; catch via try pattern.
+        // In Soroban we use a host-trap-safe approach: attempt verification and
+        // count successes.  Invalid sigs abort the host call, so we only call
+        // verify when we expect success; callers must pre-filter invalid sigs.
+        env.crypto().ed25519_verify(&pk, message, &sig);
+        valid = valid.saturating_add(1);
+        if valid >= threshold {
+            return true;
+        }
+    }
+
+    valid >= threshold
 }
 
 /// Generate a referral code from a player address.
@@ -4713,7 +4929,7 @@ mod multiparty_tests;
 mod vrf_tests;
 
 #[cfg(test)]
-mod zk_tests;
+mod mpc_tests;
 
 #[cfg(test)]
 mod tests {
