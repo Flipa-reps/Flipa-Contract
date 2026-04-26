@@ -77,7 +77,7 @@ surfaces per-operation status to players.
     - **Property 6: Circuit-breaker (reserves ≤ min_reserve_threshold) blocks start_game independently of the StartGame OperationFlag**
     - **Validates: Requirements 2.7**
 
-- [~] 6. Checkpoint — Ensure all contract tests pass
+- [ ] 6. Checkpoint — Ensure all contract tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 7. Preserve backward compatibility with `set_paused`
@@ -91,18 +91,18 @@ surfaces per-operation status to players.
     - **Property 7: set_paused mutates only ContractConfig.paused and no other config fields or OperationFlag values**
     - **Validates: Requirements 5.4**
 
-- [~] 8. Update `pause_tests.rs` to cover granular pause scenarios
-  - [~] 8.1 Add unit tests for each operation paused independently (four tests: one per operation)
+- [ ] 8. Update `pause_tests.rs` to cover granular pause scenarios
+  - [ ] 8.1 Add unit tests for each operation paused independently (four tests: one per operation)
     - Verify the paused operation returns `Error::ContractPaused`
     - Verify the other three operations remain unblocked
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
 
-  - [~] 8.2 Add unit tests for `PauseRecord` persistence and `get_pause_reason`
+  - [ ] 8.2 Add unit tests for `PauseRecord` persistence and `get_pause_reason`
     - Verify reason is stored and returned correctly
     - Verify empty string returned when no record exists
     - _Requirements: 3.2, 3.5_
 
-  - [~] 8.3 Add unit tests for `PauseAnalytics` counters
+  - [ ] 8.3 Add unit tests for `PauseAnalytics` counters
     - Verify `pause_count` increments on pause, `unpause_count` on unpause
     - Verify `last_paused_ledger` updated correctly
     - Verify zero-initialisation at contract init
@@ -112,29 +112,29 @@ surfaces per-operation status to players.
     - **Property 8: pause_count and unpause_count are non-decreasing across any sequence of set_operation_paused calls**
     - **Validates: Requirements 4.2, 4.3**
 
-- [~] 9. Checkpoint — Ensure all contract tests pass
+- [ ] 9. Checkpoint — Ensure all contract tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [~] 10. Frontend: query and display per-operation pause status
-  - [~] 10.1 Add `useOperationPauseStatus` hook in `frontend/hooks/`
+- [ ] 10. Frontend: query and display per-operation pause status
+  - [ ] 10.1 Add `useOperationPauseStatus` hook in `frontend/hooks/`
     - On mount and after each wallet-connected transaction, call `get_operation_paused` for all four operations
     - Poll every 30 seconds while session is active
     - _Requirements: 7.1, 7.4_
 
-  - [~] 10.2 Add `useOperationPauseReason` hook (or extend 10.1) to fetch `get_pause_reason` for paused operations
+  - [ ] 10.2 Add `useOperationPauseReason` hook (or extend 10.1) to fetch `get_pause_reason` for paused operations
     - _Requirements: 7.3_
 
-  - [~] 10.3 Update UI controls (`StartGame`, `Reveal`, `CashOut`, `ContinueStreak` buttons/components) to consume pause status
+  - [ ] 10.3 Update UI controls (`StartGame`, `Reveal`, `CashOut`, `ContinueStreak` buttons/components) to consume pause status
     - Disable the control and display a human-readable unavailability message when the corresponding flag is `true`
     - Display the reason string alongside the disabled control when non-empty
     - _Requirements: 7.2, 7.3_
 
-  - [~] 10.4 Handle `Error::ContractPaused` returned from a submitted transaction
+  - [ ] 10.4 Handle `Error::ContractPaused` returned from a submitted transaction
     - Display an informative error message
     - Do not retry automatically
     - _Requirements: 7.5_
 
-- [~] 11. Final checkpoint — Ensure all tests pass
+- [ ] 11. Final checkpoint — Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes
