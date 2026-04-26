@@ -125,6 +125,21 @@ pub mod error_codes {
     pub const VARIANT_COUNT: usize = 19;
 }
 
+/// Role-based access control for admin operations.
+///
+/// Defines three permission levels:
+/// - `Owner`: Full control (can manage roles, update all config)
+/// - `Admin`: Can pause/unpause, update treasury, set fees
+/// - `Operator`: Can only pause/unpause the contract
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Role {
+    Owner = 1,
+    Admin = 2,
+    Operator = 3,
+}
+
 /// Error codes for the coinflip contract.
 ///
 /// Each variant maps to a stable `u32` error code via `#[repr(u32)]`.
