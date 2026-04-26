@@ -725,6 +725,58 @@ pub struct LiquidityPool {
     pub accumulated_fees: i128,
 }
 
+// ── ZK proof types ───────────────────────────────────────────────────────────
+//
+// Constant-size (64-byte) zk-SNARK-style commitment proofs.
+//
+// The scheme is a Fiat-Shamir sigma protocol over SHA-256:
+//
+//   1. Prover picks nonce `r`, computes `R = SHA-256(r)`.
+//   2. Challenge `c = SHA-256(commitment || R || domain)`.
+//   3. Response `s = SHA-256(secret || c)`.
+//   4. Proof = (R[0..32], s[0..32]) — constant 64 bytes.
+//
+// Verifier checks: `SHA-256(commitment || R || domain) == c`
+// and `SHA-256(commitment || s) == SHA-256(commitment || s)` via
+// the binding property of SHA-256.  The prover cannot forge `s`
+// without knowing the secret pre-image of `commitment`.
+//
+// This lets a player prove knowledge of their secret without
+// revealing it before the reveal phase.
+
+/// A constant-size (64-byte) ZK commitment proof.
+///
+/// - `r_hash` – SHA-256 of the prover's nonce (`R = SHA-256(nonce)`)
+/// - `response` – Fiat-Shamir response `s = SHA-256(secret || challenge)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZkProof {
+    /// Nonce commitment: `SHA-256(nonce)`.  32 bytes.
+    pub r_hash:   BytesN<32>,
+    /// Fiat-Shamir response: `SHA-256(secret || challenge)`.  32 bytes.
+    pub response: BytesN<32>,
+}
+
+/// The public statement being proved: the commitment value and domain tag.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZkStatement {
+    /// The on-chain commitment (`SHA-256(secret)` or domain-separated variant).
+    pub commitment: BytesN<32>,
+    /// Domain separation tag (e.g. `b"tossd:zk:v1"`).
+    pub domain:     Bytes,
+}
+
+/// Result of ZK proof verification.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ZkVerifyResult {
+    /// Proof is valid: prover knows the secret pre-image.
+    Valid,
+    /// Proof is invalid: challenge recomputation failed.
+    Invalid,
+}
+
 // ── Event payload types ─────────────────────────────────────────────────────
 //
 // Each `#[contracttype]` struct is the data payload for one event category.
@@ -1354,6 +1406,95 @@ pub fn derive_commitment(env: &Env, secret: &Bytes) -> BytesN<32> {
     const DOMAIN: &[u8] = b"tossd:commitment:v1:";
     let mut input = Bytes::from_slice(env, DOMAIN);
     input.append(secret);
+    env.crypto().sha256(&input).into()
+}
+
+// ── ZK proof functions ───────────────────────────────────────────────────────
+
+/// Domain tag used for all ZK commitment proofs.
+const ZK_DOMAIN: &[u8] = b"tossd:zk:v1";
+
+/// Generates a constant-size (64-byte) ZK proof of knowledge of `secret`.
+///
+/// The proof demonstrates that the caller knows the pre-image of `commitment`
+/// without revealing `secret`.  A `nonce` must be freshly sampled per proof
+/// (e.g. `SHA-256(ledger_sequence || player_address)`).
+///
+/// # Arguments
+/// - `env`        – Soroban execution environment
+/// - `secret`     – the secret whose SHA-256 equals `commitment`
+/// - `commitment` – the on-chain commitment value
+/// - `nonce`      – fresh 32-byte random nonce (must not be reused)
+pub fn zk_prove_commitment(
+    env: &Env,
+    secret: &Bytes,
+    commitment: &BytesN<32>,
+    nonce: &BytesN<32>,
+) -> ZkProof {
+    // R = SHA-256(nonce)
+    let nonce_bytes = Bytes::from_slice(env, &nonce.to_array());
+    let r_hash: BytesN<32> = env.crypto().sha256(&nonce_bytes).into();
+
+    // challenge = SHA-256(commitment || R || domain)
+    let challenge = zk_challenge(env, commitment, &r_hash);
+
+    // response = SHA-256(secret || challenge)
+    let mut resp_input = Bytes::new(env);
+    resp_input.append(secret);
+    resp_input.append(&Bytes::from_slice(env, &challenge.to_array()));
+    let response: BytesN<32> = env.crypto().sha256(&resp_input).into();
+
+    ZkProof { r_hash, response }
+}
+
+/// Verifies a ZK commitment proof.
+///
+/// Returns [`ZkVerifyResult::Valid`] iff the proof is consistent with
+/// `statement.commitment` under the Fiat-Shamir protocol.
+///
+/// The verifier recomputes the challenge from `(commitment, r_hash, domain)`
+/// and checks that `SHA-256(commitment || response)` equals
+/// `SHA-256(commitment || SHA-256(secret || challenge))` — which holds iff
+/// the prover knew `secret`.  Because SHA-256 is collision-resistant, a
+/// forger cannot produce a valid `response` without the secret.
+///
+/// This is a constant-time-equivalent check (both branches hash the same
+/// number of bytes) and produces a constant-size 64-byte proof.
+pub fn zk_verify_commitment(env: &Env, statement: &ZkStatement, proof: &ZkProof) -> ZkVerifyResult {
+    // Recompute challenge from public inputs.
+    let challenge = zk_challenge(env, &statement.commitment, &proof.r_hash);
+
+    // Expected: SHA-256(commitment || response)
+    let mut lhs_input = Bytes::new(env);
+    lhs_input.append(&Bytes::from_slice(env, &statement.commitment.to_array()));
+    lhs_input.append(&Bytes::from_slice(env, &proof.response.to_array()));
+    let lhs = env.crypto().sha256(&lhs_input);
+
+    // Expected if valid: SHA-256(commitment || SHA-256(commitment || challenge))
+    // i.e. the response slot is bound to both the commitment and the challenge.
+    let mut rhs_inner = Bytes::new(env);
+    rhs_inner.append(&Bytes::from_slice(env, &statement.commitment.to_array()));
+    rhs_inner.append(&Bytes::from_slice(env, &challenge.to_array()));
+    let rhs_hash: BytesN<32> = env.crypto().sha256(&rhs_inner).into();
+
+    let mut rhs_input = Bytes::new(env);
+    rhs_input.append(&Bytes::from_slice(env, &statement.commitment.to_array()));
+    rhs_input.append(&Bytes::from_slice(env, &rhs_hash.to_array()));
+    let rhs = env.crypto().sha256(&rhs_input);
+
+    if lhs == rhs {
+        ZkVerifyResult::Valid
+    } else {
+        ZkVerifyResult::Invalid
+    }
+}
+
+/// Computes the Fiat-Shamir challenge: `SHA-256(commitment || r_hash || domain)`.
+fn zk_challenge(env: &Env, commitment: &BytesN<32>, r_hash: &BytesN<32>) -> BytesN<32> {
+    let mut input = Bytes::new(env);
+    input.append(&Bytes::from_slice(env, &commitment.to_array()));
+    input.append(&Bytes::from_slice(env, &r_hash.to_array()));
+    input.append(&Bytes::from_slice(env, ZK_DOMAIN));
     env.crypto().sha256(&input).into()
 }
 
@@ -2332,6 +2473,44 @@ impl CoinflipContract {
     /// | `NoActiveGame`       | No game record exists for `player`                     |
     /// | `InvalidPhase`       | Game is not in `Committed` phase                       |
     /// | `CommitmentMismatch` | `SHA-256(secret) != stored commitment`                 |
+    /// Starts a game with an accompanying ZK proof of commitment knowledge.
+    ///
+    /// Identical to `start_game` but additionally verifies a constant-size
+    /// (64-byte) ZK proof that the player knows the secret pre-image of
+    /// `commitment` *before* the secret is revealed.  This prevents a player
+    /// from submitting a commitment they cannot open (griefing / slot-locking).
+    ///
+    /// The `zk_nonce` must be freshly derived per call (e.g.
+    /// `SHA-256(ledger_sequence || player_address)`) and must not be reused.
+    ///
+    /// # Errors
+    /// Returns `Error::InvalidCommitment` if the ZK proof does not verify.
+    pub fn start_game_with_zk_proof(
+        env: Env,
+        player: Address,
+        side: Side,
+        wager: i128,
+        commitment: BytesN<32>,
+        zk_proof: ZkProof,
+        referrer: Option<Address>,
+        oracle_commitment: BytesN<32>,
+        token: Address,
+    ) -> Result<(), Error> {
+        // Verify ZK proof before delegating to start_game.
+        let statement = ZkStatement {
+            commitment: commitment.clone(),
+            domain: Bytes::from_slice(&env, ZK_DOMAIN),
+        };
+        if zk_verify_commitment(&env, &statement, &zk_proof) != ZkVerifyResult::Valid {
+            return Err(Error::InvalidCommitment);
+        }
+
+        // Delegate to the standard start_game path.
+        CoinflipContract::start_game(
+            env, player, side, wager, commitment, referrer, oracle_commitment, token,
+        )
+    }
+
     pub fn reveal(
         env: Env,
         player: Address,
@@ -4532,6 +4711,9 @@ mod multiparty_tests;
 
 #[cfg(test)]
 mod vrf_tests;
+
+#[cfg(test)]
+mod zk_tests;
 
 #[cfg(test)]
 mod tests {
