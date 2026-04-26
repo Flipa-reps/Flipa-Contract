@@ -696,3 +696,126 @@ fn test_authorization_enforcement_independent_of_pause() {
     let result3 = client.try_set_paused(&admin, &false);
     assert!(result3.is_ok());
 }
+
+// ── Task 8.1: Per-operation pause enforcement ─────────────────────────────────
+
+/// Verify that pausing StartGame causes start_game to return ContractPaused.
+#[test]
+fn test_start_game_operation_paused() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    let reason = Bytes::from_slice(&env, b"maintenance");
+    client.set_operation_paused(&admin, &PausableOperation::StartGame, &true, &reason);
+    let player = Address::generate(&env);
+    let result = client.try_start_game(
+        &player,
+        &Side::Heads,
+        &5_000_000,
+        &make_commitment(&env, 1),
+    );
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+}
+
+/// Verify that pausing Reveal causes reveal to return ContractPaused.
+#[test]
+fn test_reveal_operation_paused() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    let player = Address::generate(&env);
+    // Inject a committed game so reveal has something to act on.
+    inject_game(&env, &contract_id, &player, GamePhase::Committed, 0, 5_000_000);
+    let reason = Bytes::from_slice(&env, b"maintenance");
+    client.set_operation_paused(&admin, &PausableOperation::Reveal, &true, &reason);
+    let secret = make_secret(&env, 1);
+    let result = client.try_reveal(
+        &player,
+        &secret,
+        &BytesN::from_array(&env, &[0u8; 64]),
+    );
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+}
+
+/// Verify that pausing CashOut causes cash_out to return ContractPaused.
+#[test]
+fn test_cash_out_operation_paused() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    let player = Address::generate(&env);
+    inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 5_000_000);
+    let reason = Bytes::from_slice(&env, b"maintenance");
+    client.set_operation_paused(&admin, &PausableOperation::CashOut, &true, &reason);
+    let result = client.try_cash_out(&player);
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+}
+
+/// Verify that pausing ContinueStreak causes continue_streak to return ContractPaused.
+#[test]
+fn test_continue_streak_operation_paused() {
+    let (env, client, contract_id, admin) = setup();
+    fund(&env, &contract_id, 1_000_000_000);
+    let player = Address::generate(&env);
+    inject_game(&env, &contract_id, &player, GamePhase::Revealed, 1, 5_000_000);
+    let reason = Bytes::from_slice(&env, b"maintenance");
+    client.set_operation_paused(&admin, &PausableOperation::ContinueStreak, &true, &reason);
+    let result = client.try_continue_streak(&player, &make_commitment(&env, 42));
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+}
+
+// ── Task 8.2: PauseRecord persistence and get_pause_reason ───────────────────
+
+/// Verify that the reason passed to set_operation_paused is returned by get_pause_reason.
+#[test]
+fn test_pause_reason_stored() {
+    let (env, client, _contract_id, admin) = setup();
+    let reason_bytes = Bytes::from_slice(&env, b"scheduled downtime");
+    client.set_operation_paused(
+        &admin,
+        &PausableOperation::StartGame,
+        &true,
+        &reason_bytes,
+    );
+    let stored = client.get_pause_reason(&PausableOperation::StartGame);
+    assert_eq!(stored, reason_bytes);
+}
+
+/// Verify that get_pause_reason returns empty Bytes when no record exists.
+#[test]
+fn test_pause_reason_empty_default() {
+    let (_env, client, _contract_id, _admin) = setup();
+    let stored = client.get_pause_reason(&PausableOperation::Reveal);
+    assert_eq!(stored.len(), 0);
+}
+
+// ── Task 8.3: PauseAnalytics counters ────────────────────────────────────────
+
+/// Verify pause_count and unpause_count increment correctly.
+#[test]
+fn test_pause_analytics_increments() {
+    let (env, client, _contract_id, admin) = setup();
+    let reason = Bytes::from_slice(&env, b"test");
+    // Pause twice.
+    client.set_operation_paused(&admin, &PausableOperation::CashOut, &true, &reason);
+    client.set_operation_paused(&admin, &PausableOperation::CashOut, &true, &reason);
+    // Unpause once.
+    client.set_operation_paused(&admin, &PausableOperation::CashOut, &false, &reason);
+    let analytics = client.get_pause_analytics(&PausableOperation::CashOut);
+    assert_eq!(analytics.pause_count, 2);
+    assert_eq!(analytics.unpause_count, 1);
+}
+
+/// Verify that get_pause_analytics returns a zeroed struct right after initialize.
+#[test]
+fn test_pause_analytics_zero_at_init() {
+    let (_env, client, _contract_id, _admin) = setup();
+    for op in [
+        PausableOperation::StartGame,
+        PausableOperation::Reveal,
+        PausableOperation::CashOut,
+        PausableOperation::ContinueStreak,
+    ] {
+        let analytics = client.get_pause_analytics(&op);
+        assert_eq!(analytics.pause_count, 0, "pause_count should be 0 for {op:?}");
+        assert_eq!(analytics.unpause_count, 0, "unpause_count should be 0 for {op:?}");
+        assert_eq!(analytics.last_paused_ledger, 0, "last_paused_ledger should be 0 for {op:?}");
+    }
+}

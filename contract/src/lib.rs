@@ -87,6 +87,14 @@ pub mod error_codes {
     pub const INVALID_FEE_PERCENTAGE: u32 = 31;
     pub const INVALID_WAGER_LIMITS: u32 = 32;
     pub const INVALID_MULTIPLIERS: u32 = 33;
+    /// Pause reason string exceeds the 256-byte maximum.
+    pub const INVALID_PAUSE_REASON: u32 = 34;
+
+    // Config versioning errors (35–36)
+    /// Label supplied to a config-mutating entry point exceeds 64 bytes.
+    pub const INVALID_VERSION_LABEL: u32 = 35;
+    /// Requested version_number does not exist in the ConfigHistory store.
+    pub const VERSION_NOT_FOUND: u32 = 36;
 
     // Transfer errors (40)
     pub const TRANSFER_FAILED: u32 = 40;
@@ -718,7 +726,27 @@ pub enum StorageKey {
     MpcSessionCount,
 }
 
-/// Leaderboard entry for a single player.
+/// Aggregate pause statistics for a single [`PausableOperation`].
+///
+/// Stored under [`StorageKey::PauseAnalytics`] and updated on every
+/// `set_operation_paused` call.
+///
+/// Fields:
+/// - `pause_count`        – number of times the flag was set to `true`
+/// - `unpause_count`      – number of times the flag was set to `false`
+/// - `last_paused_ledger` – ledger sequence of the most recent pause action (0 if never paused)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseAnalytics {
+    /// Number of times this operation has been paused.
+    pub pause_count: u64,
+    /// Number of times this operation has been unpaused.
+    pub unpause_count: u64,
+    /// Ledger sequence of the most recent pause action; 0 if never paused.
+    pub last_paused_ledger: u32,
+}
+
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaderboardEntry {
@@ -2137,6 +2165,22 @@ impl CoinflipContract {
             max_wager,
         });
 
+        // Initialise PauseAnalytics to zero for each pausable operation (Requirement 4.6).
+        let zeroed_analytics = PauseAnalytics { pause_count: 0, unpause_count: 0, last_paused_ledger: 0 };
+        for operation in [
+            PausableOperation::StartGame,
+            PausableOperation::Reveal,
+            PausableOperation::CashOut,
+            PausableOperation::ContinueStreak,
+        ] {
+            let key = StorageKey::PauseAnalytics(operation);
+            env.storage().persistent().set(&key, &zeroed_analytics);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+
+        // Snapshot genesis configuration as version 1.
+        Self::snapshot_config(&env, Bytes::new(&env));
+
         Ok(())
     }
     
@@ -2146,6 +2190,49 @@ impl CoinflipContract {
     fn save_config(env: &Env, config: &ContractConfig) {
         env.storage().persistent().set(&StorageKey::Config, config);
         env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Append an immutable snapshot of the current ContractConfig to ConfigHistory.
+    ///
+    /// Called after every successful config write. Evicts the oldest entry when
+    /// the history exceeds MAX_CONFIG_HISTORY (50) entries.
+    fn snapshot_config(env: &Env, label: Bytes) {
+        let config: ContractConfig = env.storage().persistent()
+            .get(&StorageKey::Config).unwrap();
+        let mut history: soroban_sdk::Vec<ConfigVersion> = env.storage().persistent()
+            .get(&StorageKey::ConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+        let next_version = if history.is_empty() {
+            1u32
+        } else {
+            history.last().unwrap().version_number + 1
+        };
+
+        let snapshot = ConfigVersion {
+            version_number: next_version,
+            ledger: env.ledger().sequence(),
+            label,
+            config,
+        };
+
+        history.push_back(snapshot);
+
+        if history.len() > MAX_CONFIG_HISTORY {
+            history.pop_front();
+        }
+
+        env.storage().persistent().set(&StorageKey::ConfigHistory, &history);
+        env.storage().persistent().extend_ttl(&StorageKey::ConfigHistory, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Validate an optional label: None → empty Bytes, Some(b) with len > MAX_LABEL_BYTES → Error.
+    fn validate_label(env: &Env, label: &Option<Bytes>) -> Result<Bytes, Error> {
+        match label {
+            None => Ok(Bytes::new(env)),
+            Some(b) if b.len() > MAX_LABEL_BYTES => Err(Error::InvalidVersionLabel),
+            Some(b) => Ok(b.clone()),
+        }
     }
 
     /// Load the contract configuration. Panics if the contract is not initialized.
@@ -2525,6 +2612,11 @@ impl CoinflipContract {
             return Err(Error::ContractShutdown);
         }
 
+        // Guard 1c: per-operation pause flag for StartGame
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::StartGame)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+
         // Guard 2 & 3: Wager must be within configured bounds [min_wager, max_wager].
         // Uses strict inequalities to ensure inclusive bounds:
         // - Rejects wagers LESS THAN min (strictly below minimum)
@@ -2776,6 +2868,11 @@ impl CoinflipContract {
     ) -> Result<bool, Error> {
         player.require_auth();
 
+        // Guard 0: per-operation pause flag for Reveal
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::Reveal)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+
         // Guard 1: player must have an active game
         let mut game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
@@ -3015,6 +3112,11 @@ impl CoinflipContract {
     ) -> Result<(), Error> {
         player.require_auth();
 
+        // Guard 0: per-operation pause flag for CashOut (covers both cash_out and claim_winnings)
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::CashOut)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+
         let mut game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
 
@@ -3206,6 +3308,11 @@ impl CoinflipContract {
     ) -> Result<i128, Error> {
         player.require_auth();
 
+        // Guard 0: per-operation pause flag for CashOut
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::CashOut)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+
         let game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
 
@@ -3384,6 +3491,11 @@ impl CoinflipContract {
             return Err(Error::ContractShutdown);
         }
 
+        // Guard 0b: per-operation pause flag for ContinueStreak
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::ContinueStreak)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+
         // Guard 1: player must have an active game
         let mut game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
@@ -3498,8 +3610,10 @@ impl CoinflipContract {
     /// - `admin.require_auth()` enforces signed authorization.
     /// - Address equality check (`admin == config.admin`) prevents non-admin callers.
     /// - Only the `paused` flag is mutated; all other config fields are preserved.
-    pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
+    pub fn set_paused(env: Env, admin: Address, paused: bool, label: Option<Bytes>) -> Result<(), Error> {
         admin.require_auth();
+
+        let validated_label = Self::validate_label(&env, &label)?;
 
         let mut config = Self::load_config(&env);
         Self::require_role(&env, &admin, Role::PauseAdmin, &config)?;
@@ -3507,12 +3621,175 @@ impl CoinflipContract {
         config.paused = paused;
         Self::save_config(&env, &config);
 
+        Self::snapshot_config(&env, validated_label);
+
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_paused"),
             admin,
         });
 
         Ok(())
+    }
+
+    /// Pause or unpause a single contract operation (admin-only).
+    ///
+    /// Allows the admin to surgically disable one of the four player-facing
+    /// entry points (`StartGame`, `Reveal`, `CashOut`, `ContinueStreak`)
+    /// without affecting the others.
+    ///
+    /// # Arguments
+    /// - `admin`     – caller address; must authorize and match `config.admin`
+    /// - `operation` – which operation to pause or unpause
+    /// - `paused`    – `true` to pause, `false` to unpause
+    /// - `reason`    – UTF-8 string (≤ 256 bytes) describing why the change is made
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`]       – caller is not the configured admin
+    /// - [`Error::InvalidPauseReason`] – `reason` exceeds 256 bytes
+    ///
+    /// # Security
+    /// - Authorization and validation are checked before any state mutation.
+    /// - On any error, no storage is written and no event is emitted.
+    pub fn set_operation_paused(
+        env: Env,
+        admin: Address,
+        operation: PausableOperation,
+        paused: bool,
+        reason: Bytes,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Guard 1: admin check — no state mutation on failure.
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard 2: reason length — no state mutation on failure.
+        if reason.len() > 256 {
+            return Err(Error::InvalidPauseReason);
+        }
+
+        let current_ledger = env.ledger().sequence();
+
+        // Write the OperationFlag (idempotent).
+        let flag_key = StorageKey::OperationFlag(operation.clone());
+        env.storage().persistent().set(&flag_key, &paused);
+        env.storage().persistent().extend_ttl(&flag_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Append a PauseRecord to the operation's record list.
+        let records_key = StorageKey::PauseRecords(operation.clone());
+        let mut records: soroban_sdk::Vec<PauseRecord> = env
+            .storage()
+            .persistent()
+            .get(&records_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        records.push_back(PauseRecord {
+            operation: operation.clone(),
+            paused,
+            reason: reason.clone(),
+            ledger: current_ledger,
+        });
+        env.storage().persistent().set(&records_key, &records);
+        env.storage().persistent().extend_ttl(&records_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Update PauseAnalytics.
+        let analytics_key = StorageKey::PauseAnalytics(operation.clone());
+        let mut analytics: PauseAnalytics = env
+            .storage()
+            .persistent()
+            .get(&analytics_key)
+            .unwrap_or(PauseAnalytics {
+                pause_count: 0,
+                unpause_count: 0,
+                last_paused_ledger: 0,
+            });
+        if paused {
+            analytics.pause_count = analytics.pause_count.saturating_add(1);
+            analytics.last_paused_ledger = current_ledger;
+        } else {
+            analytics.unpause_count = analytics.unpause_count.saturating_add(1);
+        }
+        env.storage().persistent().set(&analytics_key, &analytics);
+        env.storage().persistent().extend_ttl(&analytics_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Emit pause_changed event.
+        env.events().publish(
+            (symbol_short!("tossd"), Symbol::new(&env, "pause_changed")),
+            (operation, paused, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Query whether a specific operation is currently paused.
+    ///
+    /// Reads [`StorageKey::OperationFlag`] for the given operation from persistent
+    /// storage. Returns `false` if no flag has been set (i.e. the operation is active
+    /// by default). Callable by any address — no authorization required.
+    ///
+    /// # Arguments
+    /// - `env`       – Soroban environment
+    /// - `operation` – the operation to query
+    ///
+    /// # Returns
+    /// `true` if the operation is paused, `false` otherwise.
+    pub fn get_operation_paused(env: Env, operation: PausableOperation) -> bool {
+        let key = StorageKey::OperationFlag(operation);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(false)
+    }
+
+    /// Query the most recent pause reason for a specific operation.
+    ///
+    /// Reads [`StorageKey::PauseRecords`] for the given operation and returns the
+    /// `reason` field from the last record. Returns empty [`Bytes`] if no records
+    /// exist. Callable by any address — no authorization required.
+    ///
+    /// # Arguments
+    /// - `env`       – Soroban environment
+    /// - `operation` – the operation to query
+    ///
+    /// # Returns
+    /// The reason from the most recent [`PauseRecord`], or empty [`Bytes`] if none.
+    pub fn get_pause_reason(env: Env, operation: PausableOperation) -> Bytes {
+        let key = StorageKey::PauseRecords(operation);
+        let records: soroban_sdk::Vec<PauseRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if records.is_empty() {
+            Bytes::new(&env)
+        } else {
+            records.get(records.len() - 1).unwrap().reason
+        }
+    }
+
+    /// Query aggregate pause analytics for a specific operation.
+    ///
+    /// Reads [`StorageKey::PauseAnalytics`] for the given operation. Returns a
+    /// default-zeroed [`PauseAnalytics`] struct if no analytics have been recorded
+    /// yet. Callable by any address — no authorization required.
+    ///
+    /// # Arguments
+    /// - `env`       – Soroban environment
+    /// - `operation` – the operation to query
+    ///
+    /// # Returns
+    /// The current [`PauseAnalytics`] for the operation, or zeroed defaults.
+    pub fn get_pause_analytics(env: Env, operation: PausableOperation) -> PauseAnalytics {
+        let key = StorageKey::PauseAnalytics(operation);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(PauseAnalytics {
+                pause_count: 0,
+                unpause_count: 0,
+                last_paused_ledger: 0,
+            })
     }
 
     /// Enable or disable emergency shutdown mode (admin-only).
@@ -3556,14 +3833,18 @@ impl CoinflipContract {
     /// - Unauthorized callers must not be able to redirect fees.
     /// - On rejection, the entire [`ContractConfig`] remains byte-for-byte unchanged.
     /// - Successful calls mutate only `config.treasury`.
-    pub fn set_treasury(env: Env, admin: Address, treasury: Address) -> Result<(), Error> {
+    pub fn set_treasury(env: Env, admin: Address, treasury: Address, label: Option<Bytes>) -> Result<(), Error> {
         admin.require_auth();
+
+        let validated_label = Self::validate_label(&env, &label)?;
 
         let mut config = Self::load_config(&env);
         Self::require_role(&env, &admin, Role::SuperAdmin, &config)?;
 
         config.treasury = treasury;
         Self::save_config(&env, &config);
+
+        Self::snapshot_config(&env, validated_label);
 
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_treasury"),
@@ -3595,8 +3876,11 @@ impl CoinflipContract {
         admin: Address,
         min_wager: i128,
         max_wager: i128,
+        label: Option<Bytes>,
     ) -> Result<(), Error> {
         admin.require_auth();
+
+        let validated_label = Self::validate_label(&env, &label)?;
 
         let mut config = Self::load_config(&env);
         Self::require_role(&env, &admin, Role::ConfigAdmin, &config)?;
@@ -3608,6 +3892,8 @@ impl CoinflipContract {
         config.min_wager = min_wager;
         config.max_wager = max_wager;
         Self::save_config(&env, &config);
+
+        Self::snapshot_config(&env, validated_label);
 
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_wager_limits"),
@@ -3639,9 +3925,11 @@ impl CoinflipContract {
     /// - Fee changes are forward-only: in-flight games settle using their
     ///   snapshotted `GameState.fee_bps` value.
     /// - Unauthorized callers leave the entire [`ContractConfig`] unchanged.
-    pub fn set_fee(env: Env, admin: Address, fee_bps: u32) -> Result<(), Error> {
+    pub fn set_fee(env: Env, admin: Address, fee_bps: u32, label: Option<Bytes>) -> Result<(), Error> {
         // Guard 1: require admin authorization before touching any state.
         admin.require_auth();
+
+        let validated_label = Self::validate_label(&env, &label)?;
 
         let mut config = Self::load_config(&env);
         Self::require_role(&env, &admin, Role::ConfigAdmin, &config)?;
@@ -3652,6 +3940,8 @@ impl CoinflipContract {
 
         config.fee_bps = fee_bps;
         Self::save_config(&env, &config);
+
+        Self::snapshot_config(&env, validated_label);
 
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_fee"),
@@ -3811,8 +4101,11 @@ impl CoinflipContract {
         streak2: u32,
         streak3: u32,
         streak4_plus: u32,
+        label: Option<Bytes>,
     ) -> Result<(), Error> {
         admin.require_auth();
+
+        let validated_label = Self::validate_label(&env, &label)?;
 
         let mut config = Self::load_config(&env);
         Self::require_role(&env, &admin, Role::ConfigAdmin, &config)?;
@@ -3825,10 +4118,162 @@ impl CoinflipContract {
         config.multipliers = m;
         Self::save_config(&env, &config);
 
+        Self::snapshot_config(&env, validated_label);
+
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_multipliers"),
             admin,
         });
+
+        Ok(())
+    }
+
+    // ── Config versioning query entry points ────────────────────────────────
+
+    /// Return all ConfigVersion entries in ascending version_number order.
+    /// Returns an empty vec when no history exists. No auth required.
+    pub fn list_config_versions(env: Env) -> soroban_sdk::Vec<ConfigVersion> {
+        env.storage().persistent()
+            .get(&StorageKey::ConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Return the ConfigVersion with the given version_number.
+    /// Returns Error::VersionNotFound if no matching entry exists. No auth required.
+    pub fn get_config_version(env: Env, version_number: u32) -> Result<ConfigVersion, Error> {
+        let history: soroban_sdk::Vec<ConfigVersion> = env.storage().persistent()
+            .get(&StorageKey::ConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        for i in 0..history.len() {
+            let entry = history.get(i).unwrap();
+            if entry.version_number == version_number {
+                return Ok(entry);
+            }
+        }
+        Err(Error::VersionNotFound)
+    }
+
+    /// Compare two config versions and return a list of differing fields.
+    /// Returns an empty vec when configs are identical. No auth required.
+    pub fn compare_config_versions(
+        env: Env,
+        version_a: u32,
+        version_b: u32,
+    ) -> Result<soroban_sdk::Vec<ConfigDiffEntry>, Error> {
+        let history: soroban_sdk::Vec<ConfigVersion> = env.storage().persistent()
+            .get(&StorageKey::ConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let mut va_opt: Option<ConfigVersion> = None;
+        let mut vb_opt: Option<ConfigVersion> = None;
+        for i in 0..history.len() {
+            let entry = history.get(i).unwrap();
+            if entry.version_number == version_a {
+                va_opt = Some(entry.clone());
+            }
+            if entry.version_number == version_b {
+                vb_opt = Some(entry.clone());
+            }
+        }
+
+        let va = va_opt.ok_or(Error::VersionNotFound)?;
+        let vb = vb_opt.ok_or(Error::VersionNotFound)?;
+
+        let ca = &va.config;
+        let cb = &vb.config;
+        let mut diffs: soroban_sdk::Vec<ConfigDiffEntry> = soroban_sdk::Vec::new(&env);
+
+        macro_rules! diff_field {
+            ($field:ident, $name:expr) => {
+                let xa = env.to_xdr(ca.$field.clone());
+                let xb = env.to_xdr(cb.$field.clone());
+                if xa != xb {
+                    diffs.push_back(ConfigDiffEntry {
+                        field: Symbol::new(&env, $name),
+                        value_a: xa,
+                        value_b: xb,
+                    });
+                }
+            };
+        }
+
+        diff_field!(fee_bps, "fee_bps");
+        diff_field!(min_wager, "min_wager");
+        diff_field!(max_wager, "max_wager");
+        diff_field!(paused, "paused");
+        diff_field!(shutdown_mode, "shutdown_mode");
+        diff_field!(min_reserve_threshold, "min_reserve_thr");
+
+        Ok(diffs)
+    }
+
+    /// Rollback the live ContractConfig to a prior snapshot (admin-only).
+    ///
+    /// Writes the target config in a single storage operation, then appends
+    /// an audit snapshot with an auto-generated label.
+    pub fn rollback_config(env: Env, admin: Address, version_number: u32) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Find target version.
+        let history: soroban_sdk::Vec<ConfigVersion> = env.storage().persistent()
+            .get(&StorageKey::ConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        let mut target_opt: Option<ConfigVersion> = None;
+        for i in 0..history.len() {
+            let entry = history.get(i).unwrap();
+            if entry.version_number == version_number {
+                target_opt = Some(entry);
+                break;
+            }
+        }
+        let target = target_opt.ok_or(Error::VersionNotFound)?;
+
+        // Write restored config atomically.
+        env.storage().persistent().set(&StorageKey::Config, &target.config);
+        env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Build rollback label.
+        let label_str = soroban_sdk::String::from_str(&env, "rollback to v");
+        let mut label_bytes = Bytes::new(&env);
+        for b in label_str.to_bytes().iter() {
+            label_bytes.push_back(b);
+        }
+        // Append version number digits.
+        let mut n = version_number;
+        if n == 0 {
+            label_bytes.push_back(b'0');
+        } else {
+            let mut digits: [u8; 10] = [0u8; 10];
+            let mut len = 0usize;
+            while n > 0 {
+                digits[len] = (n % 10) as u8 + b'0';
+                n /= 10;
+                len += 1;
+            }
+            for i in (0..len).rev() {
+                label_bytes.push_back(digits[i]);
+            }
+        }
+
+        // Append audit snapshot (this reads the just-written config).
+        Self::snapshot_config(&env, label_bytes);
+
+        // Determine the new version number for the event.
+        let new_history: soroban_sdk::Vec<ConfigVersion> = env.storage().persistent()
+            .get(&StorageKey::ConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        let new_version_number = new_history.last().unwrap().version_number;
+
+        // Emit config_rollback event.
+        env.events().publish(
+            (symbol_short!("tossd"), Symbol::new(&env, "config_rollback")),
+            (version_number, new_version_number),
+        );
 
         Ok(())
     }
@@ -5220,6 +5665,9 @@ impl CoinflipContract {
 
 #[cfg(test)]
 mod arithmetic_tests;
+
+#[cfg(test)]
+mod config_versioning_tests;
 
 #[cfg(test)]
 mod error_tests;
