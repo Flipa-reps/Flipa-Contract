@@ -87,6 +87,8 @@ pub mod error_codes {
     pub const INVALID_FEE_PERCENTAGE: u32 = 31;
     pub const INVALID_WAGER_LIMITS: u32 = 32;
     pub const INVALID_MULTIPLIERS: u32 = 33;
+    /// Pause reason string exceeds the 256-byte maximum.
+    pub const INVALID_PAUSE_REASON: u32 = 34;
 
     // Transfer errors (40)
     pub const TRANSFER_FAILED: u32 = 40;
@@ -295,6 +297,11 @@ pub enum Error {
     /// Returned by: `place_side_bet`.
     /// Code: 53
     SideBetAlreadyPlaced = 53,
+
+    /// Pause reason string exceeds the 256-byte maximum.
+    /// Returned by: `set_operation_paused`.
+    /// Code: 34 — see [`error_codes::INVALID_PAUSE_REASON`]
+    InvalidPauseReason = 34,
 }
 
 /// Optional side bet a player may attach to an active game.
@@ -671,9 +678,75 @@ pub enum StorageKey {
     LiquidityPool,
     /// Per-LP token balance (i128), keyed by provider address.
     LpBalance(Address),
+    /// Per-operation pause flag (bool), keyed by [`PausableOperation`].
+    OperationFlag(PausableOperation),
+    /// Per-operation pause record list ([`Vec<PauseRecord>`]), keyed by [`PausableOperation`].
+    PauseRecords(PausableOperation),
+    /// Per-operation pause analytics ([`PauseAnalytics`]), keyed by [`PausableOperation`].
+    PauseAnalytics(PausableOperation),
 }
 
-/// Leaderboard entry for a single player.
+/// The four player-facing operations that can be independently paused.
+///
+/// Used as a key in [`StorageKey::OperationFlag`], [`StorageKey::PauseRecords`],
+/// and [`StorageKey::PauseAnalytics`] to store per-operation pause state.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PausableOperation {
+    /// The `start_game` entry point.
+    StartGame,
+    /// The `reveal` entry point.
+    Reveal,
+    /// The `cash_out` and `claim_winnings` entry points.
+    CashOut,
+    /// The `continue_streak` entry point.
+    ContinueStreak,
+}
+
+/// An immutable log entry recording a single pause or unpause action.
+///
+/// Written to [`StorageKey::PauseRecords`] on every successful
+/// `set_operation_paused` call.
+///
+/// Fields:
+/// - `operation` – which operation was affected
+/// - `paused`    – the new flag value (`true` = paused, `false` = unpaused)
+/// - `reason`    – UTF-8 string supplied by the admin (≤ 256 bytes)
+/// - `ledger`    – ledger sequence at which the change was made
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseRecord {
+    /// The operation whose flag was changed.
+    pub operation: PausableOperation,
+    /// The new pause flag value.
+    pub paused: bool,
+    /// Human-readable reason supplied by the admin (≤ 256 bytes).
+    pub reason: Bytes,
+    /// Ledger sequence at which this record was written.
+    pub ledger: u32,
+}
+
+/// Aggregate pause statistics for a single [`PausableOperation`].
+///
+/// Stored under [`StorageKey::PauseAnalytics`] and updated on every
+/// `set_operation_paused` call.
+///
+/// Fields:
+/// - `pause_count`        – number of times the flag was set to `true`
+/// - `unpause_count`      – number of times the flag was set to `false`
+/// - `last_paused_ledger` – ledger sequence of the most recent pause action (0 if never paused)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseAnalytics {
+    /// Number of times this operation has been paused.
+    pub pause_count: u64,
+    /// Number of times this operation has been unpaused.
+    pub unpause_count: u64,
+    /// Ledger sequence of the most recent pause action; 0 if never paused.
+    pub last_paused_ledger: u32,
+}
+
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaderboardEntry {
@@ -3075,6 +3148,97 @@ impl CoinflipContract {
             action: Symbol::new(&env, "set_paused"),
             admin,
         });
+
+        Ok(())
+    }
+
+    /// Pause or unpause a single contract operation (admin-only).
+    ///
+    /// Allows the admin to surgically disable one of the four player-facing
+    /// entry points (`StartGame`, `Reveal`, `CashOut`, `ContinueStreak`)
+    /// without affecting the others.
+    ///
+    /// # Arguments
+    /// - `admin`     – caller address; must authorize and match `config.admin`
+    /// - `operation` – which operation to pause or unpause
+    /// - `paused`    – `true` to pause, `false` to unpause
+    /// - `reason`    – UTF-8 string (≤ 256 bytes) describing why the change is made
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`]       – caller is not the configured admin
+    /// - [`Error::InvalidPauseReason`] – `reason` exceeds 256 bytes
+    ///
+    /// # Security
+    /// - Authorization and validation are checked before any state mutation.
+    /// - On any error, no storage is written and no event is emitted.
+    pub fn set_operation_paused(
+        env: Env,
+        admin: Address,
+        operation: PausableOperation,
+        paused: bool,
+        reason: Bytes,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Guard 1: admin check — no state mutation on failure.
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard 2: reason length — no state mutation on failure.
+        if reason.len() > 256 {
+            return Err(Error::InvalidPauseReason);
+        }
+
+        let current_ledger = env.ledger().sequence();
+
+        // Write the OperationFlag (idempotent).
+        let flag_key = StorageKey::OperationFlag(operation.clone());
+        env.storage().persistent().set(&flag_key, &paused);
+        env.storage().persistent().extend_ttl(&flag_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Append a PauseRecord to the operation's record list.
+        let records_key = StorageKey::PauseRecords(operation.clone());
+        let mut records: soroban_sdk::Vec<PauseRecord> = env
+            .storage()
+            .persistent()
+            .get(&records_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        records.push_back(PauseRecord {
+            operation: operation.clone(),
+            paused,
+            reason: reason.clone(),
+            ledger: current_ledger,
+        });
+        env.storage().persistent().set(&records_key, &records);
+        env.storage().persistent().extend_ttl(&records_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Update PauseAnalytics.
+        let analytics_key = StorageKey::PauseAnalytics(operation.clone());
+        let mut analytics: PauseAnalytics = env
+            .storage()
+            .persistent()
+            .get(&analytics_key)
+            .unwrap_or(PauseAnalytics {
+                pause_count: 0,
+                unpause_count: 0,
+                last_paused_ledger: 0,
+            });
+        if paused {
+            analytics.pause_count = analytics.pause_count.saturating_add(1);
+            analytics.last_paused_ledger = current_ledger;
+        } else {
+            analytics.unpause_count = analytics.unpause_count.saturating_add(1);
+        }
+        env.storage().persistent().set(&analytics_key, &analytics);
+        env.storage().persistent().extend_ttl(&analytics_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Emit pause_changed event.
+        env.events().publish(
+            (symbol_short!("tossd"), Symbol::new(&env, "pause_changed")),
+            (operation, paused, reason),
+        );
 
         Ok(())
     }
