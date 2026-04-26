@@ -1812,6 +1812,19 @@ impl CoinflipContract {
             max_wager,
         });
 
+        // Initialise PauseAnalytics to zero for each pausable operation (Requirement 4.6).
+        let zeroed_analytics = PauseAnalytics { pause_count: 0, unpause_count: 0, last_paused_ledger: 0 };
+        for operation in [
+            PausableOperation::StartGame,
+            PausableOperation::Reveal,
+            PausableOperation::CashOut,
+            PausableOperation::ContinueStreak,
+        ] {
+            let key = StorageKey::PauseAnalytics(operation);
+            env.storage().persistent().set(&key, &zeroed_analytics);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+
         Ok(())
     }
     
@@ -2200,6 +2213,11 @@ impl CoinflipContract {
             return Err(Error::ContractShutdown);
         }
 
+        // Guard 1c: per-operation pause flag for StartGame
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::StartGame)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+
         // Guard 2 & 3: Wager must be within configured bounds [min_wager, max_wager].
         // Uses strict inequalities to ensure inclusive bounds:
         // - Rejects wagers LESS THAN min (strictly below minimum)
@@ -2412,6 +2430,11 @@ impl CoinflipContract {
         vrf_proof: BytesN<64>,
     ) -> Result<bool, Error> {
         player.require_auth();
+
+        // Guard 0: per-operation pause flag for Reveal
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::Reveal)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
 
         // Guard 1: player must have an active game
         let mut game = Self::load_player_game(&env, &player)
@@ -2652,6 +2675,11 @@ impl CoinflipContract {
     ) -> Result<(), Error> {
         player.require_auth();
 
+        // Guard 0: per-operation pause flag for CashOut (covers both cash_out and claim_winnings)
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::CashOut)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+
         let mut game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
 
@@ -2843,6 +2871,11 @@ impl CoinflipContract {
     ) -> Result<i128, Error> {
         player.require_auth();
 
+        // Guard 0: per-operation pause flag for CashOut
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::CashOut)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+
         let game = Self::load_player_game(&env, &player)
             .ok_or(Error::NoActiveGame)?;
 
@@ -3019,6 +3052,11 @@ impl CoinflipContract {
         let config = Self::load_config(&env);
         if config.shutdown_mode {
             return Err(Error::ContractShutdown);
+        }
+
+        // Guard 0b: per-operation pause flag for ContinueStreak
+        if env.storage().persistent().get::<StorageKey, bool>(&StorageKey::OperationFlag(PausableOperation::ContinueStreak)).unwrap_or(false) {
+            return Err(Error::ContractPaused);
         }
 
         // Guard 1: player must have an active game
@@ -3241,6 +3279,76 @@ impl CoinflipContract {
         );
 
         Ok(())
+    }
+
+    /// Query whether a specific operation is currently paused.
+    ///
+    /// Reads [`StorageKey::OperationFlag`] for the given operation from persistent
+    /// storage. Returns `false` if no flag has been set (i.e. the operation is active
+    /// by default). Callable by any address — no authorization required.
+    ///
+    /// # Arguments
+    /// - `env`       – Soroban environment
+    /// - `operation` – the operation to query
+    ///
+    /// # Returns
+    /// `true` if the operation is paused, `false` otherwise.
+    pub fn get_operation_paused(env: Env, operation: PausableOperation) -> bool {
+        let key = StorageKey::OperationFlag(operation);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(false)
+    }
+
+    /// Query the most recent pause reason for a specific operation.
+    ///
+    /// Reads [`StorageKey::PauseRecords`] for the given operation and returns the
+    /// `reason` field from the last record. Returns empty [`Bytes`] if no records
+    /// exist. Callable by any address — no authorization required.
+    ///
+    /// # Arguments
+    /// - `env`       – Soroban environment
+    /// - `operation` – the operation to query
+    ///
+    /// # Returns
+    /// The reason from the most recent [`PauseRecord`], or empty [`Bytes`] if none.
+    pub fn get_pause_reason(env: Env, operation: PausableOperation) -> Bytes {
+        let key = StorageKey::PauseRecords(operation);
+        let records: soroban_sdk::Vec<PauseRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if records.is_empty() {
+            Bytes::new(&env)
+        } else {
+            records.get(records.len() - 1).unwrap().reason
+        }
+    }
+
+    /// Query aggregate pause analytics for a specific operation.
+    ///
+    /// Reads [`StorageKey::PauseAnalytics`] for the given operation. Returns a
+    /// default-zeroed [`PauseAnalytics`] struct if no analytics have been recorded
+    /// yet. Callable by any address — no authorization required.
+    ///
+    /// # Arguments
+    /// - `env`       – Soroban environment
+    /// - `operation` – the operation to query
+    ///
+    /// # Returns
+    /// The current [`PauseAnalytics`] for the operation, or zeroed defaults.
+    pub fn get_pause_analytics(env: Env, operation: PausableOperation) -> PauseAnalytics {
+        let key = StorageKey::PauseAnalytics(operation);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(PauseAnalytics {
+                pause_count: 0,
+                unpause_count: 0,
+                last_paused_ledger: 0,
+            })
     }
 
     /// Enable or disable emergency shutdown mode (admin-only).

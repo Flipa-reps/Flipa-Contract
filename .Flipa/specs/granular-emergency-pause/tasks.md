@@ -41,28 +41,28 @@ surfaces per-operation status to players.
     - **Property 3: Any reason string exceeding 256 bytes is rejected without state mutation**
     - **Validates: Requirements 3.3**
 
-- [-] 3. Implement query entry points: `get_operation_paused`, `get_pause_reason`, `get_pause_analytics`
+- [x] 3. Implement query entry points: `get_operation_paused`, `get_pause_reason`, `get_pause_analytics`
   - Add `get_operation_paused(operation) -> bool` — reads `OperationFlag` from storage (default `false`)
   - Add `get_pause_reason(operation) -> String` — returns `PauseReason` from the most recent `PauseRecord`, or empty string if none
   - Add `get_pause_analytics(operation) -> PauseAnalytics` — returns the analytics record (default-initialised to zeros)
   - Ensure all three queries are callable by any address (no access restriction)
   - _Requirements: 1.5, 3.5, 4.4, 6.3_
 
-- [~] 4. Initialise `PauseAnalytics` to zero at contract initialisation
+- [x] 4. Initialise `PauseAnalytics` to zero at contract initialisation
   - In the `initialize` entry point, write a zeroed `PauseAnalytics` record for each of the four `PausableOperation` variants
   - _Requirements: 4.6_
 
-- [~] 5. Enforce per-operation flags in player-facing entry points
-  - [~] 5.1 Guard `start_game`: check `OperationFlag` for `StartGame`; return `Error::ContractPaused` before any state mutation if `true`
+- [x] 5. Enforce per-operation flags in player-facing entry points
+  - [x] 5.1 Guard `start_game`: check `OperationFlag` for `StartGame`; return `Error::ContractPaused` before any state mutation if `true`
     - _Requirements: 2.1_
 
-  - [~] 5.2 Guard `reveal`: check `OperationFlag` for `Reveal`; return `Error::ContractPaused` before phase transition if `true`
+  - [x] 5.2 Guard `reveal`: check `OperationFlag` for `Reveal`; return `Error::ContractPaused` before phase transition if `true`
     - _Requirements: 2.2_
 
-  - [~] 5.3 Guard `cash_out` and `claim_winnings`: check `OperationFlag` for `CashOut`; return `Error::ContractPaused` before fund transfer if `true`
+  - [x] 5.3 Guard `cash_out` and `claim_winnings`: check `OperationFlag` for `CashOut`; return `Error::ContractPaused` before fund transfer if `true`
     - _Requirements: 2.3_
 
-  - [~] 5.4 Guard `continue_streak`: check `OperationFlag` for `ContinueStreak`; return `Error::ContractPaused` before state advance if `true`
+  - [x] 5.4 Guard `continue_streak`: check `OperationFlag` for `ContinueStreak`; return `Error::ContractPaused` before state advance if `true`
     - _Requirements: 2.4_
 
   - [ ]* 5.5 Write property test for independent operation enforcement
@@ -80,7 +80,7 @@ surfaces per-operation status to players.
 - [~] 6. Checkpoint — Ensure all contract tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [~] 7. Preserve backward compatibility with `set_paused`
+- [ ] 7. Preserve backward compatibility with `set_paused`
   - Verify `set_paused(admin, paused)` signature and access-control are unchanged
   - Confirm `set_paused(true)` sets `ContractConfig.paused = true` and that all four entry-point guards treat it as a master override (Requirement 2.6 already covered by task 5.6)
   - Confirm `set_paused(false)` sets `ContractConfig.paused = false` and leaves all four `OperationFlag` values unchanged
