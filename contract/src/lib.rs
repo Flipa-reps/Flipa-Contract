@@ -438,6 +438,8 @@ pub struct GameState {
     /// signs as its VRF proof input.  Computed and stored at `start_game` time so
     /// the oracle cannot change what it signs after seeing the player's secret.
     pub vrf_input: BytesN<32>,
+    /// Token used for this game's wager and payout (snapshotted from the whitelist at start_game).
+    pub token: Address,
 }
 
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
@@ -650,6 +652,10 @@ pub enum StorageKey {
     Jackpot,
     /// Configurable reveal timeout in ledgers (u32).
     RevealTimeout,
+    /// Per-token reserve balance (i128), keyed by token address.
+    TokenReserve(Address),
+    /// Whitelisted token addresses (`Vec<Address>`).
+    TokenWhitelist,
 }
 
 /// Leaderboard entry for a single player.
@@ -2071,6 +2077,7 @@ impl CoinflipContract {
         commitment: BytesN<32>,
         referrer: Option<Address>,
         oracle_commitment: BytesN<32>,
+        token: Address,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -2114,6 +2121,11 @@ impl CoinflipContract {
         }
         if wager > config.max_wager {
             return Err(Error::WagerAboveMaximum);
+        }
+
+        // Guard: token must be whitelisted
+        if !Self::is_token_whitelisted(&env, &token) {
+            return Err(Error::Unauthorized);
         }
 
         // Guard 4: player must not have an active game
@@ -2196,6 +2208,7 @@ impl CoinflipContract {
                 msg.append(&Bytes::from_slice(&env, &contract_random.to_array()));
                 env.crypto().sha256(&msg).into()
             },
+            token: token.clone(),
         };
 
         Self::save_player_game(&env, &player, &game);
@@ -2220,6 +2233,13 @@ impl CoinflipContract {
         stats.total_games = stats.total_games.checked_add(1).unwrap_or(stats.total_games);
         stats.total_volume = stats.total_volume.checked_add(wager).unwrap_or(stats.total_volume);
         Self::save_stats(&env, &stats);
+
+        // Track per-token reserve: credit the wager to the token's reserve bucket.
+        let token_reserve_key = StorageKey::TokenReserve(token.clone());
+        let prev_token_reserve: i128 = env.storage().persistent()
+            .get(&token_reserve_key).unwrap_or(0i128);
+        env.storage().persistent().set(&token_reserve_key, &prev_token_reserve.saturating_add(wager));
+        env.storage().persistent().extend_ttl(&token_reserve_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         Self::emit_game_started(&env, EventGameStarted {
             player,
@@ -2540,7 +2560,7 @@ impl CoinflipContract {
         }
 
         let config = Self::load_config(&env);
-        let token_client = token::Client::new(&env, &config.token);
+        let token_client = token::Client::new(&env, &game.token);
 
         // Single-pass payout breakdown: gross, fee, and net computed together to
         // avoid the duplicate multiplier lookup + two checked_div calls that would
@@ -4160,6 +4180,101 @@ impl CoinflipContract {
         Self::save_player_game(&env, &player, &game);
 
         Ok(())
+    }
+
+    // ── Token whitelist helpers ─────────────────────────────────────────────
+
+    fn load_token_whitelist(env: &Env) -> soroban_sdk::Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::TokenWhitelist)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+    }
+
+    fn save_token_whitelist(env: &Env, list: &soroban_sdk::Vec<Address>) {
+        env.storage().persistent().set(&StorageKey::TokenWhitelist, list);
+        env.storage().persistent().extend_ttl(&StorageKey::TokenWhitelist, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn is_token_whitelisted(env: &Env, token: &Address) -> bool {
+        // The default token in config is always valid.
+        let config = Self::load_config(env);
+        if token == &config.token {
+            return true;
+        }
+        let list = Self::load_token_whitelist(env);
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == *token {
+                return true;
+            }
+        }
+        false
+    }
+
+    // ── Token whitelist public API ──────────────────────────────────────────
+
+    /// Add a token to the whitelist (admin-only).
+    ///
+    /// Whitelisted tokens may be used as wager currency in `start_game`.
+    /// The default `config.token` is always implicitly whitelisted.
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
+    pub fn add_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        let mut list = Self::load_token_whitelist(&env);
+        // Avoid duplicates.
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == token {
+                return Ok(());
+            }
+        }
+        list.push_back(token);
+        Self::save_token_whitelist(&env, &list);
+        Ok(())
+    }
+
+    /// Remove a token from the whitelist (admin-only).
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
+    pub fn remove_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        let list = Self::load_token_whitelist(&env);
+        let mut updated = soroban_sdk::Vec::new(&env);
+        for i in 0..list.len() {
+            let t = list.get(i).unwrap();
+            if t != token {
+                updated.push_back(t);
+            }
+        }
+        Self::save_token_whitelist(&env, &updated);
+        Ok(())
+    }
+
+    /// Return all whitelisted tokens (excluding the default config token).
+    pub fn get_tokens(env: Env) -> soroban_sdk::Vec<Address> {
+        Self::load_token_whitelist(&env)
+    }
+
+    /// Return the per-token reserve balance.
+    ///
+    /// Note: the global `reserve_balance` in [`ContractStats`] aggregates all tokens.
+    /// This query returns the amount tracked specifically for `token` via
+    /// `StorageKey::TokenReserve`.
+    pub fn get_token_reserve(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::TokenReserve(token))
+            .unwrap_or(0i128)
     }
 }
 
