@@ -119,10 +119,13 @@ pub mod error_codes {
     pub const ALREADY_VOTED: u32 = 64;
     pub const QUORUM_NOT_MET: u32 = 65;
 
+    // Batch operation errors (80–82)
+    pub const BATCH_TOO_LARGE: u32 = 80;
+    pub const BATCH_EMPTY: u32 = 81;
+    pub const BATCH_OPERATION_FAILED: u32 = 82;
+
     /// Total number of defined error variants.
-    pub const VARIANT_COUNT: usize = 25;
-    pub const VARIANT_COUNT: usize = 18;
-    pub const VARIANT_COUNT: usize = 19;
+    pub const VARIANT_COUNT: usize = 28;
 }
 
 /// Role-based access control for admin operations.
@@ -295,6 +298,23 @@ pub enum Error {
     /// Returned by: `place_side_bet`.
     /// Code: 53
     SideBetAlreadyPlaced = 53,
+
+    // ── Batch operation errors (80–82) ──────────────────────────────────────
+
+    /// Batch operation exceeds the maximum allowed size.
+    /// Returned by: `batch_reveal`, `batch_cash_out`.
+    /// Code: 80 — see [`error_codes::BATCH_TOO_LARGE`]
+    BatchTooLarge = 80,
+
+    /// Batch operation is empty (no operations to perform).
+    /// Returned by: `batch_reveal`, `batch_cash_out`.
+    /// Code: 81 — see [`error_codes::BATCH_EMPTY`]
+    BatchEmpty = 81,
+
+    /// One or more operations in the batch failed.
+    /// Returned by: `batch_reveal`, `batch_cash_out`.
+    /// Code: 82 — see [`error_codes::BATCH_OPERATION_FAILED`]
+    BatchOperationFailed = 82,
 }
 
 /// Optional side bet a player may attach to an active game.
@@ -314,11 +334,28 @@ pub enum SideBet {
     None,
     ExactStreak(u32),
     Sequence(u32),
-    // ── Governance errors (60–65) ───────────────────────────────────────────
+}
 
-    /// No proposal exists with the given id.
-    /// Code: 60
-    ProposalNotFound = 60,
+/// Input structure for batch reveal operations.
+///
+/// Contains the player address, their secret, and VRF proof for revealing a game.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRevealInput {
+    pub player: Address,
+    pub secret: Bytes,
+    pub vrf_proof: BytesN<64>,
+}
+
+/// Result structure for batch operations.
+///
+/// Contains the player address and the result of the operation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchResult<T> {
+    pub player: Address,
+    pub result: Result<T, Error>,
+}
 
     /// Caller has already cast a vote on this proposal.
     /// Code: 61
@@ -575,6 +612,10 @@ pub struct HistoryEntry {
 /// Maximum number of history entries retained per player.
 /// Older entries are evicted in FIFO order once the cap is reached.
 pub const HISTORY_LIMIT: u32 = 100;
+
+/// Maximum number of operations allowed in a single batch.
+/// This prevents excessive gas consumption and transaction timeouts.
+pub const MAX_BATCH_SIZE: u32 = 20;
 
 /// Batch configuration update payload for [`CoinflipContract::update_config`].
 ///
@@ -4853,6 +4894,327 @@ impl CoinflipContract {
     /// Return the LP token balance for `provider`.
     pub fn get_lp_balance(env: Env, provider: Address) -> i128 {
         Self::load_lp_balance(&env, &provider)
+    }
+
+    /// Batch reveal multiple games in a single transaction.
+    ///
+    /// Processes multiple reveal operations atomically. If any operation fails,
+    /// the entire batch is rolled back. This reduces gas costs by batching
+    /// storage operations and event emissions.
+    ///
+    /// # Arguments
+    /// - `reveals` – vector of reveal inputs, each containing player, secret, and VRF proof
+    ///
+    /// # Returns
+    /// Vector of batch results, each containing the player and the result of their reveal.
+    ///
+    /// # Errors
+    /// - [`Error::BatchTooLarge`] – batch size exceeds [`MAX_BATCH_SIZE`]
+    /// - [`Error::BatchEmpty`] – no reveals provided
+    /// - [`Error::BatchOperationFailed`] – one or more reveals failed
+    pub fn batch_reveal(env: Env, reveals: soroban_sdk::Vec<BatchRevealInput>) -> Result<soroban_sdk::Vec<BatchResult<bool>>, Error> {
+        if reveals.is_empty() {
+            return Err(Error::BatchEmpty);
+        }
+        if reveals.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut validation_errors = soroban_sdk::Vec::new(&env);
+
+        // Pre-validate all operations without state changes
+        for i in 0..reveals.len() {
+            let input = reveals.get(i).unwrap();
+            input.player.require_auth();
+
+            let game = match Self::load_player_game(&env, &input.player) {
+                Some(g) => g,
+                None => {
+                    validation_errors.push_back((i, Error::NoActiveGame));
+                    continue;
+                }
+            };
+
+            // Guard 2: time-lock
+            let earliest_reveal = game.start_ledger.saturating_add(MIN_REVEAL_DELAY_LEDGERS);
+            if env.ledger().sequence() < earliest_reveal {
+                validation_errors.push_back((i, Error::RevealTimeout));
+                continue;
+            }
+
+            // Guard 3: game must be in Committed phase
+            if game.phase != GamePhase::Committed {
+                validation_errors.push_back((i, Error::InvalidPhase));
+                continue;
+            }
+
+            // Guard 4: verify commitment
+            if !verify_commitment(&env, &input.secret, &game.commitment) {
+                validation_errors.push_back((i, Error::CommitmentMismatch));
+                continue;
+            }
+
+            // Guard 5: verify VRF proof
+            let config = Self::load_config(&env);
+            if !verify_vrf_proof(&env, &config.oracle_vrf_pk, &game.vrf_input, &input.vrf_proof) {
+                validation_errors.push_back((i, Error::CommitmentMismatch)); // Reuse error for VRF failure
+                continue;
+            }
+        }
+
+        if !validation_errors.is_empty() {
+            return Err(Error::BatchOperationFailed);
+        }
+
+        // All validations passed, now execute the reveals
+        let mut final_results = soroban_sdk::Vec::new(&env);
+        let mut stats_updated = false;
+        let mut global_stats = Self::load_stats(&env);
+
+        for i in 0..reveals.len() {
+            let input = reveals.get(i).unwrap();
+            let mut game = Self::load_player_game(&env, &input.player).unwrap(); // Should exist
+
+            // Determine outcome
+            let outcome = generate_outcome(&env, &input.secret, &game.contract_random, &input.vrf_proof);
+            let won = outcome == game.side;
+
+            if won {
+                game.streak = game.streak.saturating_add(1);
+                game.phase = GamePhase::Revealed;
+                Self::save_player_game(&env, &input.player, &game);
+
+                Self::emit_game_revealed(&env, EventGameRevealed {
+                    player: input.player,
+                    won: true,
+                    streak: game.streak,
+                    outcome,
+                });
+
+                // Update player stats
+                let mut player_stats = Self::load_player_stats(&env, &input.player);
+                player_stats.wins = player_stats.wins.saturating_add(1);
+                player_stats.current_streak = game.streak;
+                if game.streak > player_stats.max_streak {
+                    player_stats.max_streak = game.streak;
+                }
+                Self::save_player_stats(&env, &input.player, &player_stats);
+
+                final_results.push_back(BatchResult {
+                    player: input.player,
+                    result: Ok(true),
+                });
+            } else {
+                // Loss: credit wager to reserves
+                let forfeited = game.wager.checked_add(game.side_bet_amount).unwrap_or(game.wager);
+                global_stats.reserve_balance = global_stats.reserve_balance.saturating_add(forfeited);
+                stats_updated = true;
+
+                // Save history
+                Self::save_history_entry(&env, &input.player, HistoryEntry {
+                    wager: game.wager,
+                    side: game.side,
+                    outcome,
+                    won: false,
+                    streak: 0,
+                    commitment: game.commitment,
+                    secret: input.secret,
+                    contract_random: game.contract_random,
+                    payout: 0,
+                    ledger: game.start_ledger,
+                    vrf_proof: input.vrf_proof,
+                });
+
+                // Update player stats
+                let mut player_stats = Self::load_player_stats(&env, &input.player);
+                player_stats.losses = player_stats.losses.saturating_add(1);
+                player_stats.current_streak = 0;
+                player_stats.net_winnings = player_stats.net_winnings.saturating_sub(game.wager);
+                Self::save_player_stats(&env, &input.player, &player_stats);
+
+                Self::delete_player_game(&env, &input.player);
+
+                Self::emit_game_revealed(&env, EventGameRevealed {
+                    player: input.player,
+                    won: false,
+                    streak: 0,
+                    outcome,
+                });
+
+                final_results.push_back(BatchResult {
+                    player: input.player,
+                    result: Ok(false),
+                });
+            }
+        }
+
+        // Save global stats once at the end
+        if stats_updated {
+            Self::save_stats(&env, &global_stats);
+        }
+
+        Ok(final_results)
+    }
+
+    /// Batch cash out multiple games in a single transaction.
+    ///
+    /// Processes multiple cash_out operations atomically. If any operation fails,
+    /// the entire batch is rolled back. This reduces gas costs by batching
+    /// storage operations and token transfers.
+    ///
+    /// # Arguments
+    /// - `players` – vector of player addresses to cash out
+    ///
+    /// # Returns
+    /// Vector of batch results, each containing the player and their payout amount.
+    ///
+    /// # Errors
+    /// - [`Error::BatchTooLarge`] – batch size exceeds [`MAX_BATCH_SIZE`]
+    /// - [`Error::BatchEmpty`] – no players provided
+    /// - [`Error::BatchOperationFailed`] – one or more cash outs failed
+    pub fn batch_cash_out(env: Env, players: soroban_sdk::Vec<Address>) -> Result<soroban_sdk::Vec<BatchResult<i128>>, Error> {
+        if players.is_empty() {
+            return Err(Error::BatchEmpty);
+        }
+        if players.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut validation_errors = soroban_sdk::Vec::new(&env);
+
+        // Pre-validate all operations
+        for i in 0..players.len() {
+            let addr = players.get(i).unwrap();
+            addr.require_auth();
+
+            let game = match Self::load_player_game(&env, &addr) {
+                Some(g) => g,
+                None => {
+                    validation_errors.push_back((i, Error::NoActiveGame));
+                    continue;
+                }
+            };
+
+            if game.phase != GamePhase::Revealed {
+                validation_errors.push_back((i, Error::InvalidPhase));
+                continue;
+            }
+
+            if game.streak == 0 {
+                validation_errors.push_back((i, Error::NoWinningsToClaimOrContinue));
+                continue;
+            }
+
+            // Calculate payout to check for errors
+            let multiplier_bps = game.multipliers.for_streak(game.streak) as i128;
+            let gross = game.wager.checked_mul(multiplier_bps)
+                .and_then(|v| v.checked_div(10_000))
+                .ok_or(Error::InsufficientReserves)?;
+            let fee = gross.checked_mul(game.fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .ok_or(Error::InsufficientReserves)?;
+            let net_payout = gross.checked_sub(fee)
+                .ok_or(Error::InsufficientReserves)?;
+
+            let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount)
+                .ok_or(Error::InsufficientReserves)?;
+
+            let _total_payout = net_payout.checked_add(side_bet_payout)
+                .ok_or(Error::InsufficientReserves)?;
+        }
+
+        if !validation_errors.is_empty() {
+            return Err(Error::BatchOperationFailed);
+        }
+
+        // All validations passed, execute the cash outs
+        let config = Self::load_config(&env);
+        let token_client = token::Client::new(&env, &config.token);
+        let mut global_stats = Self::load_stats(&env);
+        let mut final_results = soroban_sdk::Vec::new(&env);
+
+        for i in 0..players.len() {
+            let addr = players.get(i).unwrap();
+            let game = Self::load_player_game(&env, &addr).unwrap(); // Should exist
+
+            // Recalculate payout (already validated)
+            let multiplier_bps = game.multipliers.for_streak(game.streak) as i128;
+            let gross = game.wager.checked_mul(multiplier_bps)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let fee = gross.checked_mul(game.fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap();
+            let net_payout = gross.checked_sub(fee).unwrap();
+
+            let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount).unwrap();
+            let total_payout = net_payout.checked_add(side_bet_payout).unwrap();
+
+            // Update reserves
+            global_stats.reserve_balance = global_stats.reserve_balance
+                .checked_sub(gross)
+                .unwrap();
+            if side_bet_payout > 0 {
+                global_stats.reserve_balance = global_stats.reserve_balance
+                    .checked_sub(side_bet_payout)
+                    .unwrap();
+            } else if game.side_bet_amount > 0 {
+                global_stats.reserve_balance = global_stats.reserve_balance
+                    .checked_add(game.side_bet_amount)
+                    .unwrap();
+            }
+            global_stats.total_fees = global_stats.total_fees
+                .checked_add(fee)
+                .unwrap();
+
+            // Save history
+            Self::save_history_entry(&env, &addr, HistoryEntry {
+                wager: game.wager,
+                side: game.side,
+                outcome: game.side, // won
+                won: true,
+                streak: game.streak,
+                commitment: game.commitment,
+                secret: Bytes::new(&env), // consumed
+                contract_random: game.contract_random,
+                payout: total_payout,
+                ledger: game.start_ledger,
+                vrf_proof: BytesN::from_array(&env, &[0u8; 64]),
+            });
+
+            // Update player stats
+            let mut player_stats = Self::load_player_stats(&env, &addr);
+            player_stats.net_winnings = player_stats.net_winnings.saturating_add(total_payout);
+            Self::save_player_stats(&env, &addr, &player_stats);
+
+            Self::delete_player_game(&env, &addr);
+
+            Self::emit_game_settled(&env, EventGameSettled {
+                player: addr,
+                payout: total_payout,
+                streak: game.streak,
+            });
+
+            final_results.push_back(BatchResult {
+                player: addr,
+                result: Ok(total_payout),
+            });
+        }
+
+        // Save global stats once
+        Self::save_stats(&env, &global_stats);
+
+        // Batch token transfers at the end
+        for result in final_results.iter() {
+            let batch_result = result.unwrap();
+            if let Ok(payout) = batch_result.result {
+                if payout > 0 {
+                    token_client.transfer(&env.current_contract_address(), &batch_result.player, &payout);
+                }
+            }
+        }
+
+        Ok(final_results)
     }
 }
 
