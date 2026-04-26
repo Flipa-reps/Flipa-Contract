@@ -125,6 +125,21 @@ pub mod error_codes {
     pub const VARIANT_COUNT: usize = 19;
 }
 
+/// Role-based access control for admin operations.
+///
+/// Defines three permission levels:
+/// - `Owner`: Full control (can manage roles, update all config)
+/// - `Admin`: Can pause/unpause, update treasury, set fees
+/// - `Operator`: Can only pause/unpause the contract
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Role {
+    Owner = 1,
+    Admin = 2,
+    Operator = 3,
+}
+
 /// Error codes for the coinflip contract.
 ///
 /// Each variant maps to a stable `u32` error code via `#[repr(u32)]`.
@@ -652,10 +667,10 @@ pub enum StorageKey {
     Jackpot,
     /// Configurable reveal timeout in ledgers (u32).
     RevealTimeout,
-    /// Per-token reserve balance (i128), keyed by token address.
-    TokenReserve(Address),
-    /// Whitelisted token addresses (`Vec<Address>`).
-    TokenWhitelist,
+    /// Global AMM liquidity pool state ([`LiquidityPool`]).
+    LiquidityPool,
+    /// Per-LP token balance (i128), keyed by provider address.
+    LpBalance(Address),
 }
 
 /// Leaderboard entry for a single player.
@@ -691,6 +706,23 @@ pub struct ReferralStats {
     pub referrer: Option<Address>,
     pub total_referral_rewards: i128,
     pub referrals_count: u32,
+}
+
+/// AMM liquidity pool state.
+///
+/// Tracks the total token reserves deposited by LPs and the total LP token
+/// supply.  LP tokens represent proportional ownership of the pool.
+///
+/// Invariant: `total_lp_tokens > 0` iff `total_deposits > 0`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityPool {
+    /// Total tokens deposited by all LPs (in stroops).
+    pub total_deposits: i128,
+    /// Total LP tokens minted (1:1 with stroops on first deposit; proportional thereafter).
+    pub total_lp_tokens: i128,
+    /// Accumulated fees allocated to LPs (in stroops); distributed pro-rata on withdrawal.
+    pub accumulated_fees: i128,
 }
 
 // ── Event payload types ─────────────────────────────────────────────────────
@@ -1048,6 +1080,8 @@ const JACKPOT_PAYOUT_PERCENTAGE: u32 = 5_000; // 50% in basis points
 
 /// Referral reward percentage (1% of wager).
 const REFERRAL_REWARD_PERCENTAGE: u32 = 100; // 1% in basis points
+/// Share of protocol fees routed to the LP pool (50% of collected fees).
+const LP_FEE_SHARE_BPS: u32 = 5_000; // 50% in basis points
 /// Minimum number of ledgers that must elapse between `start_game` and `reveal`.
 ///
 /// This time-lock prevents a player from immediately revealing their secret in
@@ -2612,6 +2646,9 @@ impl CoinflipContract {
         }
         stats.total_fees = stats.total_fees.checked_add(fee_amount).unwrap_or(stats.total_fees);
         
+        // Route LP share of fees to the liquidity pool.
+        Self::distribute_fee_to_lp(&env, fee_amount);
+
         // Accumulate jackpot from fees
         let jackpot_accumulation = calculate_jackpot_accumulation(fee_amount).unwrap_or(0);
         let mut jackpot = Self::load_jackpot(&env);
@@ -4182,99 +4219,245 @@ impl CoinflipContract {
         Ok(())
     }
 
-    // ── Token whitelist helpers ─────────────────────────────────────────────
+    // ── AMM liquidity pool helpers ──────────────────────────────────────────
 
-    fn load_token_whitelist(env: &Env) -> soroban_sdk::Vec<Address> {
+    fn load_liquidity_pool(env: &Env) -> LiquidityPool {
         env.storage()
             .persistent()
-            .get(&StorageKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+            .get(&StorageKey::LiquidityPool)
+            .unwrap_or(LiquidityPool {
+                total_deposits: 0,
+                total_lp_tokens: 0,
+                accumulated_fees: 0,
+            })
     }
 
-    fn save_token_whitelist(env: &Env, list: &soroban_sdk::Vec<Address>) {
-        env.storage().persistent().set(&StorageKey::TokenWhitelist, list);
-        env.storage().persistent().extend_ttl(&StorageKey::TokenWhitelist, TTL_THRESHOLD, TTL_EXTEND_TO);
+    fn save_liquidity_pool(env: &Env, pool: &LiquidityPool) {
+        env.storage().persistent().set(&StorageKey::LiquidityPool, pool);
+        env.storage().persistent().extend_ttl(&StorageKey::LiquidityPool, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
-    fn is_token_whitelisted(env: &Env, token: &Address) -> bool {
-        // The default token in config is always valid.
-        let config = Self::load_config(env);
-        if token == &config.token {
-            return true;
+    fn load_lp_balance(env: &Env, provider: &Address) -> i128 {
+        let key = StorageKey::LpBalance(provider.clone());
+        env.storage().persistent().get(&key).unwrap_or(0i128)
+    }
+
+    fn save_lp_balance(env: &Env, provider: &Address, balance: i128) {
+        let key = StorageKey::LpBalance(provider.clone());
+        if balance == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &balance);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
         }
-        let list = Self::load_token_whitelist(env);
-        for i in 0..list.len() {
-            if list.get(i).unwrap() == *token {
-                return true;
-            }
-        }
-        false
     }
 
-    // ── Token whitelist public API ──────────────────────────────────────────
-
-    /// Add a token to the whitelist (admin-only).
+    /// Distribute a share of collected fees to the LP pool.
     ///
-    /// Whitelisted tokens may be used as wager currency in `start_game`.
-    /// The default `config.token` is always implicitly whitelisted.
+    /// Called internally after every fee collection (claim_winnings).
+    /// Routes `LP_FEE_SHARE_BPS / 10_000` of `fee_amount` to `pool.accumulated_fees`.
+    fn distribute_fee_to_lp(env: &Env, fee_amount: i128) {
+        if fee_amount <= 0 {
+            return;
+        }
+        let lp_share = match fee_amount.checked_mul(LP_FEE_SHARE_BPS as i128) {
+            Some(v) => v / 10_000,
+            None => return,
+        };
+        if lp_share <= 0 {
+            return;
+        }
+        let mut pool = Self::load_liquidity_pool(env);
+        pool.accumulated_fees = pool.accumulated_fees.saturating_add(lp_share);
+        Self::save_liquidity_pool(env, &pool);
+    }
+
+    // ── AMM public API ──────────────────────────────────────────────────────
+
+    /// Deposit tokens into the liquidity pool and receive LP tokens.
+    ///
+    /// LP tokens represent proportional ownership of the pool.  On the first
+    /// deposit, LP tokens are minted 1:1 with the deposited amount.  On
+    /// subsequent deposits, LP tokens are minted proportionally to preserve
+    /// existing holders' share:
+    ///
+    /// ```text
+    /// lp_minted = amount * total_lp_tokens / total_deposits
+    /// ```
+    ///
+    /// The deposited tokens are transferred from `provider` to the contract
+    /// and added to `reserve_balance` so they back house payouts.
+    ///
+    /// # Arguments
+    /// - `provider` – must authorize; the address depositing tokens
+    /// - `amount`   – number of stroops to deposit (must be > 0)
+    ///
+    /// # Returns
+    /// `Ok(lp_minted)` — the number of LP tokens minted to `provider`.
     ///
     /// # Errors
-    /// - [`Error::Unauthorized`] – caller is not the configured admin
-    pub fn add_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
-        admin.require_auth();
+    /// - [`Error::InvalidWagerLimits`] – `amount` is zero or negative
+    /// - [`Error::InsufficientReserves`] – arithmetic overflow
+    pub fn deposit_liquidity(env: Env, provider: Address, amount: i128) -> Result<i128, Error> {
+        provider.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::InvalidWagerLimits);
+        }
+
         let config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
+        let token_client = token::Client::new(&env, &config.token);
+
+        let mut pool = Self::load_liquidity_pool(&env);
+
+        // Compute LP tokens to mint.
+        let lp_minted = if pool.total_lp_tokens == 0 || pool.total_deposits == 0 {
+            // First deposit: 1:1 ratio.
+            amount
+        } else {
+            // Proportional mint: preserve existing holders' share.
+            amount
+                .checked_mul(pool.total_lp_tokens)
+                .and_then(|v| v.checked_div(pool.total_deposits))
+                .ok_or(Error::InsufficientReserves)?
+        };
+
+        if lp_minted <= 0 {
+            return Err(Error::InsufficientReserves);
         }
-        let mut list = Self::load_token_whitelist(&env);
-        // Avoid duplicates.
-        for i in 0..list.len() {
-            if list.get(i).unwrap() == token {
-                return Ok(());
-            }
-        }
-        list.push_back(token);
-        Self::save_token_whitelist(&env, &list);
-        Ok(())
+
+        // Transfer tokens from provider to contract.
+        token_client.transfer(&provider, &env.current_contract_address(), &amount);
+
+        // Update pool state.
+        pool.total_deposits = pool.total_deposits.checked_add(amount)
+            .ok_or(Error::InsufficientReserves)?;
+        pool.total_lp_tokens = pool.total_lp_tokens.checked_add(lp_minted)
+            .ok_or(Error::InsufficientReserves)?;
+        Self::save_liquidity_pool(&env, &pool);
+
+        // Credit LP balance.
+        let prev = Self::load_lp_balance(&env, &provider);
+        Self::save_lp_balance(&env, &provider, prev.saturating_add(lp_minted));
+
+        // Increase reserve_balance so the house can use the deposited liquidity.
+        let mut stats = Self::load_stats(&env);
+        stats.reserve_balance = stats.reserve_balance.checked_add(amount)
+            .ok_or(Error::InsufficientReserves)?;
+        Self::save_stats(&env, &stats);
+
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("lp_dep")),
+            (provider, amount, lp_minted),
+        );
+
+        Ok(lp_minted)
     }
 
-    /// Remove a token from the whitelist (admin-only).
+    /// Withdraw tokens from the liquidity pool by burning LP tokens.
+    ///
+    /// The provider redeems `lp_amount` LP tokens for a proportional share of
+    /// the pool's deposits **plus** their share of accumulated fees:
+    ///
+    /// ```text
+    /// share_bps      = lp_amount / total_lp_tokens
+    /// token_out      = share_bps * total_deposits
+    /// fee_out        = share_bps * accumulated_fees
+    /// total_out      = token_out + fee_out
+    /// ```
+    ///
+    /// The redeemed tokens are transferred from the contract to `provider`.
+    /// `reserve_balance` is decremented by `token_out` (fees come from the
+    /// separately tracked `accumulated_fees` bucket).
+    ///
+    /// # Arguments
+    /// - `provider`  – must authorize; the address redeeming LP tokens
+    /// - `lp_amount` – number of LP tokens to burn (must be > 0 and ≤ balance)
+    ///
+    /// # Returns
+    /// `Ok(total_out)` — total stroops transferred to `provider`.
     ///
     /// # Errors
-    /// - [`Error::Unauthorized`] – caller is not the configured admin
-    pub fn remove_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
-        admin.require_auth();
+    /// - [`Error::InvalidWagerLimits`]   – `lp_amount` is zero or negative
+    /// - [`Error::NoWinningsToClaimOrContinue`] – provider has no LP tokens or insufficient balance
+    /// - [`Error::InsufficientReserves`] – pool has no deposits or arithmetic overflow
+    pub fn withdraw_liquidity(env: Env, provider: Address, lp_amount: i128) -> Result<i128, Error> {
+        provider.require_auth();
+
+        if lp_amount <= 0 {
+            return Err(Error::InvalidWagerLimits);
+        }
+
+        let lp_balance = Self::load_lp_balance(&env, &provider);
+        if lp_balance < lp_amount {
+            return Err(Error::NoWinningsToClaimOrContinue);
+        }
+
+        let mut pool = Self::load_liquidity_pool(&env);
+        if pool.total_lp_tokens == 0 || pool.total_deposits == 0 {
+            return Err(Error::InsufficientReserves);
+        }
+
+        // Proportional share of deposits.
+        let token_out = lp_amount
+            .checked_mul(pool.total_deposits)
+            .and_then(|v| v.checked_div(pool.total_lp_tokens))
+            .ok_or(Error::InsufficientReserves)?;
+
+        // Proportional share of accumulated fees.
+        let fee_out = lp_amount
+            .checked_mul(pool.accumulated_fees)
+            .and_then(|v| v.checked_div(pool.total_lp_tokens))
+            .ok_or(Error::InsufficientReserves)?;
+
+        let total_out = token_out.checked_add(fee_out)
+            .ok_or(Error::InsufficientReserves)?;
+
+        // Verify reserves can cover the withdrawal.
+        let stats = Self::load_stats(&env);
+        if stats.reserve_balance < token_out {
+            return Err(Error::InsufficientReserves);
+        }
+
+        // Update pool state before transfer.
+        pool.total_deposits = pool.total_deposits.checked_sub(token_out)
+            .ok_or(Error::InsufficientReserves)?;
+        pool.accumulated_fees = pool.accumulated_fees.checked_sub(fee_out)
+            .ok_or(Error::InsufficientReserves)?;
+        pool.total_lp_tokens = pool.total_lp_tokens.checked_sub(lp_amount)
+            .ok_or(Error::InsufficientReserves)?;
+        Self::save_liquidity_pool(&env, &pool);
+
+        // Burn LP tokens.
+        Self::save_lp_balance(&env, &provider, lp_balance - lp_amount);
+
+        // Decrement reserve_balance by the principal portion.
+        let mut stats = stats;
+        stats.reserve_balance = stats.reserve_balance.checked_sub(token_out)
+            .ok_or(Error::InsufficientReserves)?;
+        Self::save_stats(&env, &stats);
+
+        // Transfer total_out to provider.
         let config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
-        let list = Self::load_token_whitelist(&env);
-        let mut updated = soroban_sdk::Vec::new(&env);
-        for i in 0..list.len() {
-            let t = list.get(i).unwrap();
-            if t != token {
-                updated.push_back(t);
-            }
-        }
-        Self::save_token_whitelist(&env, &updated);
-        Ok(())
+        let token_client = token::Client::new(&env, &config.token);
+        token_client.transfer(&env.current_contract_address(), &provider, &total_out);
+
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("lp_wdr")),
+            (provider, lp_amount, total_out),
+        );
+
+        Ok(total_out)
     }
 
-    /// Return all whitelisted tokens (excluding the default config token).
-    pub fn get_tokens(env: Env) -> soroban_sdk::Vec<Address> {
-        Self::load_token_whitelist(&env)
+    /// Return the current liquidity pool state.
+    pub fn get_liquidity_pool(env: Env) -> LiquidityPool {
+        Self::load_liquidity_pool(&env)
     }
 
-    /// Return the per-token reserve balance.
-    ///
-    /// Note: the global `reserve_balance` in [`ContractStats`] aggregates all tokens.
-    /// This query returns the amount tracked specifically for `token` via
-    /// `StorageKey::TokenReserve`.
-    pub fn get_token_reserve(env: Env, token: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::TokenReserve(token))
-            .unwrap_or(0i128)
+    /// Return the LP token balance for `provider`.
+    pub fn get_lp_balance(env: Env, provider: Address) -> i128 {
+        Self::load_lp_balance(&env, &provider)
     }
 }
 
