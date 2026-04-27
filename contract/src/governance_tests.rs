@@ -1,6 +1,6 @@
 //! # Governance Tests
 //!
-//! Tests for the proposal/voting/execution lifecycle.
+//! Tests for the proposal/voting/execution lifecycle, including quadratic voting.
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -13,9 +13,27 @@ fn setup(env: &Env) -> (Address, Address, CoinflipContractClient) {
     let client = CoinflipContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
-    let token = Address::generate(env);
+    // Use a real stellar asset contract so token::Client::balance() works.
+    let token = env.register_stellar_asset_contract(admin.clone());
     client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
     (admin, contract_id, client)
+}
+
+fn setup_with_token(env: &Env) -> (Address, Address, Address, CoinflipContractClient) {
+    env.mock_all_auths();
+    let contract_id = env.register(CoinflipContract, ());
+    let client = CoinflipContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    let treasury = Address::generate(env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    client.initialize(&admin, &treasury, &token, &300, &1_000_000, &100_000_000);
+    (admin, contract_id, token, client)
+}
+
+/// Mint `amount` tokens to `addr` using the stellar asset admin.
+fn mint(env: &Env, token: &Address, admin: &Address, addr: &Address, amount: i128) {
+    soroban_sdk::token::StellarAssetClient::new(env, token).mint(addr, &amount);
+    let _ = admin; // admin auth is mocked
 }
 
 fn add_voters(client: &CoinflipContractClient, admin: &Address, voters: &[Address]) {
@@ -225,7 +243,7 @@ fn test_execute_set_fee_applies_change() {
     add_voters(&client, &admin, &voters);
 
     client.propose(&admin, &ProposalAction::SetFee(400));
-    // 2 of 3 vote yes → 66% > 51%
+    // 2 yes, 0 against → votes_for > votes_against → passes
     client.vote(&voters[0], &0, &true);
     client.vote(&voters[1], &0, &true);
 
@@ -331,8 +349,10 @@ fn test_execute_rejects_threshold_not_met() {
     add_voters(&client, &admin, &voters);
 
     client.propose(&admin, &ProposalAction::SetFee(400));
-    // Only 1 of 3 votes yes → 33% < 51%
+    // 1 yes, 2 against → votes_for (1) <= votes_against (2) → threshold not met
     client.vote(&voters[0], &0, &true);
+    client.vote(&voters[1], &0, &false);
+    client.vote(&voters[2], &0, &false);
 
     advance_past_deadline(&env);
     assert_eq!(
@@ -452,4 +472,134 @@ fn test_governance_fee_change_does_not_reprice_active_game() {
         CoinflipContract::load_player_game(&env, &player).unwrap().unwrap()
     });
     assert_eq!(game.fee_bps, 300, "active game fee snapshot must be unchanged");
+}
+
+// ── quadratic voting ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_get_voting_power_returns_zero_for_non_voter() {
+    let env = Env::default();
+    let (_, _, _, client) = setup_with_token(&env);
+    let stranger = Address::generate(&env);
+    assert_eq!(client.get_voting_power(&stranger), 0);
+}
+
+#[test]
+fn test_get_voting_power_returns_one_for_voter_with_no_balance() {
+    let env = Env::default();
+    let (admin, _, _, client) = setup_with_token(&env);
+    let voter = Address::generate(&env);
+    client.add_voter(&admin, &voter);
+    // balance = 0 → isqrt(0).max(1) = 1
+    assert_eq!(client.get_voting_power(&voter), 1);
+}
+
+#[test]
+fn test_get_voting_power_reflects_token_balance() {
+    let env = Env::default();
+    let (admin, _, token, client) = setup_with_token(&env);
+    let voter = Address::generate(&env);
+    client.add_voter(&admin, &voter);
+    // mint 100 tokens → isqrt(100) = 10
+    mint(&env, &token, &admin, &voter, 100);
+    assert_eq!(client.get_voting_power(&voter), 10);
+}
+
+#[test]
+fn test_quadratic_vote_weight_accumulates_correctly() {
+    let env = Env::default();
+    let (admin, _, token, client) = setup_with_token(&env);
+
+    let voter_a = Address::generate(&env);
+    let voter_b = Address::generate(&env);
+    client.add_voter(&admin, &voter_a);
+    client.add_voter(&admin, &voter_b);
+
+    // voter_a: balance 100 → weight 10
+    // voter_b: balance 400 → weight 20
+    mint(&env, &token, &admin, &voter_a, 100);
+    mint(&env, &token, &admin, &voter_b, 400);
+
+    client.propose(&admin, &ProposalAction::SetFee(400));
+    client.vote(&voter_a, &0, &true);
+    client.vote(&voter_b, &0, &true);
+
+    let p = client.get_proposal(&0).unwrap();
+    assert_eq!(p.votes_for, 30);   // 10 + 20
+    assert_eq!(p.votes_against, 0);
+}
+
+#[test]
+fn test_quadratic_large_balance_voter_can_outweigh_many_small_voters() {
+    let env = Env::default();
+    let (admin, _, token, client) = setup_with_token(&env);
+
+    // whale: balance 10_000 → weight 100
+    // 3 minnows: balance 1 each → weight 1 each
+    let whale = Address::generate(&env);
+    let minnows: Vec<Address> = (0..3).map(|_| Address::generate(&env)).collect();
+
+    client.add_voter(&admin, &whale);
+    for m in &minnows { client.add_voter(&admin, m); }
+
+    mint(&env, &token, &admin, &whale, 10_000);
+    for m in &minnows { mint(&env, &token, &admin, m, 1); }
+
+    client.propose(&admin, &ProposalAction::SetFee(400));
+    // whale votes against, minnows vote for
+    client.vote(&whale, &0, &false);
+    for m in &minnows { client.vote(m, &0, &true); }
+
+    let p = client.get_proposal(&0).unwrap();
+    // votes_for = 3 (3 minnows × 1), votes_against = 100 (whale)
+    assert_eq!(p.votes_for, 3);
+    assert_eq!(p.votes_against, 100);
+
+    advance_past_deadline(&env);
+    // votes_for (3) <= votes_against (100) → threshold not met
+    assert_eq!(
+        client.try_execute_proposal(&admin, &0),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+}
+
+#[test]
+fn test_quadratic_execute_passes_when_for_exceeds_against() {
+    let env = Env::default();
+    let (admin, _, token, client) = setup_with_token(&env);
+
+    let voter_a = Address::generate(&env);
+    let voter_b = Address::generate(&env);
+    client.add_voter(&admin, &voter_a);
+    client.add_voter(&admin, &voter_b);
+
+    // voter_a: 10_000 → weight 100 (votes for)
+    // voter_b: 100   → weight 10  (votes against)
+    mint(&env, &token, &admin, &voter_a, 10_000);
+    mint(&env, &token, &admin, &voter_b, 100);
+
+    client.propose(&admin, &ProposalAction::SetFee(400));
+    client.vote(&voter_a, &0, &true);
+    client.vote(&voter_b, &0, &false);
+
+    advance_past_deadline(&env);
+    client.execute_proposal(&admin, &0);
+
+    assert_eq!(client.get_config().fee_bps, 400);
+}
+
+#[test]
+fn test_quadratic_no_votes_fails_threshold() {
+    let env = Env::default();
+    let (admin, _, _, client) = setup_with_token(&env);
+    let voter = Address::generate(&env);
+    client.add_voter(&admin, &voter);
+
+    client.propose(&admin, &ProposalAction::SetFee(400));
+    // No votes cast at all
+    advance_past_deadline(&env);
+    assert_eq!(
+        client.try_execute_proposal(&admin, &0),
+        Err(Ok(Error::ThresholdNotMet))
+    );
 }
