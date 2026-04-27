@@ -184,3 +184,16 @@ fn test_vrf_output_deterministic() {
     let out2 = env.crypto().sha256(&proof_bytes).to_array();
     assert_eq!(out1, out2);
 }
+
+/// verify_vrf_proof panics (aborts tx) when pk is non-zero and proof is invalid.
+#[test]
+#[should_panic]
+fn test_verify_vrf_proof_invalid_proof_panics() {
+    let env = Env::default();
+    // Non-zero pk — any 32-byte value that is not all-zero triggers real verification.
+    let pk    = BytesN::from_array(&env, &[0xABu8; 32]);
+    let input = BytesN::from_array(&env, &[1u8; 32]);
+    // All-zero proof is not a valid Ed25519 signature for this pk/input pair.
+    let proof = BytesN::from_array(&env, &[0u8; 64]);
+    verify_vrf_proof(&env, &pk, &input, &proof);
+}

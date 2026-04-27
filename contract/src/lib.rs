@@ -749,6 +749,78 @@ pub struct PauseAnalytics {
     pub last_paused_ledger: u32,
 }
 
+// ── Config versioning constants ───────────────────────────────────────────────
+
+/// Maximum number of config history snapshots retained. Oldest entry is evicted
+/// when this cap is exceeded.
+pub const MAX_CONFIG_HISTORY: u32 = 50;
+
+/// Maximum byte length for a config version label.
+pub const MAX_LABEL_BYTES: u32 = 64;
+
+/// An immutable snapshot of [`ContractConfig`] captured after every admin write.
+///
+/// Stored in a `Vec<ConfigVersion>` under [`StorageKey::ConfigHistory`].
+/// Enables rollback to any prior configuration and full audit trail.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigVersion {
+    /// Monotonically increasing version counter (starts at 1 on `initialize`).
+    pub version_number: u32,
+    /// Ledger sequence at which this version was written.
+    pub ledger: u32,
+    /// Optional human-readable label (max 64 bytes).
+    pub label: Bytes,
+    /// Full config snapshot at this version.
+    pub config: ContractConfig,
+}
+
+/// A single field difference between two [`ConfigVersion`] snapshots.
+/// Returned by [`CoinflipContract::compare_config_versions`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigDiffEntry {
+    /// Name of the differing field (e.g. `Symbol("fee_bps")`).
+    pub field: Symbol,
+    /// XDR-encoded value from version A.
+    pub value_a: Bytes,
+    /// XDR-encoded value from version B.
+    pub value_b: Bytes,
+}
+
+// ── Fraud detection constants & types ────────────────────────────────────────
+
+/// Maximum games a player may start within a 60-ledger (~5 min) window.
+pub const RATE_LIMIT_MAX_GAMES: u32 = 10;
+/// Sliding window size in ledgers for rate limiting.
+pub const RATE_LIMIT_WINDOW_LEDGERS: u32 = 60;
+/// Consecutive-loss threshold that triggers an anomaly flag.
+pub const ANOMALY_LOSS_STREAK_THRESHOLD: u32 = 20;
+/// Consecutive-win threshold that triggers an anomaly flag (unusually lucky).
+pub const ANOMALY_WIN_STREAK_THRESHOLD: u32 = 8;
+
+/// Per-player rate-limit state stored under [`StorageKey::PlayerRateLimit`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerRateLimit {
+    /// Ledger sequence of the first game in the current window.
+    pub window_start: u32,
+    /// Number of games started in the current window.
+    pub games_in_window: u32,
+}
+
+/// Fraud/anomaly flag stored under [`StorageKey::FraudFlag`].
+///
+/// Set when a player triggers a rate-limit or anomaly threshold.
+/// Admin can query and clear flags via `get_fraud_flag` / `clear_fraud_flag`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudFlag {
+    /// Ledger at which the flag was set.
+    pub flagged_at: u32,
+    /// Short reason code (e.g. `Symbol("rate_limit")`, `Symbol("loss_streak")`).
+    pub reason: Symbol,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2772,6 +2844,9 @@ impl CoinflipContract {
     ) -> Result<(), Error> {
         player.require_auth();
 
+        // Fraud guard: enforce per-player rate limit.
+        Self::check_rate_limit(&env, &player)?;
+
         let config = Self::load_config(&env);
 
         // Guard 1: contract must not be paused or in shutdown mode
@@ -3090,6 +3165,7 @@ impl CoinflipContract {
                 player_stats.max_streak = game.streak;
             }
             Self::save_player_stats(&env, &player, &player_stats);
+            Self::check_anomaly(&env, &player, &player_stats);
             
             Ok(true)
         } else {
@@ -6245,6 +6321,9 @@ mod observability_tests;
 
 #[cfg(test)]
 mod upgrade_migration_tests;
+
+#[cfg(test)]
+mod fraud_detection_tests;
 
 #[cfg(test)]
 mod security_validation_tests;
