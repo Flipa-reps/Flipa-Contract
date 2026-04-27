@@ -5688,6 +5688,9 @@ mod phase_transition_tests;
 mod streak_tests;
 
 #[cfg(test)]
+mod loss_streak_integration_tests;
+
+#[cfg(test)]
 mod ttl_tests;
 
 #[cfg(test)]
