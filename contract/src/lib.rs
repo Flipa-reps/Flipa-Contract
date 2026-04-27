@@ -134,6 +134,22 @@ pub mod error_codes {
 
     /// Total number of defined error variants.
     pub const VARIANT_COUNT: usize = 28;
+
+    // ── #471 Input validation errors (90–92) ─────────────────────────────────
+    pub const INVALID_WAGER_VALUE: u32 = 90;
+    pub const INVALID_SECRET_LENGTH: u32 = 91;
+    pub const INVALID_ADDRESS: u32 = 92;
+
+    // ── #472 Rate limiting errors (93–94) ─────────────────────────────────────
+    pub const RATE_LIMIT_EXCEEDED: u32 = 93;
+    pub const GLOBAL_RATE_LIMIT_EXCEEDED: u32 = 94;
+
+    // ── #470 Multi-sig errors (95–99) ─────────────────────────────────────────
+    pub const MULTISIG_NOT_CONFIGURED: u32 = 95;
+    pub const MULTISIG_ALREADY_APPROVED: u32 = 96;
+    pub const MULTISIG_TIMELOCK_PENDING: u32 = 97;
+    pub const MULTISIG_THRESHOLD_NOT_MET: u32 = 98;
+    pub const MULTISIG_PROPOSAL_NOT_FOUND: u32 = 99;
 }
 
 /// Role-based access control for admin operations.
@@ -323,6 +339,39 @@ pub enum Error {
     /// Returned by: `batch_reveal`, `batch_cash_out`.
     /// Code: 82 — see [`error_codes::BATCH_OPERATION_FAILED`]
     BatchOperationFailed = 82,
+
+    // ── #471 Input validation errors (90–92) ─────────────────────────────────
+    /// Wager value is zero, negative, or overflows i128.
+    /// Code: 90
+    InvalidWagerValue = 90,
+    /// Secret bytes are empty or exceed the maximum allowed length.
+    /// Code: 91
+    InvalidSecretLength = 91,
+
+    // ── #472 Rate limiting errors (93–94) ─────────────────────────────────────
+    /// Per-player rate limit exceeded; caller must wait before retrying.
+    /// Code: 93
+    RateLimitExceeded = 93,
+    /// Global rate limit exceeded; contract is under load, retry later.
+    /// Code: 94
+    GlobalRateLimitExceeded = 94,
+
+    // ── #470 Multi-sig errors (95–99) ─────────────────────────────────────────
+    /// Multi-sig is not configured (no signers set).
+    /// Code: 95
+    MultisigNotConfigured = 95,
+    /// Caller has already approved this proposal.
+    /// Code: 96
+    MultisigAlreadyApproved = 96,
+    /// Timelock period has not yet elapsed.
+    /// Code: 97
+    MultisigTimelockPending = 97,
+    /// Approval threshold not yet met.
+    /// Code: 98
+    MultisigThresholdNotMet = 98,
+    /// Proposal id does not exist.
+    /// Code: 99
+    MultisigProposalNotFound = 99,
 }
 
 /// Optional side bet a player may attach to an active game.
@@ -763,6 +812,160 @@ pub struct LiquidityPool {
     /// Accumulated fees allocated to LPs (in stroops); distributed pro-rata on withdrawal.
     pub accumulated_fees: i128,
 }
+
+// ── #471: Input validation types ─────────────────────────────────────────────
+
+/// Validated wager amount (guaranteed positive and within configured bounds).
+/// Constructed only via [`validate_wager`].
+pub struct ValidatedWager(pub i128);
+
+/// Validated commitment (guaranteed 32 bytes, non-zero, sufficient entropy).
+/// Constructed only via [`validate_commitment`].
+pub struct ValidatedCommitment(pub BytesN<32>);
+
+// ── #472: Rate limiting types ─────────────────────────────────────────────────
+
+/// Per-player rate limit state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitState {
+    /// Number of actions in the current window.
+    pub count: u32,
+    /// Ledger sequence at which the current window started.
+    pub window_start: u32,
+}
+
+/// Global rate limit state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalRateLimit {
+    /// Number of actions in the current window.
+    pub count: u32,
+    /// Ledger sequence at which the current window started.
+    pub window_start: u32,
+}
+
+/// Per-player action limit per window (10 games per ~50 seconds at 5 s/ledger).
+pub const RATE_LIMIT_PER_PLAYER: u32 = 10;
+/// Global action limit per window (1000 games per ~50 seconds).
+pub const RATE_LIMIT_GLOBAL: u32 = 1_000;
+/// Rate limit window size in ledgers (~50 seconds at 5 s/ledger).
+pub const RATE_LIMIT_WINDOW_LEDGERS: u32 = 10;
+
+// ── #473: Security audit log types ───────────────────────────────────────────
+
+/// Category of a security audit event.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AuditEventKind {
+    /// Admin operation (pause, fee change, treasury change, etc.).
+    AdminAction = 0,
+    /// Authentication failure (unauthorized call attempt).
+    AuthFailure = 1,
+    /// Rate limit triggered for a player.
+    RateLimitHit = 2,
+    /// Global rate limit triggered.
+    GlobalRateLimitHit = 3,
+    /// Multi-sig proposal created.
+    MultisigProposed = 4,
+    /// Multi-sig approval added.
+    MultisigApproved = 5,
+    /// Multi-sig proposal executed.
+    MultisigExecuted = 6,
+    /// Input validation failure.
+    ValidationFailure = 7,
+    /// Contract initialized.
+    Initialized = 8,
+}
+
+/// A single immutable audit log entry.
+///
+/// Entries are chained: each entry stores the SHA-256 of the previous entry's
+/// hash, forming a tamper-evident linked list.  Any modification to a past
+/// entry breaks the chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditLogEntry {
+    /// Sequential index (0-based).
+    pub index: u64,
+    /// Ledger sequence at which the event occurred.
+    pub ledger: u32,
+    /// Category of the event.
+    pub kind: AuditEventKind,
+    /// Address of the actor (admin, player, or contract).
+    pub actor: Address,
+    /// Short description symbol (max 9 chars for `symbol_short!`).
+    pub action: Symbol,
+    /// SHA-256 of the previous entry (all-zero for the first entry).
+    pub prev_hash: BytesN<32>,
+    /// SHA-256 of this entry's canonical fields (index || ledger || kind || actor || action || prev_hash).
+    pub entry_hash: BytesN<32>,
+}
+
+/// Maximum number of audit log entries retained on-chain.
+/// Older entries are pruned once this cap is reached (FIFO).
+pub const AUDIT_LOG_MAX_ENTRIES: u64 = 1_000;
+
+// ── #470: Multi-sig admin types ───────────────────────────────────────────────
+
+/// The admin operation a multi-sig proposal requests.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MultisigAction {
+    SetFee(u32),
+    SetWagerLimits(i128, i128),
+    SetPaused(bool),
+    SetTreasury(Address),
+    SetMultipliers(MultiplierConfig),
+    GrantRole(Address, Role),
+    RevokeRole(Address),
+}
+
+/// Lifecycle state of a multi-sig proposal.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MultisigProposalStatus {
+    /// Collecting approvals.
+    Pending,
+    /// Executed after threshold met and timelock elapsed.
+    Executed,
+    /// Canceled by a signer before execution.
+    Canceled,
+}
+
+/// A pending multi-sig admin proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigProposal {
+    pub id: u32,
+    pub proposer: Address,
+    pub action: MultisigAction,
+    /// Ledger at which the proposal was created.
+    pub created_ledger: u32,
+    /// Earliest ledger at which the proposal may be executed (timelock).
+    pub executable_after: u32,
+    /// Number of approvals collected so far.
+    pub approvals: u32,
+    pub status: MultisigProposalStatus,
+}
+
+/// Multi-sig configuration stored under [`StorageKey::MultisigConfig`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    /// Ordered list of authorized signers.
+    pub signers: soroban_sdk::Vec<Address>,
+    /// Minimum approvals required to execute a proposal (M of N).
+    pub threshold: u32,
+    /// Ledgers to wait after threshold is met before execution (~24 h at 5 s/ledger).
+    pub timelock_ledgers: u32,
+}
+
+/// Default timelock: 24 hours at 5 s/ledger.
+pub const MULTISIG_DEFAULT_TIMELOCK: u32 = 17_280;
+/// Maximum number of signers.
+pub const MULTISIG_MAX_SIGNERS: u32 = 10;
 
 // ── MPC (Multi-Party Computation) types ─────────────────────────────────────
 //
@@ -2133,6 +2336,10 @@ impl CoinflipContract {
 
         // Snapshot genesis configuration as version 1.
         Self::snapshot_config(&env, Bytes::new(&env));
+
+        // Write the first audit log entry.
+        let audit_actor = Self::load_config(&env).admin;
+        Self::append_audit_log(&env, AuditEventKind::Initialized, audit_actor, symbol_short!("init"));
 
         Ok(())
     }
@@ -3549,8 +3756,10 @@ impl CoinflipContract {
 
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_paused"),
-            admin,
+            admin: admin.clone(),
         });
+
+        Self::append_audit_log(&env, AuditEventKind::AdminAction, admin, symbol_short!("set_paused"));
 
         Ok(())
     }
@@ -3869,8 +4078,10 @@ impl CoinflipContract {
 
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_fee"),
-            admin,
+            admin: admin.clone(),
         });
+
+        Self::append_audit_log(&env, AuditEventKind::AdminAction, admin, symbol_short!("set_fee"));
 
         Ok(())
     }
@@ -6054,6 +6265,18 @@ mod multiparty_tests;
 
 #[cfg(test)]
 mod vrf_tests;
+
+#[cfg(test)]
+mod input_validation_tests;
+
+#[cfg(test)]
+mod rate_limiting_tests;
+
+#[cfg(test)]
+mod audit_log_tests;
+
+#[cfg(test)]
+mod multisig_tests;
 
 #[cfg(test)]
 mod mpc_tests;
