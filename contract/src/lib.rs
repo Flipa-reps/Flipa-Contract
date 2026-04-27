@@ -5816,6 +5816,9 @@ mod multiplier_tests;
 mod wager_limit_tests;
 
 #[cfg(test)]
+mod wager_fee_edge_tests;
+
+#[cfg(test)]
 mod dynamic_reserve_tests;
 
 #[cfg(test)]
