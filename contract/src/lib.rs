@@ -582,6 +582,40 @@ pub struct ContractStats {
     pub mix_count: u64,
 }
 
+/// Reserve health snapshot returned by [`CoinflipContract::get_reserve_health`].
+///
+/// ## Risk model
+///
+/// The contract partitions reserve levels into four tiers based on the ratio
+/// `reserve / max_worst_case_payout` (where `max_worst_case_payout` is the
+/// streak-4+ multiplier applied to `config.max_wager`):
+///
+/// | Tier     | Ratio (R)       | Dynamic max wager cap |
+/// |----------|-----------------|-----------------------|
+/// | Healthy  | R >= 10         | 100% of config max    |
+/// | Moderate | 5 <= R < 10     | 50% of config max     |
+/// | Low      | 2 <= R < 5      | 20% of config max     |
+/// | Critical | R < 2           | 0 (no new games)      |
+///
+/// The `dynamic_max_wager` is the effective upper bound enforced in
+/// `start_game` in addition to `config.max_wager`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveHealth {
+    /// Current reserve balance in stroops.
+    pub reserve_balance: i128,
+    /// Worst-case single-game payout at `config.max_wager` and streak-4+ multiplier.
+    pub max_worst_case_payout: i128,
+    /// `reserve_balance / max_worst_case_payout` (integer, floored).
+    /// A value of 0 means reserves cannot cover even one max-wager game.
+    pub coverage_ratio: i128,
+    /// Effective maximum wager allowed given current reserve levels.
+    /// May be lower than `config.max_wager` when reserves are stressed.
+    pub dynamic_max_wager: i128,
+    /// Human-readable tier: "healthy", "moderate", "low", or "critical".
+    pub tier: soroban_sdk::String,
+}
+
 /// A single completed game record stored in a player's history ring-buffer.
 ///
 /// Captures the full commit-reveal proof so any past game can be independently
@@ -1272,6 +1306,47 @@ pub fn get_milestone_bonus_bps(streak: u32) -> u32 {
         5 => 500,   // 5% bonus at 5 wins
         _ => 0,     // No bonus for other streaks
     }
+}
+
+/// Compute the dynamic maximum wager given current reserve balance and config.
+///
+/// ## Risk tiers
+///
+/// | Coverage ratio (R = reserve / max_worst_case_payout) | Cap applied to config.max_wager |
+/// |------------------------------------------------------|---------------------------------|
+/// | R >= 10  (Healthy)                                   | 100%                            |
+/// | 5 <= R < 10  (Moderate)                              | 50%                             |
+/// | 2 <= R < 5   (Low)                                   | 20%                             |
+/// | R < 2    (Critical)                                  | 0 (no new games)                |
+///
+/// Returns `(dynamic_max_wager, coverage_ratio, max_worst_case_payout)`.
+pub fn compute_dynamic_max_wager(
+    reserve_balance: i128,
+    config_max_wager: i128,
+    streak4_plus_multiplier_bps: i128,
+) -> (i128, i128, i128) {
+    // Worst-case payout for a single game at max_wager with streak-4+ multiplier.
+    let max_worst_case_payout = config_max_wager
+        .saturating_mul(streak4_plus_multiplier_bps)
+        / 10_000;
+
+    if max_worst_case_payout <= 0 || reserve_balance <= 0 {
+        return (0, 0, max_worst_case_payout);
+    }
+
+    let coverage_ratio = reserve_balance / max_worst_case_payout;
+
+    let dynamic_max = if coverage_ratio >= 10 {
+        config_max_wager
+    } else if coverage_ratio >= 5 {
+        config_max_wager / 2
+    } else if coverage_ratio >= 2 {
+        config_max_wager / 5
+    } else {
+        0
+    };
+
+    (dynamic_max, coverage_ratio, max_worst_case_payout)
 }
 
 /// Calculates the full payout breakdown for a winning streak, including milestone bonuses.
@@ -2675,6 +2750,17 @@ impl CoinflipContract {
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
         if stats.reserve_balance < max_payout {
+            return Err(Error::InsufficientReserves);
+        }
+
+        // Guard 6b: dynamic risk-adjusted wager cap based on reserve health.
+        // Reduces the effective max wager as reserves shrink to maintain solvency.
+        let (dynamic_max, _, _) = compute_dynamic_max_wager(
+            stats.reserve_balance,
+            config.max_wager,
+            config.multipliers.streak4_plus as i128,
+        );
+        if wager > dynamic_max {
             return Err(Error::InsufficientReserves);
         }
 
@@ -4815,6 +4901,54 @@ impl CoinflipContract {
         Self::load_stats(&env)
     }
 
+    /// Return a reserve health snapshot with dynamic risk metrics.
+    ///
+    /// Computes the current coverage ratio and effective maximum wager based on
+    /// the reserve balance relative to the worst-case payout.  See
+    /// [`ReserveHealth`] and [`compute_dynamic_max_wager`] for the risk model.
+    ///
+    /// Read-only; does not require authorization.
+    pub fn get_reserve_health(env: Env) -> ReserveHealth {
+        let config = Self::load_config(&env);
+        let stats = Self::load_stats(&env);
+        let multiplier_bps = config.multipliers.streak4_plus as i128;
+        let (dynamic_max_wager, coverage_ratio, max_worst_case_payout) =
+            compute_dynamic_max_wager(stats.reserve_balance, config.max_wager, multiplier_bps);
+
+        let tier = if coverage_ratio >= 10 {
+            soroban_sdk::String::from_str(&env, "healthy")
+        } else if coverage_ratio >= 5 {
+            soroban_sdk::String::from_str(&env, "moderate")
+        } else if coverage_ratio >= 2 {
+            soroban_sdk::String::from_str(&env, "low")
+        } else {
+            soroban_sdk::String::from_str(&env, "critical")
+        };
+
+        ReserveHealth {
+            reserve_balance: stats.reserve_balance,
+            max_worst_case_payout,
+            coverage_ratio,
+            dynamic_max_wager,
+            tier,
+        }
+    }
+
+    /// Return the effective maximum wager allowed given current reserve levels.
+    ///
+    /// This is the value enforced by the dynamic solvency check in `start_game`.
+    /// It may be lower than `config.max_wager` when reserves are stressed.
+    ///
+    /// Read-only; does not require authorization.
+    pub fn get_dynamic_max_wager(env: Env) -> i128 {
+        let config = Self::load_config(&env);
+        let stats = Self::load_stats(&env);
+        let multiplier_bps = config.multipliers.streak4_plus as i128;
+        let (dynamic_max, _, _) =
+            compute_dynamic_max_wager(stats.reserve_balance, config.max_wager, multiplier_bps);
+        dynamic_max
+    }
+
     /// Return the active game state for `player`, if one exists.
     ///
     /// Read-only; does not require authorization.
@@ -5680,6 +5814,9 @@ mod multiplier_tests;
 
 #[cfg(test)]
 mod wager_limit_tests;
+
+#[cfg(test)]
+mod dynamic_reserve_tests;
 
 #[cfg(test)]
 mod phase_transition_tests;
