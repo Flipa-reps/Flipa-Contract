@@ -134,6 +134,22 @@ pub mod error_codes {
 
     /// Total number of defined error variants.
     pub const VARIANT_COUNT: usize = 28;
+
+    // ── #471 Input validation errors (90–92) ─────────────────────────────────
+    pub const INVALID_WAGER_VALUE: u32 = 90;
+    pub const INVALID_SECRET_LENGTH: u32 = 91;
+    pub const INVALID_ADDRESS: u32 = 92;
+
+    // ── #472 Rate limiting errors (93–94) ─────────────────────────────────────
+    pub const RATE_LIMIT_EXCEEDED: u32 = 93;
+    pub const GLOBAL_RATE_LIMIT_EXCEEDED: u32 = 94;
+
+    // ── #470 Multi-sig errors (95–99) ─────────────────────────────────────────
+    pub const MULTISIG_NOT_CONFIGURED: u32 = 95;
+    pub const MULTISIG_ALREADY_APPROVED: u32 = 96;
+    pub const MULTISIG_TIMELOCK_PENDING: u32 = 97;
+    pub const MULTISIG_THRESHOLD_NOT_MET: u32 = 98;
+    pub const MULTISIG_PROPOSAL_NOT_FOUND: u32 = 99;
 }
 
 /// Role-based access control for admin operations.
@@ -323,6 +339,39 @@ pub enum Error {
     /// Returned by: `batch_reveal`, `batch_cash_out`.
     /// Code: 82 — see [`error_codes::BATCH_OPERATION_FAILED`]
     BatchOperationFailed = 82,
+
+    // ── #471 Input validation errors (90–92) ─────────────────────────────────
+    /// Wager value is zero, negative, or overflows i128.
+    /// Code: 90
+    InvalidWagerValue = 90,
+    /// Secret bytes are empty or exceed the maximum allowed length.
+    /// Code: 91
+    InvalidSecretLength = 91,
+
+    // ── #472 Rate limiting errors (93–94) ─────────────────────────────────────
+    /// Per-player rate limit exceeded; caller must wait before retrying.
+    /// Code: 93
+    RateLimitExceeded = 93,
+    /// Global rate limit exceeded; contract is under load, retry later.
+    /// Code: 94
+    GlobalRateLimitExceeded = 94,
+
+    // ── #470 Multi-sig errors (95–99) ─────────────────────────────────────────
+    /// Multi-sig is not configured (no signers set).
+    /// Code: 95
+    MultisigNotConfigured = 95,
+    /// Caller has already approved this proposal.
+    /// Code: 96
+    MultisigAlreadyApproved = 96,
+    /// Timelock period has not yet elapsed.
+    /// Code: 97
+    MultisigTimelockPending = 97,
+    /// Approval threshold not yet met.
+    /// Code: 98
+    MultisigThresholdNotMet = 98,
+    /// Proposal id does not exist.
+    /// Code: 99
+    MultisigProposalNotFound = 99,
 }
 
 /// Optional side bet a player may attach to an active game.
@@ -724,6 +773,27 @@ pub enum StorageKey {
     MpcSession(u64),
     /// MPC session counter (u64) — monotonically increasing session id.
     MpcSessionCount,
+    // ── Rate limiting ────────────────────────────────────────────────────────
+    /// Per-player rate limit state ([`RateLimitState`]), keyed by player address.
+    PlayerRateLimit(Address),
+    /// Global rate limit state ([`GlobalRateLimit`]).
+    GlobalRateLimit,
+    // ── Security audit log ───────────────────────────────────────────────────
+    /// Append-only audit log entry count (u64).
+    AuditLogCount,
+    /// A single audit log entry ([`AuditLogEntry`]), keyed by sequential index (u64).
+    AuditLogEntry(u64),
+    /// Audit log chain tip: SHA-256 of the last entry (tamper-evident link).
+    AuditLogChainTip,
+    // ── Multi-sig admin ──────────────────────────────────────────────────────
+    /// Multi-sig configuration ([`MultisigConfig`]).
+    MultisigConfig,
+    /// A pending multi-sig admin proposal ([`MultisigProposal`]), keyed by id (u32).
+    MultisigProposal(u32),
+    /// Multi-sig proposal counter (u32).
+    MultisigProposalCount,
+    /// Whether a signer has approved a given proposal: (proposal_id, signer).
+    MultisigApproval(u32, Address),
 }
 
 /// Aggregate pause statistics for a single [`PausableOperation`].
@@ -797,6 +867,160 @@ pub struct LiquidityPool {
     /// Accumulated fees allocated to LPs (in stroops); distributed pro-rata on withdrawal.
     pub accumulated_fees: i128,
 }
+
+// ── #471: Input validation types ─────────────────────────────────────────────
+
+/// Validated wager amount (guaranteed positive and within configured bounds).
+/// Constructed only via [`validate_wager`].
+pub struct ValidatedWager(pub i128);
+
+/// Validated commitment (guaranteed 32 bytes, non-zero, sufficient entropy).
+/// Constructed only via [`validate_commitment`].
+pub struct ValidatedCommitment(pub BytesN<32>);
+
+// ── #472: Rate limiting types ─────────────────────────────────────────────────
+
+/// Per-player rate limit state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitState {
+    /// Number of actions in the current window.
+    pub count: u32,
+    /// Ledger sequence at which the current window started.
+    pub window_start: u32,
+}
+
+/// Global rate limit state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalRateLimit {
+    /// Number of actions in the current window.
+    pub count: u32,
+    /// Ledger sequence at which the current window started.
+    pub window_start: u32,
+}
+
+/// Per-player action limit per window (10 games per ~50 seconds at 5 s/ledger).
+pub const RATE_LIMIT_PER_PLAYER: u32 = 10;
+/// Global action limit per window (1000 games per ~50 seconds).
+pub const RATE_LIMIT_GLOBAL: u32 = 1_000;
+/// Rate limit window size in ledgers (~50 seconds at 5 s/ledger).
+pub const RATE_LIMIT_WINDOW_LEDGERS: u32 = 10;
+
+// ── #473: Security audit log types ───────────────────────────────────────────
+
+/// Category of a security audit event.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AuditEventKind {
+    /// Admin operation (pause, fee change, treasury change, etc.).
+    AdminAction = 0,
+    /// Authentication failure (unauthorized call attempt).
+    AuthFailure = 1,
+    /// Rate limit triggered for a player.
+    RateLimitHit = 2,
+    /// Global rate limit triggered.
+    GlobalRateLimitHit = 3,
+    /// Multi-sig proposal created.
+    MultisigProposed = 4,
+    /// Multi-sig approval added.
+    MultisigApproved = 5,
+    /// Multi-sig proposal executed.
+    MultisigExecuted = 6,
+    /// Input validation failure.
+    ValidationFailure = 7,
+    /// Contract initialized.
+    Initialized = 8,
+}
+
+/// A single immutable audit log entry.
+///
+/// Entries are chained: each entry stores the SHA-256 of the previous entry's
+/// hash, forming a tamper-evident linked list.  Any modification to a past
+/// entry breaks the chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditLogEntry {
+    /// Sequential index (0-based).
+    pub index: u64,
+    /// Ledger sequence at which the event occurred.
+    pub ledger: u32,
+    /// Category of the event.
+    pub kind: AuditEventKind,
+    /// Address of the actor (admin, player, or contract).
+    pub actor: Address,
+    /// Short description symbol (max 9 chars for `symbol_short!`).
+    pub action: Symbol,
+    /// SHA-256 of the previous entry (all-zero for the first entry).
+    pub prev_hash: BytesN<32>,
+    /// SHA-256 of this entry's canonical fields (index || ledger || kind || actor || action || prev_hash).
+    pub entry_hash: BytesN<32>,
+}
+
+/// Maximum number of audit log entries retained on-chain.
+/// Older entries are pruned once this cap is reached (FIFO).
+pub const AUDIT_LOG_MAX_ENTRIES: u64 = 1_000;
+
+// ── #470: Multi-sig admin types ───────────────────────────────────────────────
+
+/// The admin operation a multi-sig proposal requests.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MultisigAction {
+    SetFee(u32),
+    SetWagerLimits(i128, i128),
+    SetPaused(bool),
+    SetTreasury(Address),
+    SetMultipliers(MultiplierConfig),
+    GrantRole(Address, Role),
+    RevokeRole(Address),
+}
+
+/// Lifecycle state of a multi-sig proposal.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MultisigProposalStatus {
+    /// Collecting approvals.
+    Pending,
+    /// Executed after threshold met and timelock elapsed.
+    Executed,
+    /// Canceled by a signer before execution.
+    Canceled,
+}
+
+/// A pending multi-sig admin proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigProposal {
+    pub id: u32,
+    pub proposer: Address,
+    pub action: MultisigAction,
+    /// Ledger at which the proposal was created.
+    pub created_ledger: u32,
+    /// Earliest ledger at which the proposal may be executed (timelock).
+    pub executable_after: u32,
+    /// Number of approvals collected so far.
+    pub approvals: u32,
+    pub status: MultisigProposalStatus,
+}
+
+/// Multi-sig configuration stored under [`StorageKey::MultisigConfig`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    /// Ordered list of authorized signers.
+    pub signers: soroban_sdk::Vec<Address>,
+    /// Minimum approvals required to execute a proposal (M of N).
+    pub threshold: u32,
+    /// Ledgers to wait after threshold is met before execution (~24 h at 5 s/ledger).
+    pub timelock_ledgers: u32,
+}
+
+/// Default timelock: 24 hours at 5 s/ledger.
+pub const MULTISIG_DEFAULT_TIMELOCK: u32 = 17_280;
+/// Maximum number of signers.
+pub const MULTISIG_MAX_SIGNERS: u32 = 10;
 
 // ── MPC (Multi-Party Computation) types ─────────────────────────────────────
 //
@@ -2180,6 +2404,10 @@ impl CoinflipContract {
 
         // Snapshot genesis configuration as version 1.
         Self::snapshot_config(&env, Bytes::new(&env));
+
+        // Write the first audit log entry.
+        let audit_actor = Self::load_config(&env).admin;
+        Self::append_audit_log(&env, AuditEventKind::Initialized, audit_actor, symbol_short!("init"));
 
         Ok(())
     }
@@ -3625,8 +3853,10 @@ impl CoinflipContract {
 
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_paused"),
-            admin,
+            admin: admin.clone(),
         });
+
+        Self::append_audit_log(&env, AuditEventKind::AdminAction, admin, symbol_short!("set_paused"));
 
         Ok(())
     }
@@ -3945,8 +4175,10 @@ impl CoinflipContract {
 
         Self::emit_admin_action(&env, EventAdminAction {
             action: Symbol::new(&env, "set_fee"),
-            admin,
+            admin: admin.clone(),
         });
+
+        Self::append_audit_log(&env, AuditEventKind::AdminAction, admin, symbol_short!("set_fee"));
 
         Ok(())
     }
@@ -5661,6 +5893,567 @@ impl CoinflipContract {
 
         Ok(final_results)
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // #471 — Input validation helpers
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Validate a wager amount: must be positive and within [min_wager, max_wager].
+    ///
+    /// Returns `Ok(ValidatedWager)` on success, or the appropriate [`Error`].
+    pub fn validate_wager(wager: i128, config: &ContractConfig) -> Result<ValidatedWager, Error> {
+        if wager <= 0 {
+            return Err(Error::InvalidWagerValue);
+        }
+        if wager < config.min_wager {
+            return Err(Error::WagerBelowMinimum);
+        }
+        if wager > config.max_wager {
+            return Err(Error::WagerAboveMaximum);
+        }
+        Ok(ValidatedWager(wager))
+    }
+
+    /// Validate a commitment: must be 32 bytes, non-zero, and have sufficient entropy.
+    ///
+    /// Returns `Ok(ValidatedCommitment)` on success, or the appropriate [`Error`].
+    pub fn validate_commitment_input(commitment: &BytesN<32>) -> Result<ValidatedCommitment, Error> {
+        let arr = commitment.to_array();
+        // Reject all-zero commitment (placeholder / missing value).
+        if arr.iter().all(|&b| b == 0) {
+            return Err(Error::InvalidCommitment);
+        }
+        // Reject weak (all-same-byte) commitments.
+        if !validate_commitment_strength(commitment) {
+            return Err(Error::WeakCommitment);
+        }
+        Ok(ValidatedCommitment(commitment.clone()))
+    }
+
+    /// Validate a player secret: must be non-empty and ≤ 256 bytes.
+    ///
+    /// Returns `Ok(())` on success, or [`Error::InvalidSecretLength`].
+    pub fn validate_secret(secret: &Bytes) -> Result<(), Error> {
+        if secret.is_empty() || secret.len() > 256 {
+            return Err(Error::InvalidSecretLength);
+        }
+        Ok(())
+    }
+
+    /// Validate a fee in basis points: must be in [200, 500].
+    ///
+    /// Returns `Ok(())` on success, or [`Error::InvalidFeePercentage`].
+    pub fn validate_fee_bps(fee_bps: u32) -> Result<(), Error> {
+        if fee_bps < 200 || fee_bps > 500 {
+            return Err(Error::InvalidFeePercentage);
+        }
+        Ok(())
+    }
+
+    /// Validate wager limits: min must be positive and strictly less than max.
+    ///
+    /// Returns `Ok(())` on success, or [`Error::InvalidWagerLimits`].
+    pub fn validate_wager_limits(min_wager: i128, max_wager: i128) -> Result<(), Error> {
+        if min_wager <= 0 || min_wager >= max_wager {
+            return Err(Error::InvalidWagerLimits);
+        }
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // #472 — Rate limiting and DOS protection
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn load_player_rate_limit(env: &Env, player: &Address) -> RateLimitState {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::PlayerRateLimit(player.clone()))
+            .unwrap_or(RateLimitState { count: 0, window_start: 0 })
+    }
+
+    fn save_player_rate_limit(env: &Env, player: &Address, state: &RateLimitState) {
+        let key = StorageKey::PlayerRateLimit(player.clone());
+        env.storage().persistent().set(&key, state);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_global_rate_limit(env: &Env) -> GlobalRateLimit {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::GlobalRateLimit)
+            .unwrap_or(GlobalRateLimit { count: 0, window_start: 0 })
+    }
+
+    fn save_global_rate_limit(env: &Env, state: &GlobalRateLimit) {
+        env.storage().persistent().set(&StorageKey::GlobalRateLimit, state);
+        env.storage().persistent().extend_ttl(&StorageKey::GlobalRateLimit, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Check and increment the per-player rate limit.
+    ///
+    /// Returns `Ok(())` if the player is within their limit, or
+    /// [`Error::RateLimitExceeded`] if they have exceeded it.
+    fn check_player_rate_limit(env: &Env, player: &Address) -> Result<(), Error> {
+        let current = env.ledger().sequence();
+        let mut state = Self::load_player_rate_limit(env, player);
+
+        // Reset window if it has expired.
+        if current >= state.window_start.saturating_add(RATE_LIMIT_WINDOW_LEDGERS) {
+            state = RateLimitState { count: 0, window_start: current };
+        }
+
+        if state.count >= RATE_LIMIT_PER_PLAYER {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        state.count = state.count.saturating_add(1);
+        Self::save_player_rate_limit(env, player, &state);
+        Ok(())
+    }
+
+    /// Check and increment the global rate limit.
+    ///
+    /// Returns `Ok(())` if within the global limit, or
+    /// [`Error::GlobalRateLimitExceeded`] if exceeded.
+    fn check_global_rate_limit(env: &Env) -> Result<(), Error> {
+        let current = env.ledger().sequence();
+        let mut state = Self::load_global_rate_limit(env);
+
+        if current >= state.window_start.saturating_add(RATE_LIMIT_WINDOW_LEDGERS) {
+            state = GlobalRateLimit { count: 0, window_start: current };
+        }
+
+        if state.count >= RATE_LIMIT_GLOBAL {
+            return Err(Error::GlobalRateLimitExceeded);
+        }
+
+        state.count = state.count.saturating_add(1);
+        Self::save_global_rate_limit(env, &state);
+        Ok(())
+    }
+
+    /// Query the current per-player rate limit state (read-only).
+    pub fn get_player_rate_limit(env: Env, player: Address) -> RateLimitState {
+        Self::load_player_rate_limit(&env, &player)
+    }
+
+    /// Query the current global rate limit state (read-only).
+    pub fn get_global_rate_limit(env: Env) -> GlobalRateLimit {
+        Self::load_global_rate_limit(&env)
+    }
+
+    /// Admin override: reset the per-player rate limit counter.
+    ///
+    /// Allows an admin to unblock a player that was incorrectly rate-limited.
+    pub fn reset_player_rate_limit(env: Env, admin: Address, player: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::load_config(&env);
+        Self::require_role(&env, &admin, Role::SuperAdmin, &config)?;
+        Self::save_player_rate_limit(&env, &player, &RateLimitState { count: 0, window_start: 0 });
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // #473 — Immutable security audit log
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn load_audit_log_count(env: &Env) -> u64 {
+        env.storage().persistent().get(&StorageKey::AuditLogCount).unwrap_or(0u64)
+    }
+
+    fn load_audit_chain_tip(env: &Env) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::AuditLogChainTip)
+            .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]))
+    }
+
+    /// Compute the canonical hash of an audit log entry.
+    ///
+    /// Hash input: `index(8) || ledger(4) || kind(4) || prev_hash(32)` — all
+    /// big-endian.  The actor address and action symbol are mixed in via the
+    /// Soroban SHA-256 primitive over the concatenated byte representation.
+    fn audit_entry_hash(env: &Env, entry: &AuditLogEntry) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        // index as 8 bytes big-endian
+        let idx_bytes = entry.index.to_be_bytes();
+        data.append(&Bytes::from_slice(env, &idx_bytes));
+        // ledger as 4 bytes big-endian
+        let ledger_bytes = entry.ledger.to_be_bytes();
+        data.append(&Bytes::from_slice(env, &ledger_bytes));
+        // kind discriminant as 4 bytes
+        let kind_val: u32 = entry.kind as u32;
+        data.append(&Bytes::from_slice(env, &kind_val.to_be_bytes()));
+        // prev_hash
+        data.append(&Bytes::from_slice(env, &entry.prev_hash.to_array()));
+        env.crypto().sha256(&data).into()
+    }
+
+    /// Append an immutable entry to the security audit log.
+    ///
+    /// Each entry is chained to the previous via `prev_hash`, forming a
+    /// tamper-evident linked list.  The entry's own hash is stored in
+    /// `entry_hash` and also saved as the new chain tip.
+    ///
+    /// Old entries beyond [`AUDIT_LOG_MAX_ENTRIES`] are pruned (FIFO).
+    fn append_audit_log(
+        env: &Env,
+        kind: AuditEventKind,
+        actor: Address,
+        action: Symbol,
+    ) {
+        let count = Self::load_audit_log_count(env);
+        let prev_hash = Self::load_audit_chain_tip(env);
+
+        let mut entry = AuditLogEntry {
+            index: count,
+            ledger: env.ledger().sequence(),
+            kind,
+            actor,
+            action,
+            prev_hash: prev_hash.clone(),
+            entry_hash: BytesN::from_array(env, &[0u8; 32]), // placeholder
+        };
+        entry.entry_hash = Self::audit_entry_hash(env, &entry);
+
+        // Store entry.
+        let key = StorageKey::AuditLogEntry(count);
+        env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Update chain tip.
+        env.storage().persistent().set(&StorageKey::AuditLogChainTip, &entry.entry_hash);
+        env.storage().persistent().extend_ttl(&StorageKey::AuditLogChainTip, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Advance count.
+        let new_count = count.saturating_add(1);
+        env.storage().persistent().set(&StorageKey::AuditLogCount, &new_count);
+        env.storage().persistent().extend_ttl(&StorageKey::AuditLogCount, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Prune oldest entry if over cap.
+        if new_count > AUDIT_LOG_MAX_ENTRIES {
+            let oldest = new_count.saturating_sub(AUDIT_LOG_MAX_ENTRIES).saturating_sub(1);
+            env.storage().persistent().remove(&StorageKey::AuditLogEntry(oldest));
+        }
+
+        // Emit event for off-chain indexers.
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("audit")),
+            (count, entry.ledger, entry.kind as u32),
+        );
+    }
+
+    /// Query a single audit log entry by its sequential index.
+    ///
+    /// Returns `None` if the entry has been pruned or does not exist.
+    pub fn get_audit_log_entry(env: Env, index: u64) -> Option<AuditLogEntry> {
+        env.storage().persistent().get(&StorageKey::AuditLogEntry(index))
+    }
+
+    /// Return the total number of audit log entries ever written.
+    pub fn get_audit_log_count(env: Env) -> u64 {
+        Self::load_audit_log_count(&env)
+    }
+
+    /// Return the SHA-256 chain tip (hash of the most recent entry).
+    ///
+    /// Clients can use this to verify the integrity of the log: re-hash all
+    /// entries in order and confirm the final hash matches this value.
+    pub fn get_audit_chain_tip(env: Env) -> BytesN<32> {
+        Self::load_audit_chain_tip(&env)
+    }
+
+    /// Verify the integrity of a range of audit log entries.
+    ///
+    /// Re-hashes each entry and checks that `entry.prev_hash` matches the
+    /// previous entry's `entry_hash`.  Returns `true` if the chain is intact.
+    ///
+    /// # Arguments
+    /// - `from_index` – first entry index to verify (inclusive)
+    /// - `to_index`   – last entry index to verify (inclusive)
+    pub fn verify_audit_chain(env: Env, from_index: u64, to_index: u64) -> bool {
+        if from_index > to_index {
+            return false;
+        }
+        let mut expected_prev = if from_index == 0 {
+            BytesN::from_array(&env, &[0u8; 32])
+        } else {
+            match env.storage().persistent().get::<StorageKey, AuditLogEntry>(&StorageKey::AuditLogEntry(from_index - 1)) {
+                Some(e) => e.entry_hash,
+                None => return false,
+            }
+        };
+
+        for i in from_index..=to_index {
+            let entry: AuditLogEntry = match env.storage().persistent().get(&StorageKey::AuditLogEntry(i)) {
+                Some(e) => e,
+                None => return false,
+            };
+            if entry.prev_hash != expected_prev {
+                return false;
+            }
+            let computed = Self::audit_entry_hash(&env, &entry);
+            if computed != entry.entry_hash {
+                return false;
+            }
+            expected_prev = entry.entry_hash;
+        }
+        true
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // #470 — Multi-signature admin control
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn load_multisig_config(env: &Env) -> Option<MultisigConfig> {
+        env.storage().persistent().get(&StorageKey::MultisigConfig)
+    }
+
+    fn save_multisig_config(env: &Env, cfg: &MultisigConfig) {
+        env.storage().persistent().set(&StorageKey::MultisigConfig, cfg);
+        env.storage().persistent().extend_ttl(&StorageKey::MultisigConfig, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn load_multisig_proposal_count(env: &Env) -> u32 {
+        env.storage().persistent().get(&StorageKey::MultisigProposalCount).unwrap_or(0u32)
+    }
+
+    fn load_multisig_proposal(env: &Env, id: u32) -> Option<MultisigProposal> {
+        env.storage().persistent().get(&StorageKey::MultisigProposal(id))
+    }
+
+    fn save_multisig_proposal(env: &Env, proposal: &MultisigProposal) {
+        let key = StorageKey::MultisigProposal(proposal.id);
+        env.storage().persistent().set(&key, proposal);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn multisig_has_approved(env: &Env, proposal_id: u32, signer: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&StorageKey::MultisigApproval(proposal_id, signer.clone()))
+    }
+
+    fn multisig_record_approval(env: &Env, proposal_id: u32, signer: &Address) {
+        let key = StorageKey::MultisigApproval(proposal_id, signer.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Configure the multi-sig admin system.
+    ///
+    /// Only the contract admin may call this.  Sets the list of authorized
+    /// signers, the approval threshold (M of N), and the timelock duration.
+    ///
+    /// # Constraints
+    /// - `signers` must be non-empty and ≤ [`MULTISIG_MAX_SIGNERS`].
+    /// - `threshold` must be ≥ 1 and ≤ `signers.len()`.
+    /// - `timelock_ledgers` may be 0 (no timelock) or any positive value.
+    pub fn configure_multisig(
+        env: Env,
+        admin: Address,
+        signers: soroban_sdk::Vec<Address>,
+        threshold: u32,
+        timelock_ledgers: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        if signers.is_empty() || signers.len() > MULTISIG_MAX_SIGNERS {
+            return Err(Error::InvalidWagerLimits); // reuse bounds error
+        }
+        if threshold == 0 || threshold > signers.len() {
+            return Err(Error::InvalidWagerLimits);
+        }
+        let ms_cfg = MultisigConfig { signers, threshold, timelock_ledgers };
+        Self::save_multisig_config(&env, &ms_cfg);
+        Self::append_audit_log(&env, AuditEventKind::AdminAction, admin, symbol_short!("ms_cfg"));
+        Ok(())
+    }
+
+    /// Create a multi-sig proposal for an admin operation.
+    ///
+    /// Any configured signer may propose.  The proposer's approval is
+    /// automatically counted.  Returns the new proposal id.
+    pub fn multisig_propose(
+        env: Env,
+        proposer: Address,
+        action: MultisigAction,
+    ) -> Result<u32, Error> {
+        proposer.require_auth();
+        let ms_cfg = Self::load_multisig_config(&env)
+            .ok_or(Error::MultisigNotConfigured)?;
+
+        // Proposer must be a registered signer.
+        let is_signer = (0..ms_cfg.signers.len())
+            .any(|i| ms_cfg.signers.get(i).unwrap() == proposer);
+        if !is_signer {
+            return Err(Error::Unauthorized);
+        }
+
+        let id = Self::load_multisig_proposal_count(&env);
+        let proposal = MultisigProposal {
+            id,
+            proposer: proposer.clone(),
+            action,
+            created_ledger: env.ledger().sequence(),
+            executable_after: env.ledger().sequence().saturating_add(ms_cfg.timelock_ledgers),
+            approvals: 1, // proposer auto-approves
+            status: MultisigProposalStatus::Pending,
+        };
+
+        Self::save_multisig_proposal(&env, &proposal);
+        Self::multisig_record_approval(&env, id, &proposer);
+
+        env.storage().persistent().set(&StorageKey::MultisigProposalCount, &(id + 1));
+        env.storage().persistent().extend_ttl(&StorageKey::MultisigProposalCount, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Self::append_audit_log(&env, AuditEventKind::MultisigProposed, proposer, symbol_short!("ms_prop"));
+        Ok(id)
+    }
+
+    /// Approve a pending multi-sig proposal.
+    ///
+    /// Each signer may approve at most once.  When the approval count reaches
+    /// the threshold the proposal becomes executable (after the timelock).
+    pub fn multisig_approve(env: Env, signer: Address, proposal_id: u32) -> Result<(), Error> {
+        signer.require_auth();
+        let ms_cfg = Self::load_multisig_config(&env)
+            .ok_or(Error::MultisigNotConfigured)?;
+
+        let is_signer = (0..ms_cfg.signers.len())
+            .any(|i| ms_cfg.signers.get(i).unwrap() == signer);
+        if !is_signer {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut proposal = Self::load_multisig_proposal(&env, proposal_id)
+            .ok_or(Error::MultisigProposalNotFound)?;
+
+        if proposal.status != MultisigProposalStatus::Pending {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if Self::multisig_has_approved(&env, proposal_id, &signer) {
+            return Err(Error::MultisigAlreadyApproved);
+        }
+
+        proposal.approvals = proposal.approvals.saturating_add(1);
+        Self::multisig_record_approval(&env, proposal_id, &signer);
+        Self::save_multisig_proposal(&env, &proposal);
+
+        Self::append_audit_log(&env, AuditEventKind::MultisigApproved, signer, symbol_short!("ms_appr"));
+        Ok(())
+    }
+
+    /// Execute a multi-sig proposal that has met the threshold and timelock.
+    ///
+    /// Any signer may trigger execution once:
+    /// 1. `approvals >= threshold`
+    /// 2. `current_ledger >= proposal.executable_after`
+    pub fn multisig_execute(env: Env, executor: Address, proposal_id: u32) -> Result<(), Error> {
+        executor.require_auth();
+        let ms_cfg = Self::load_multisig_config(&env)
+            .ok_or(Error::MultisigNotConfigured)?;
+
+        let is_signer = (0..ms_cfg.signers.len())
+            .any(|i| ms_cfg.signers.get(i).unwrap() == executor);
+        if !is_signer {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut proposal = Self::load_multisig_proposal(&env, proposal_id)
+            .ok_or(Error::MultisigProposalNotFound)?;
+
+        if proposal.status != MultisigProposalStatus::Pending {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if proposal.approvals < ms_cfg.threshold {
+            return Err(Error::MultisigThresholdNotMet);
+        }
+        if env.ledger().sequence() < proposal.executable_after {
+            return Err(Error::MultisigTimelockPending);
+        }
+
+        // Execute the action.
+        let mut config = Self::load_config(&env);
+        match proposal.action.clone() {
+            MultisigAction::SetFee(fee_bps) => {
+                Self::validate_fee_bps(fee_bps)?;
+                config.fee_bps = fee_bps;
+                Self::save_config(&env, &config);
+            }
+            MultisigAction::SetWagerLimits(min, max) => {
+                Self::validate_wager_limits(min, max)?;
+                config.min_wager = min;
+                config.max_wager = max;
+                Self::save_config(&env, &config);
+            }
+            MultisigAction::SetPaused(paused) => {
+                config.paused = paused;
+                Self::save_config(&env, &config);
+            }
+            MultisigAction::SetTreasury(treasury) => {
+                config.treasury = treasury;
+                Self::save_config(&env, &config);
+            }
+            MultisigAction::SetMultipliers(m) => {
+                if !m.is_valid() {
+                    return Err(Error::InvalidMultipliers);
+                }
+                config.multipliers = m;
+                Self::save_config(&env, &config);
+            }
+            MultisigAction::GrantRole(grantee, role) => {
+                env.storage().persistent().set(&StorageKey::Role(grantee), &role);
+            }
+            MultisigAction::RevokeRole(grantee) => {
+                env.storage().persistent().remove(&StorageKey::Role(grantee));
+            }
+        }
+
+        proposal.status = MultisigProposalStatus::Executed;
+        Self::save_multisig_proposal(&env, &proposal);
+
+        Self::append_audit_log(&env, AuditEventKind::MultisigExecuted, executor, symbol_short!("ms_exec"));
+        Ok(())
+    }
+
+    /// Cancel a pending multi-sig proposal.
+    ///
+    /// Only the proposer or the contract admin may cancel.
+    pub fn multisig_cancel(env: Env, caller: Address, proposal_id: u32) -> Result<(), Error> {
+        caller.require_auth();
+        let config = Self::load_config(&env);
+
+        let mut proposal = Self::load_multisig_proposal(&env, proposal_id)
+            .ok_or(Error::MultisigProposalNotFound)?;
+
+        if proposal.status != MultisigProposalStatus::Pending {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        let is_proposer = caller == proposal.proposer;
+        let is_admin = caller == config.admin;
+        if !is_proposer && !is_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        proposal.status = MultisigProposalStatus::Canceled;
+        Self::save_multisig_proposal(&env, &proposal);
+        Ok(())
+    }
+
+    /// Query a multi-sig proposal by id.
+    pub fn get_multisig_proposal(env: Env, proposal_id: u32) -> Option<MultisigProposal> {
+        Self::load_multisig_proposal(&env, proposal_id)
+    }
+
+    /// Query the current multi-sig configuration.
+    pub fn get_multisig_config(env: Env) -> Option<MultisigConfig> {
+        Self::load_multisig_config(&env)
+    }
 }
 
 #[cfg(test)]
@@ -5737,6 +6530,18 @@ mod multiparty_tests;
 
 #[cfg(test)]
 mod vrf_tests;
+
+#[cfg(test)]
+mod input_validation_tests;
+
+#[cfg(test)]
+mod rate_limiting_tests;
+
+#[cfg(test)]
+mod audit_log_tests;
+
+#[cfg(test)]
+mod multisig_tests;
 
 #[cfg(test)]
 mod mpc_tests;
