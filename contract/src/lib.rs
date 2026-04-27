@@ -724,6 +724,12 @@ pub enum StorageKey {
     MpcSession(u64),
     /// MPC session counter (u64) — monotonically increasing session id.
     MpcSessionCount,
+    /// Config version history ([`Vec<ConfigVersion>`]).
+    ConfigHistory,
+    /// Per-player rate-limit state ([`PlayerRateLimit`]).
+    PlayerRateLimit(Address),
+    /// Per-player fraud/anomaly flag ([`FraudFlag`]).
+    FraudFlag(Address),
 }
 
 /// Aggregate pause statistics for a single [`PausableOperation`].
@@ -746,6 +752,78 @@ pub struct PauseAnalytics {
     pub last_paused_ledger: u32,
 }
 
+// ── Config versioning constants ───────────────────────────────────────────────
+
+/// Maximum number of config history snapshots retained. Oldest entry is evicted
+/// when this cap is exceeded.
+pub const MAX_CONFIG_HISTORY: u32 = 50;
+
+/// Maximum byte length for a config version label.
+pub const MAX_LABEL_BYTES: u32 = 64;
+
+/// An immutable snapshot of [`ContractConfig`] captured after every admin write.
+///
+/// Stored in a `Vec<ConfigVersion>` under [`StorageKey::ConfigHistory`].
+/// Enables rollback to any prior configuration and full audit trail.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigVersion {
+    /// Monotonically increasing version counter (starts at 1 on `initialize`).
+    pub version_number: u32,
+    /// Ledger sequence at which this version was written.
+    pub ledger: u32,
+    /// Optional human-readable label (max 64 bytes).
+    pub label: Bytes,
+    /// Full config snapshot at this version.
+    pub config: ContractConfig,
+}
+
+/// A single field difference between two [`ConfigVersion`] snapshots.
+/// Returned by [`CoinflipContract::compare_config_versions`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigDiffEntry {
+    /// Name of the differing field (e.g. `Symbol("fee_bps")`).
+    pub field: Symbol,
+    /// XDR-encoded value from version A.
+    pub value_a: Bytes,
+    /// XDR-encoded value from version B.
+    pub value_b: Bytes,
+}
+
+// ── Fraud detection constants & types ────────────────────────────────────────
+
+/// Maximum games a player may start within a 60-ledger (~5 min) window.
+pub const RATE_LIMIT_MAX_GAMES: u32 = 10;
+/// Sliding window size in ledgers for rate limiting.
+pub const RATE_LIMIT_WINDOW_LEDGERS: u32 = 60;
+/// Consecutive-loss threshold that triggers an anomaly flag.
+pub const ANOMALY_LOSS_STREAK_THRESHOLD: u32 = 20;
+/// Consecutive-win threshold that triggers an anomaly flag (unusually lucky).
+pub const ANOMALY_WIN_STREAK_THRESHOLD: u32 = 8;
+
+/// Per-player rate-limit state stored under [`StorageKey::PlayerRateLimit`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerRateLimit {
+    /// Ledger sequence of the first game in the current window.
+    pub window_start: u32,
+    /// Number of games started in the current window.
+    pub games_in_window: u32,
+}
+
+/// Fraud/anomaly flag stored under [`StorageKey::FraudFlag`].
+///
+/// Set when a player triggers a rate-limit or anomaly threshold.
+/// Admin can query and clear flags via `get_fraud_flag` / `clear_fraud_flag`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudFlag {
+    /// Ledger at which the flag was set.
+    pub flagged_at: u32,
+    /// Short reason code (e.g. `Symbol("rate_limit")`, `Symbol("loss_streak")`).
+    pub reason: Symbol,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2600,6 +2678,9 @@ impl CoinflipContract {
     ) -> Result<(), Error> {
         player.require_auth();
 
+        // Fraud guard: enforce per-player rate limit.
+        Self::check_rate_limit(&env, &player)?;
+
         let config = Self::load_config(&env);
 
         // Guard 1: contract must not be paused or in shutdown mode
@@ -2943,6 +3024,7 @@ impl CoinflipContract {
                 player_stats.max_streak = game.streak;
             }
             Self::save_player_stats(&env, &player, &player_stats);
+            Self::check_anomaly(&env, &player, &player_stats);
             
             Ok(true)
         } else {
@@ -5661,6 +5743,80 @@ impl CoinflipContract {
 
         Ok(final_results)
     }
+
+    // ── Fraud detection helpers ───────────────────────────────────────────────
+
+    /// Enforce per-player rate limiting: max [`RATE_LIMIT_MAX_GAMES`] games per
+    /// [`RATE_LIMIT_WINDOW_LEDGERS`] ledgers.  Sets a [`FraudFlag`] and returns
+    /// `Err(Error::ContractPaused)` when the limit is exceeded.
+    fn check_rate_limit(env: &Env, player: &Address) -> Result<(), Error> {
+        let key = StorageKey::PlayerRateLimit(player.clone());
+        let current_ledger = env.ledger().sequence();
+        let mut state: PlayerRateLimit = env.storage().persistent()
+            .get(&key)
+            .unwrap_or(PlayerRateLimit { window_start: current_ledger, games_in_window: 0 });
+
+        // Reset window if expired.
+        if current_ledger.saturating_sub(state.window_start) >= RATE_LIMIT_WINDOW_LEDGERS {
+            state.window_start = current_ledger;
+            state.games_in_window = 0;
+        }
+
+        state.games_in_window = state.games_in_window.saturating_add(1);
+        env.storage().persistent().set(&key, &state);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        if state.games_in_window > RATE_LIMIT_MAX_GAMES {
+            Self::set_fraud_flag(env, player, symbol_short!("rate_limit"));
+            return Err(Error::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Check player stats for anomalous patterns and set a [`FraudFlag`] if found.
+    /// Called after every game outcome.
+    fn check_anomaly(env: &Env, player: &Address, stats: &PlayerStats) {
+        if stats.current_streak >= ANOMALY_WIN_STREAK_THRESHOLD {
+            Self::set_fraud_flag(env, player, symbol_short!("win_streak"));
+        }
+        // Detect unusual loss pattern: losses >> wins by large margin.
+        if stats.losses > 0 && stats.wins == 0 && stats.losses >= ANOMALY_LOSS_STREAK_THRESHOLD as u64 {
+            Self::set_fraud_flag(env, player, symbol_short!("loss_streak"));
+        }
+    }
+
+    /// Persist a [`FraudFlag`] for `player` and emit an admin alert event.
+    fn set_fraud_flag(env: &Env, player: &Address, reason: Symbol) {
+        let flag = FraudFlag { flagged_at: env.ledger().sequence(), reason: reason.clone() };
+        env.storage().persistent().set(&StorageKey::FraudFlag(player.clone()), &flag);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::FraudFlag(player.clone()), TTL_THRESHOLD, TTL_EXTEND_TO,
+        );
+        // Emit alert event for off-chain monitoring.
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("fraud_flag")),
+            (player.clone(), reason),
+        );
+    }
+
+    // ── Fraud detection admin entry points ────────────────────────────────────
+
+    /// Return the [`FraudFlag`] for `player`, or `None` if no flag is set.
+    /// No auth required — readable by anyone for transparency.
+    pub fn get_fraud_flag(env: Env, player: Address) -> Option<FraudFlag> {
+        env.storage().persistent().get(&StorageKey::FraudFlag(player))
+    }
+
+    /// Clear the fraud flag for `player`. Admin only.
+    pub fn clear_fraud_flag(env: Env, admin: Address, player: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().persistent().remove(&StorageKey::FraudFlag(player));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -5717,6 +5873,9 @@ mod observability_tests;
 
 #[cfg(test)]
 mod upgrade_migration_tests;
+
+#[cfg(test)]
+mod fraud_detection_tests;
 
 #[cfg(test)]
 mod security_validation_tests;
