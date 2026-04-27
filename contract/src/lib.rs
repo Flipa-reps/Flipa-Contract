@@ -6114,6 +6114,9 @@ mod batch_operations_tests;
 mod game_history_tests;
 
 #[cfg(test)]
+mod referral_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
