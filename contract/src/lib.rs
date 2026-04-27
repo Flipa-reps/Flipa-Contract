@@ -1062,8 +1062,10 @@ pub struct Proposal {
     pub action:          ProposalAction,
     /// Ledger sequence after which voting is closed.
     pub deadline_ledger: u32,
-    pub votes_for:       u32,
-    pub votes_against:   u32,
+    /// Accumulated quadratic voting weight in favour (sum of isqrt(balance) per voter).
+    pub votes_for:       i128,
+    /// Accumulated quadratic voting weight against (sum of isqrt(balance) per voter).
+    pub votes_against:   i128,
     pub status:          ProposalStatus,
 }
 
@@ -4280,6 +4282,21 @@ impl CoinflipContract {
 
     // ── Governance helpers ──────────────────────────────────────────────────
 
+    /// Integer square root (floor) of a non-negative i128.
+    ///
+    /// Used to compute quadratic voting weight: a voter with token balance `b`
+    /// contributes `isqrt(b)` to the vote tally rather than a flat 1.
+    fn isqrt(n: i128) -> i128 {
+        if n <= 0 { return 0; }
+        let mut x = n;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        x
+    }
+
     fn load_proposal_count(env: &Env) -> u32 {
         env.storage().persistent()
             .get(&StorageKey::ProposalCount)
@@ -4430,8 +4447,8 @@ impl CoinflipContract {
             proposer,
             action,
             deadline_ledger: env.ledger().sequence().saturating_add(VOTING_PERIOD_LEDGERS),
-            votes_for: 0,
-            votes_against: 0,
+            votes_for: 0i128,
+            votes_against: 0i128,
             status: ProposalStatus::Active,
         };
 
@@ -4471,10 +4488,16 @@ impl CoinflipContract {
             return Err(Error::AlreadyVoted);
         }
 
+        // Quadratic voting: weight = floor(sqrt(token_balance)).
+        let config = Self::load_config(&env);
+        let token_client = token::Client::new(&env, &config.token);
+        let balance = token_client.balance(&voter);
+        let weight = Self::isqrt(balance).max(1); // minimum weight of 1 for registered voters
+
         if approve {
-            proposal.votes_for = proposal.votes_for.saturating_add(1);
+            proposal.votes_for = proposal.votes_for.saturating_add(weight);
         } else {
-            proposal.votes_against = proposal.votes_against.saturating_add(1);
+            proposal.votes_against = proposal.votes_against.saturating_add(weight);
         }
 
         Self::record_vote(&env, proposal_id, &voter);
@@ -4486,7 +4509,7 @@ impl CoinflipContract {
     /// Execute a proposal that has passed the voting threshold.
     ///
     /// Execution is allowed only after the voting deadline has passed and
-    /// `votes_for > 50%` of registered voters (minimum 1 vote).
+    /// the weighted `votes_for` (quadratic) exceeds `votes_against` with at least 1 vote.
     pub fn execute_proposal(env: Env, caller: Address, proposal_id: u32) -> Result<(), Error> {
         caller.require_auth();
 
@@ -4509,10 +4532,9 @@ impl CoinflipContract {
             return Err(Error::VotingOpen);
         }
 
-        // 51% threshold: votes_for must be > half of registered voters, minimum 1.
-        let total_voters = voters.len();
-        let threshold = total_voters / 2 + 1; // integer ceiling of 51%
-        if proposal.votes_for < threshold || proposal.votes_for == 0 {
+        // Quadratic threshold: weighted votes_for must exceed weighted votes_against,
+        // and votes_for must meet the minimum quorum.
+        if proposal.votes_for <= proposal.votes_against || proposal.votes_for == 0 {
             return Err(Error::ThresholdNotMet);
         }
 
@@ -4590,6 +4612,21 @@ impl CoinflipContract {
     /// Return the registered voter list.
     pub fn get_voters(env: Env) -> soroban_sdk::Vec<Address> {
         Self::load_voters(&env)
+    }
+
+    /// Return the quadratic voting power of `voter`: `floor(sqrt(token_balance))`, minimum 1
+    /// if the address is a registered voter, or 0 if not registered.
+    pub fn get_voting_power(env: Env, voter: Address) -> i128 {
+        let voters = Self::load_voters(&env);
+        let is_voter = (0..voters.len()).any(|i| voters.get(i).unwrap() == voter);
+        if !is_voter {
+            return 0;
+        }
+        let config = Self::load_config(&env);
+        let token_client = token::Client::new(&env, &config.token);
+        let balance = token_client.balance(&voter);
+        Self::isqrt(balance).max(1)
+    }
     /// Update the circuit-breaker reserve threshold.
     ///
     /// When `reserve_balance <= min_reserve_threshold`, `start_game` is automatically
