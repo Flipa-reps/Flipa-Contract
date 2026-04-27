@@ -5828,6 +5828,9 @@ mod phase_transition_tests;
 mod streak_tests;
 
 #[cfg(test)]
+mod max_streak_tests;
+
+#[cfg(test)]
 mod ttl_tests;
 
 #[cfg(test)]
