@@ -1231,6 +1231,24 @@ const MULTIPLIER_STREAK_2: u32 = 35_000; // 3.5x
 const MULTIPLIER_STREAK_3: u32 = 60_000; // 6.0x
 const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
 
+/// Emitted after every stats-mutating operation (start_game, reveal win,
+/// cash_out/claim_winnings, reclaim_wager).
+///
+/// Off-chain consumers subscribe to `("tossd", "stats")` to drive live
+/// dashboards without polling.
+///
+/// Topics: `("tossd", "stats")`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventStatsUpdated {
+    /// Trigger: `"start"`, `"win"`, `"loss"`, `"settle"`, or `"reclaim"`.
+    pub trigger:         soroban_sdk::Symbol,
+    pub total_games:     u64,
+    pub total_volume:    i128,
+    pub total_fees:      i128,
+    pub reserve_balance: i128,
+}
+
 /// Governance constants
 /// 48 hours in ledgers (assuming 5 seconds per ledger)
 const EXECUTION_DELAY_LEDGERS: u32 = 34_560; // 48 hours * 3600 seconds / 5 seconds per ledger
@@ -2126,6 +2144,19 @@ impl CoinflipContract {
         );
     }
 
+    fn emit_stats_updated(env: &Env, trigger: soroban_sdk::Symbol, stats: &ContractStats) {
+        env.events().publish(
+            (symbol_short!("tossd"), symbol_short!("stats")),
+            EventStatsUpdated {
+                trigger,
+                total_games:     stats.total_games,
+                total_volume:    stats.total_volume,
+                total_fees:      stats.total_fees,
+                reserve_balance: stats.reserve_balance,
+            },
+        );
+    }
+
     /// Initialize the contract with configuration.
     ///
     /// Accepted inputs:
@@ -2819,6 +2850,7 @@ impl CoinflipContract {
         stats.total_games = stats.total_games.checked_add(1).unwrap_or(stats.total_games);
         stats.total_volume = stats.total_volume.checked_add(wager).unwrap_or(stats.total_volume);
         Self::save_stats(&env, &stats);
+        Self::emit_stats_updated(&env, Symbol::new(&env, "start"), &stats);
 
         // Track per-token reserve: credit the wager to the token's reserve bucket.
         let token_reserve_key = StorageKey::TokenReserve(token.clone());
@@ -3020,6 +3052,7 @@ impl CoinflipContract {
                 .checked_add(forfeited)
                 .unwrap_or(stats.reserve_balance);
             Self::save_stats(&env, &stats);
+            Self::emit_stats_updated(&env, Symbol::new(&env, "loss"), &stats);
 
             Self::save_history_entry(&env, &player, HistoryEntry {
                 wager: game.wager,
@@ -3265,6 +3298,7 @@ impl CoinflipContract {
         }
         
         Self::save_stats(&env, &stats);
+        Self::emit_stats_updated(&env, Symbol::new(&env, "settle"), &stats);
         Self::save_jackpot(&env, jackpot);
 
         // Update leaderboard
@@ -3430,6 +3464,7 @@ impl CoinflipContract {
             .checked_add(fee)
             .unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
+        Self::emit_stats_updated(&env, Symbol::new(&env, "settle"), &stats);
 
         let total_payout = net_payout.checked_add(side_bet_payout)
             .ok_or(Error::InsufficientReserves)?;
@@ -4789,6 +4824,7 @@ impl CoinflipContract {
             .checked_add(game.wager)
             .unwrap_or(stats.reserve_balance);
         Self::save_stats(&env, &stats);
+        Self::emit_stats_updated(&env, Symbol::new(&env, "reclaim"), &stats);
 
         // Record the timed-out game in history (no outcome — treat as loss).
         Self::save_history_entry(&env, &player, HistoryEntry {
@@ -5926,6 +5962,9 @@ mod governance_tests;
 
 #[cfg(test)]
 mod analytics_tests;
+
+#[cfg(test)]
+mod streaming_tests;
 
 #[cfg(test)]
 mod rbac_tests;
