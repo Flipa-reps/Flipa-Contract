@@ -832,6 +832,57 @@ pub struct PlayerAnalyticsExport {
     pub leaderboard_streak: u32,
 }
 
+/// Detailed performance report for a single player.
+///
+/// Computed on demand from [`PlayerStats`] and the player's [`HistoryEntry`]
+/// ring-buffer.  Covers ROI, wager sizing, streak distribution, and a simple
+/// retention signal (games in the last N ledgers).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerPerformanceReport {
+    pub player:            Address,
+    /// Total games played.
+    pub games_played:      u64,
+    /// Win rate in basis points (0–10_000).
+    pub win_rate_bps:      u32,
+    /// Return on investment in basis points: `net_winnings * 10_000 / total_wagered`.
+    /// Negative values are clamped to i32::MIN equivalent via i128.
+    pub roi_bps:           i128,
+    /// Average wager per game in stroops.
+    pub avg_wager:         i128,
+    /// Highest streak achieved.
+    pub max_streak:        u32,
+    /// Number of games won at streak ≥ 2 (multi-win streak count).
+    pub multi_streak_wins: u32,
+    /// Total payout received across all settled games (stroops).
+    pub total_payout:      i128,
+    /// Number of games played in the most recent `retention_window` ledgers.
+    /// Used as a retention / activity signal.
+    pub recent_games:      u32,
+    /// Ledger window used for `recent_games` (always [`RETENTION_WINDOW_LEDGERS`]).
+    pub retention_window:  u32,
+}
+
+/// Aggregate cohort analytics across a set of players.
+///
+/// Returned by [`CoinflipContract::get_cohort_stats`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CohortStats {
+    /// Number of players in the cohort.
+    pub cohort_size:       u32,
+    /// Number of players with at least one game played.
+    pub active_players:    u32,
+    /// Aggregate win rate across the cohort in basis points.
+    pub avg_win_rate_bps:  u32,
+    /// Aggregate ROI across the cohort in basis points.
+    pub avg_roi_bps:       i128,
+    /// Average max streak across the cohort.
+    pub avg_max_streak:    u32,
+    /// Number of players active within the retention window.
+    pub retained_players:  u32,
+}
+
 /// Per-player referral statistics.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1277,6 +1328,9 @@ const TTL_EXTEND_TO: u32 = 500_000;
 /// Number of ledgers a player has to call `reveal` before the wager can be
 /// reclaimed via `reclaim_wager`.  At ~5 s/ledger this is roughly 8 minutes.
 const REVEAL_TIMEOUT_LEDGERS: u32 = 100;
+
+/// Number of ledgers used as the retention activity window (~7 days at 5 s/ledger).
+pub const RETENTION_WINDOW_LEDGERS: u32 = 120_960;
 
 /// Maximum number of players tracked in the leaderboard.
 const LEADERBOARD_SIZE: u32 = 100;
@@ -5290,6 +5344,140 @@ impl CoinflipContract {
         Self::load_jackpot(&env)
     }
 
+    /// Compute a detailed performance report for `player`.
+    ///
+    /// Derives ROI, average wager, streak distribution, and retention signal
+    /// from the player's [`PlayerStats`] and [`HistoryEntry`] ring-buffer.
+    ///
+    /// Read-only; does not require authorization.
+    pub fn get_player_performance(env: Env, player: Address) -> PlayerPerformanceReport {
+        let stats = Self::load_player_stats(&env, &player);
+        let history = Self::load_player_history(&env, &player);
+        let current_ledger = env.ledger().sequence();
+
+        let win_rate_bps = if stats.games_played > 0 {
+            ((stats.wins * 10_000) / stats.games_played) as u32
+        } else {
+            0
+        };
+
+        let roi_bps: i128 = if stats.total_wagered > 0 {
+            (stats.net_winnings * 10_000) / stats.total_wagered
+        } else {
+            0
+        };
+
+        let avg_wager: i128 = if stats.games_played > 0 {
+            stats.total_wagered / stats.games_played as i128
+        } else {
+            0
+        };
+
+        // Scan history for total_payout, multi_streak_wins, and recent_games.
+        let mut total_payout: i128 = 0;
+        let mut multi_streak_wins: u32 = 0;
+        let mut recent_games: u32 = 0;
+        let retention_cutoff = current_ledger.saturating_sub(RETENTION_WINDOW_LEDGERS);
+
+        for i in 0..history.len() {
+            let entry = history.get(i).unwrap();
+            total_payout = total_payout.saturating_add(entry.payout);
+            if entry.won && entry.streak >= 2 {
+                multi_streak_wins = multi_streak_wins.saturating_add(1);
+            }
+            if entry.ledger >= retention_cutoff {
+                recent_games = recent_games.saturating_add(1);
+            }
+        }
+
+        PlayerPerformanceReport {
+            player,
+            games_played: stats.games_played,
+            win_rate_bps,
+            roi_bps,
+            avg_wager,
+            max_streak: stats.max_streak,
+            multi_streak_wins,
+            total_payout,
+            recent_games,
+            retention_window: RETENTION_WINDOW_LEDGERS,
+        }
+    }
+
+    /// Compute aggregate cohort analytics across a list of players.
+    ///
+    /// Aggregates win rate, ROI, max streak, and retention across all
+    /// provided addresses.  Players with no games are counted in
+    /// `cohort_size` but not in `active_players`.
+    ///
+    /// `players` is capped at 20 entries to bound compute cost.
+    ///
+    /// Read-only; does not require authorization.
+    pub fn get_cohort_stats(
+        env: Env,
+        players: soroban_sdk::Vec<Address>,
+    ) -> CohortStats {
+        let cohort_size = players.len().min(20);
+        let current_ledger = env.ledger().sequence();
+        let retention_cutoff = current_ledger.saturating_sub(RETENTION_WINDOW_LEDGERS);
+
+        let mut active_players: u32 = 0;
+        let mut sum_win_rate: u64 = 0;
+        let mut sum_roi: i128 = 0;
+        let mut sum_max_streak: u64 = 0;
+        let mut retained_players: u32 = 0;
+
+        for i in 0..cohort_size {
+            let player = players.get(i).unwrap();
+            let stats = Self::load_player_stats(&env, &player);
+
+            if stats.games_played == 0 {
+                continue;
+            }
+            active_players = active_players.saturating_add(1);
+
+            let win_rate = ((stats.wins * 10_000) / stats.games_played) as u64;
+            sum_win_rate = sum_win_rate.saturating_add(win_rate);
+
+            let roi: i128 = if stats.total_wagered > 0 {
+                (stats.net_winnings * 10_000) / stats.total_wagered
+            } else {
+                0
+            };
+            sum_roi = sum_roi.saturating_add(roi);
+            sum_max_streak = sum_max_streak.saturating_add(stats.max_streak as u64);
+
+            // Retention: check if any history entry falls within the window.
+            let history = Self::load_player_history(&env, &player);
+            let is_retained = (0..history.len()).any(|j| {
+                history.get(j).map(|e| e.ledger >= retention_cutoff).unwrap_or(false)
+            });
+            if is_retained {
+                retained_players = retained_players.saturating_add(1);
+            }
+        }
+
+        let (avg_win_rate_bps, avg_roi_bps, avg_max_streak) = if active_players > 0 {
+            let n = active_players as u64;
+            (
+                (sum_win_rate / n) as u32,
+                sum_roi / n as i128,
+                (sum_max_streak / n) as u32,
+            )
+        } else {
+            (0, 0, 0)
+        };
+
+        CohortStats {
+            cohort_size,
+            active_players,
+            avg_win_rate_bps,
+            avg_roi_bps,
+            avg_max_streak,
+            retained_players,
+        }
+    }
+
     /// Set the reveal timeout duration (admin only).
     ///
     /// # Arguments
@@ -5965,6 +6153,9 @@ mod analytics_tests;
 
 #[cfg(test)]
 mod streaming_tests;
+
+#[cfg(test)]
+mod player_performance_tests;
 
 #[cfg(test)]
 mod rbac_tests;
