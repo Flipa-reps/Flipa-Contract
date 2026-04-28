@@ -1,0 +1,109 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  pointer-events: none;
+}
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: all;
+}
+
+.highlight {
+  position: fixed;
+  border-radius: 8px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55), 0 0 0 3px var(--color-accent, #f5c518);
+  pointer-events: none;
+  transition: all 0.3s ease;
+  z-index: 1001;
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 1002;
+  background: var(--color-surface, #1a1a2e);
+  border: 1px solid var(--color-accent, #f5c518);
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+  max-width: 320px;
+  pointer-events: all;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.stepLabel {
+  font-size: 0.75rem;
+  color: var(--color-accent, #f5c518);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 0 0 0.5rem;
+}
+
+.title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--color-text-primary, #fff);
+  margin: 0 0 0.5rem;
+}
+
+.description {
+  font-size: 0.9rem;
+  color: var(--color-text-secondary, #aaa);
+  margin: 0 0 1.25rem;
+  line-height: 1.5;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.btnNext {
+  flex: 1;
+  padding: 0.5rem 1rem;
+  background: var(--color-accent, #f5c518);
+  color: #000;
+  border: none;
+  border-radius: 6px;
+  font-weight: 700;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.btnNext:hover {
+  opacity: 0.9;
+}
+
+.btnSkip {
+  background: none;
+  border: none;
+  color: var(--color-text-secondary, #aaa);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.25rem;
+}
+
+.btnSkip:hover {
+  color: var(--color-text-primary, #fff);
+}
+
+.dots {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-text-secondary, #aaa);
+  transition: background 0.2s;
+}
+
+.dotActive {
+  background: var(--color-accent, #f5c518);
+}
