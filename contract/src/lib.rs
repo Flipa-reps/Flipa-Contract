@@ -6862,6 +6862,9 @@ mod streak_tests;
 mod loss_streak_integration_tests;
 
 #[cfg(test)]
+mod continue_streak_integration_tests;
+
+#[cfg(test)]
 mod ttl_tests;
 
 #[cfg(test)]
