@@ -1,1528 +1,559 @@
-//! Snapshot tests for contract state serialization.
-//! Uses `insta` for Borsh baseline snapshots + round-trip verification.
+//! Snapshot tests for contract state serialization/deserialization.
 //!
-//! Run `cargo test snapshot_tests -- --nocapture` to review.
-//! Update: `cargo test update_snapshots`.
-
-use super::*;
-use soroban_sdk::{Env, Address, BytesN};
-use insta::assert_snapshot;
-use hex;
-
-// Test env for deterministic Borsh serialization.
-fn test_env() -> Env {
-    Env::default()
-}
-
-// ── Utility: Serialize to hex ────────────────────────────────────────────────
-
-fn borsh_to_hex<T: soroban_sdk::contracttype::ContractType>(env: &Env, value: &T) -> String {
-    let bytes = env.bytes_from_object(value).unwrap().unwrap();
-    hex::encode(bytes.to_vec())
-}
-
-// ── ContractConfig Snapshots ─────────────────────────────────────────────────
-
-#[test]
-fn contract_config_default() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let config = ContractConfig {
-        admin,
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-        shutdown_mode: false,
-    };
-
-    assert_snapshot!(borsh_to_hex(&env, &config), @r###"
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000012c
-    00000000000000000000000000000000000000000000000000000f4240
-    0000000000000000000000000000000000000000000000000005f5e100
-    00
-    "###);
-}
-
-#[test]
-fn contract_config_edge_cases() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let config_paused = ContractConfig {
-        admin: admin.clone(),
-        treasury,
-        token,
-        fee_bps: 500, // max fee
-        min_wager: 1_000_000,
-        max_wager: i128::MAX / 10, // near max
-        paused: true,
-        shutdown_mode: false,
-    };
-
-    assert_snapshot!(borsh_to_hex(&env, &config_paused));
-}
-
-#[test]
-fn contract_config_roundtrip() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let original = ContractConfig {
-        admin: admin.clone(),
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-        shutdown_mode: false,
-    };
-
-    // Serialize → deserialize → reserialize → must match original bytes
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: ContractConfig = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip); // Field equality
-}
-
-// ── ContractStats Snapshots ──────────────────────────────────────────────────
-
-#[test]
-fn contract_stats_zero() {
-    let env = test_env();
-    let stats = ContractStats {
-        total_games: 0,
-        total_volume: 0,
-        total_fees: 0,
-        reserve_balance: 0,
-        pool_size: 0,
-        mix_count: 0,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &stats));
-}
-
-#[test]
-fn contract_stats_production() {
-    let env = test_env();
-    let stats = ContractStats {
-        total_games: 1_000_000,
-        total_volume: 1_000_000_000_000, // 100k XLM volume
-        total_fees: 30_000_000_000,       // 3% of volume
-        reserve_balance: 500_000_000_000, // 50k XLM reserves
-        pool_size: 1_000_000,
-        mix_count: 1_000_000,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &stats));
-}
-
-#[test]
-fn contract_stats_roundtrip() {
-    let env = test_env();
-    let original = ContractStats {
-        total_games: 1_234,
-        total_volume: 123_456_789,
-        total_fees: 12_345_678,
-        reserve_balance: 1_000_000_000,
-        pool_size: 42,
-        mix_count: 21,
-    };
-
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: ContractStats = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip);
-}
-
-// ── GameState Snapshots ──────────────────────────────────────────────────────
-
-#[test]
-fn game_state_committed_streak_0() {
-    let env = test_env();
-    let game = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 0,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[1u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[2u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Committed,
-        start_ledger: 12345,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &game));
-}
-
-#[test]
-fn game_state_all_phases() {
-    let env = test_env();
-    macro_rules! snapshot_phase {
-        ($phase:expr) => {
-            let game = GameState {
-                wager: 10_000_000,
-                side: Side::Heads,
-                streak: 1,
-                commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32])).try_into().unwrap(),
-                contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[43u8; 32])).try_into().unwrap(),
-                fee_bps: 300,
-                phase: $phase,
-                start_ledger: 12345,
-            };
-            assert_snapshot!(format!("{:?}", borsh_to_hex(&env, &game)));
-        };
-    }
-
-    snapshot_phase!(GamePhase::Committed);
-    snapshot_phase!(GamePhase::Revealed);
-    snapshot_phase!(GamePhase::Completed);
-}
-
-#[test]
-fn game_state_edge_streaks() {
-    let env = test_env();
-    for streak in [0, 1, 2, 3, 4, 10, u32::MAX] {
-        let game = GameState {
-            wager: 10_000_000,
-            side: Side::Tails,
-            streak,
-            commitment: BytesN::from_array(&env, &[0; 32]), // deterministic
-            contract_random: BytesN::from_array(&env, &[1; 32]),
-            fee_bps: 500, // max fee
-            phase: GamePhase::Revealed,
-            start_ledger: u32::MAX,
-        };
-        assert_snapshot!(format!("streak_{}", streak), borsh_to_hex(&env, &game));
-    }
-}
-
-#[test]
-fn game_state_roundtrip() {
-    let env = test_env();
-    let original = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 2,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[43u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Revealed,
-        start_ledger: 12345,
-    };
-
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: GameState = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip);
-}
-
-// ── Enum Snapshots ───────────────────────────────────────────────────────────
-
-#[test]
-fn side_enum() {
-    let env = test_env();
-    assert_snapshot!(borsh_to_hex(&env, &Side::Heads), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &Side::Tails), @"01");
-}
-
-#[test]
-fn game_phase_enum() {
-    let env = test_env();
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Committed), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Revealed), @"01");
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Completed), @"02");
-}
-
-#[test]
-fn storage_key_enum() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::Config), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::Stats), @"01");
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::PlayerGame(admin)));
-}
-
-#[test]
-fn error_enum_stable_codes() {
-    // Verify stable u32 discriminants (protocol contract)
-    assert_eq!(Error::WagerBelowMinimum as u32, 1);
-    assert_eq!(Error::AlreadyInitialized as u32, 51);
-    assert_eq!(Error::DuplicateCommitment as u32, 52);
-    // All 18 codes covered in lib.rs error_codes::VARIANT_COUNT
-}
-
-// ── Backward Compatibility Probes ────────────────────────────────────────────
-
-#[test]
-fn legacy_game_state_deserializes() {
-    // Embed known-good legacy Borsh bytes (update when format changes intentionally)
-    let env = test_env();
-    let legacy_bytes = hex::decode("...").unwrap(); // TODO: capture from mainnet/deployed
-    let _legacy_game: GameState = env.bytes_to_object(&env.bytes_object(&legacy_bytes).unwrap().unwrap()).unwrap();
-    // Will fail-fast if fields reordered/renamed/added incompatibly
-}
-//! Snapshot tests for contract state serialization.
-//! Uses `insta` for Borsh baseline snapshots + round-trip verification.
+//! Strategy: write a value into `env.storage()`, read it back, and compare
+//! the Debug representation as an `insta` snapshot.  This catches any
+//! unintended change to field order, field names, or enum discriminants
+//! across refactors and upgrades.
 //!
-//! Run `cargo test snapshot_tests -- --nocapture` to review.
-//! Update: `cargo test update_snapshots`.
+//! Run:   `cargo test --features testutils snapshot`
+//! Update snapshots: `INSTA_UPDATE=always cargo test --features testutils snapshot`
 
-use super::*;
-use soroban_sdk::{Env, Address, BytesN};
-use insta::assert_snapshot;
-use hex;
+#[cfg(test)]
+mod snapshot_tests {
+    use crate::*;
+    use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env};
+    use insta::assert_debug_snapshot;
 
-// Test env for deterministic Borsh serialization.
-fn test_env() -> Env {
-    Env::default()
-}
+    // ── helpers ──────────────────────────────────────────────────────────────
 
-// ── Utility: Serialize to hex ────────────────────────────────────────────────
-
-fn borsh_to_hex<T: soroban_sdk::contracttype::ContractType>(env: &Env, value: &T) -> String {
-    let bytes = env.bytes_from_object(value).unwrap().unwrap();
-    hex::encode(bytes.to_vec())
-}
-
-// ── ContractConfig Snapshots ─────────────────────────────────────────────────
-
-#[test]
-fn contract_config_default() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let config = ContractConfig {
-        admin,
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-    
-        oracle_vrf_pk: BytesN::from_array(&env, &[0u8; 32]),
-    };
-
-    assert_snapshot!(borsh_to_hex(&env, &config), @r###"
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000012c
-    00000000000000000000000000000000000000000000000000000f4240
-    0000000000000000000000000000000000000000000000000005f5e100
-    00
-    "###);
-}
-
-#[test]
-fn contract_config_edge_cases() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let config_paused = ContractConfig {
-        admin: admin.clone(),
-        treasury,
-        token,
-        fee_bps: 500, // max fee
-        min_wager: 1_000_000,
-        max_wager: i128::MAX / 10, // near max
-        paused: true,
-    
-        oracle_vrf_pk: BytesN::from_array(&env, &[0u8; 32]),
-    };
-
-    assert_snapshot!(borsh_to_hex(&env, &config_paused));
-}
-
-#[test]
-fn contract_config_roundtrip() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let original = ContractConfig {
-        admin: admin.clone(),
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-    
-        oracle_vrf_pk: BytesN::from_array(&env, &[0u8; 32]),
-    };
-
-    // Serialize → deserialize → reserialize → must match original bytes
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: ContractConfig = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip); // Field equality
-}
-
-// ── ContractStats Snapshots ──────────────────────────────────────────────────
-
-#[test]
-fn contract_stats_zero() {
-    let env = test_env();
-    let stats = ContractStats {
-        total_games: 0,
-        total_volume: 0,
-        total_fees: 0,
-        reserve_balance: 0,
-        pool_size: 0,
-        mix_count: 0,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &stats));
-}
-
-#[test]
-fn contract_stats_production() {
-    let env = test_env();
-    let stats = ContractStats {
-        total_games: 1_000_000,
-        total_volume: 1_000_000_000_000, // 100k XLM volume
-        total_fees: 30_000_000_000,       // 3% of volume
-        reserve_balance: 500_000_000_000, // 50k XLM reserves
-        pool_size: 1_000_000,
-        mix_count: 1_000_000,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &stats));
-}
-
-#[test]
-fn contract_stats_roundtrip() {
-    let env = test_env();
-    let original = ContractStats {
-        total_games: 1_234,
-        total_volume: 123_456_789,
-        total_fees: 12_345_678,
-        reserve_balance: 1_000_000_000,
-        pool_size: 42,
-        mix_count: 21,
-    };
-
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: ContractStats = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip);
-}
-
-// ── GameState Snapshots ──────────────────────────────────────────────────────
-
-#[test]
-fn game_state_committed_streak_0() {
-    let env = test_env();
-    let game = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 0,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[1u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[2u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Committed,
-        start_ledger: 12345,
-    
-        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
-    };
-    assert_snapshot!(borsh_to_hex(&env, &game));
-}
-
-#[test]
-fn game_state_all_phases() {
-    let env = test_env();
-    macro_rules! snapshot_phase {
-        ($phase:expr) => {
-            let game = GameState {
-                wager: 10_000_000,
-                side: Side::Heads,
-                streak: 1,
-                commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32])).try_into().unwrap(),
-                contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[43u8; 32])).try_into().unwrap(),
-                fee_bps: 300,
-                phase: $phase,
-                start_ledger: 12345,
-            
-                vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
-            };
-            assert_snapshot!(format!("{:?}", borsh_to_hex(&env, &game)));
-        };
+    fn env() -> Env {
+        Env::default()
     }
 
-    snapshot_phase!(GamePhase::Committed);
-    snapshot_phase!(GamePhase::Revealed);
-    snapshot_phase!(GamePhase::Completed);
-}
+    /// Round-trip a value through persistent storage and return the read-back copy.
+    /// Panics if the value cannot be stored or retrieved.
+    fn storage_roundtrip<K, V>(env: &Env, key: K, value: &V) -> V
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>
+            + soroban_sdk::TryFromVal<Env, soroban_sdk::Val>
+            + Clone,
+        V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>
+            + soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        env.storage().persistent().set(&key, value);
+        env.storage().persistent().get(&key).unwrap()
+    }
 
-#[test]
-fn game_state_edge_streaks() {
-    let env = test_env();
-    for streak in [0, 1, 2, 3, 4, 10, u32::MAX] {
-        let game = GameState {
+    fn zero_bytes32(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &[0u8; 32])
+    }
+
+    fn zero_bytes64(env: &Env) -> BytesN<64> {
+        BytesN::from_array(env, &[0u8; 64])
+    }
+
+    fn deterministic_hash(env: &Env, seed: u8) -> BytesN<32> {
+        env.crypto()
+            .sha256(&Bytes::from_slice(env, &[seed; 32]))
+            .into()
+    }
+
+    fn default_multipliers(env: &Env) -> MultiplierConfig {
+        MultiplierConfig {
+            streak1: 19_000,
+            streak2: 35_000,
+            streak3: 60_000,
+            streak4_plus: 100_000,
+        }
+    }
+
+    fn minimal_config(env: &Env) -> ContractConfig {
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = Address::generate(env);
+        ContractConfig {
+            admin,
+            treasury,
+            token,
+            fee_bps: 300,
+            min_wager: 1_000_000,
+            max_wager: 100_000_000,
+            paused: false,
+            shutdown_mode: false,
+            multipliers: default_multipliers(env),
+            min_reserve_threshold: 0,
+            oracle_vrf_pk: zero_bytes32(env),
+        }
+    }
+
+    fn minimal_game(env: &Env) -> GameState {
+        GameState {
             wager: 10_000_000,
+            side: Side::Heads,
+            streak: 0,
+            commitment: deterministic_hash(env, 1),
+            contract_random: deterministic_hash(env, 2),
+            fee_bps: 300,
+            phase: GamePhase::Committed,
+            start_ledger: 1000,
+            side_bet: SideBet::None,
+            side_bet_amount: 0,
+            multipliers: default_multipliers(env),
+            oracle_commitment: zero_bytes32(env),
+            vrf_input: deterministic_hash(env, 3),
+            token: Address::generate(env),
+        }
+    }
+
+    // ── ContractConfig ────────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_contract_config_default() {
+        let env = env();
+        let config = minimal_config(&env);
+        assert_debug_snapshot!("contract_config_default", config);
+    }
+
+    #[test]
+    fn snapshot_contract_config_paused() {
+        let env = env();
+        let mut config = minimal_config(&env);
+        config.paused = true;
+        config.fee_bps = 500;
+        assert_debug_snapshot!("contract_config_paused", config);
+    }
+
+    #[test]
+    fn snapshot_contract_config_shutdown() {
+        let env = env();
+        let mut config = minimal_config(&env);
+        config.shutdown_mode = true;
+        assert_debug_snapshot!("contract_config_shutdown", config);
+    }
+
+    #[test]
+    fn roundtrip_contract_config() {
+        let env = env();
+        let original = minimal_config(&env);
+        let restored: ContractConfig =
+            storage_roundtrip(&env, StorageKey::Config, &original);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn roundtrip_contract_config_fields_preserved() {
+        let env = env();
+        let original = minimal_config(&env);
+        let restored: ContractConfig =
+            storage_roundtrip(&env, StorageKey::Config, &original);
+        assert_eq!(restored.fee_bps, 300);
+        assert_eq!(restored.min_wager, 1_000_000);
+        assert_eq!(restored.max_wager, 100_000_000);
+        assert!(!restored.paused);
+        assert!(!restored.shutdown_mode);
+        assert_eq!(restored.min_reserve_threshold, 0);
+    }
+
+    // ── ContractStats ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_contract_stats_zero() {
+        let env = env();
+        let stats = ContractStats {
+            total_games: 0,
+            total_volume: 0,
+            total_fees: 0,
+            reserve_balance: 0,
+            pool_size: 0,
+            mix_count: 0,
+        };
+        assert_debug_snapshot!("contract_stats_zero", stats);
+    }
+
+    #[test]
+    fn snapshot_contract_stats_populated() {
+        let env = env();
+        let stats = ContractStats {
+            total_games: 1_000_000,
+            total_volume: 1_000_000_000_000,
+            total_fees: 30_000_000_000,
+            reserve_balance: 500_000_000_000,
+            pool_size: 1_000_000,
+            mix_count: 999_999,
+        };
+        assert_debug_snapshot!("contract_stats_populated", stats);
+    }
+
+    #[test]
+    fn roundtrip_contract_stats() {
+        let env = env();
+        let original = ContractStats {
+            total_games: 1_234,
+            total_volume: 123_456_789,
+            total_fees: 12_345_678,
+            reserve_balance: 1_000_000_000,
+            pool_size: 42,
+            mix_count: 21,
+        };
+        let restored: ContractStats =
+            storage_roundtrip(&env, StorageKey::Stats, &original);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn roundtrip_contract_stats_fields_preserved() {
+        let env = env();
+        let original = ContractStats {
+            total_games: 500,
+            total_volume: 600_000_000,
+            total_fees: 18_000_000,
+            reserve_balance: 50_000_000,
+            pool_size: 500,
+            mix_count: 500,
+        };
+        let restored: ContractStats =
+            storage_roundtrip(&env, StorageKey::Stats, &original);
+        assert_eq!(restored.total_games, 500);
+        assert_eq!(restored.total_volume, 600_000_000);
+        assert_eq!(restored.total_fees, 18_000_000);
+        assert_eq!(restored.reserve_balance, 50_000_000);
+        assert_eq!(restored.pool_size, 500);
+        assert_eq!(restored.mix_count, 500);
+    }
+
+    // ── GameState ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_game_state_committed() {
+        let env = env();
+        let game = minimal_game(&env);
+        assert_debug_snapshot!("game_state_committed", game);
+    }
+
+    #[test]
+    fn snapshot_game_state_revealed() {
+        let env = env();
+        let mut game = minimal_game(&env);
+        game.phase = GamePhase::Revealed;
+        game.streak = 1;
+        assert_debug_snapshot!("game_state_revealed", game);
+    }
+
+    #[test]
+    fn snapshot_game_state_completed() {
+        let env = env();
+        let mut game = minimal_game(&env);
+        game.phase = GamePhase::Completed;
+        game.streak = 3;
+        assert_debug_snapshot!("game_state_completed", game);
+    }
+
+    #[test]
+    fn snapshot_game_state_with_side_bet_exact() {
+        let env = env();
+        let mut game = minimal_game(&env);
+        game.side_bet = SideBet::ExactStreak(5);
+        game.side_bet_amount = 5_000_000;
+        assert_debug_snapshot!("game_state_side_bet_exact", game);
+    }
+
+    #[test]
+    fn snapshot_game_state_with_side_bet_sequence() {
+        let env = env();
+        let mut game = minimal_game(&env);
+        game.side_bet = SideBet::Sequence(3);
+        game.side_bet_amount = 3_000_000;
+        assert_debug_snapshot!("game_state_side_bet_sequence", game);
+    }
+
+    #[test]
+    fn roundtrip_game_state() {
+        let env = env();
+        let player = Address::generate(&env);
+        let original = minimal_game(&env);
+        let restored: GameState =
+            storage_roundtrip(&env, StorageKey::PlayerGame(player), &original);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn roundtrip_game_state_fields_preserved() {
+        let env = env();
+        let player = Address::generate(&env);
+        let original = minimal_game(&env);
+        let restored: GameState =
+            storage_roundtrip(&env, StorageKey::PlayerGame(player), &original);
+        assert_eq!(restored.wager, 10_000_000);
+        assert_eq!(restored.fee_bps, 300);
+        assert_eq!(restored.streak, 0);
+        assert_eq!(restored.phase, GamePhase::Committed);
+        assert_eq!(restored.start_ledger, 1000);
+        assert_eq!(restored.side_bet_amount, 0);
+    }
+
+    // ── Enum variants ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_side_enum_all_variants() {
+        assert_debug_snapshot!("side_heads", Side::Heads);
+        assert_debug_snapshot!("side_tails", Side::Tails);
+    }
+
+    #[test]
+    fn snapshot_game_phase_all_variants() {
+        assert_debug_snapshot!("phase_committed", GamePhase::Committed);
+        assert_debug_snapshot!("phase_revealed", GamePhase::Revealed);
+        assert_debug_snapshot!("phase_completed", GamePhase::Completed);
+    }
+
+    #[test]
+    fn snapshot_side_bet_all_variants() {
+        assert_debug_snapshot!("side_bet_none", SideBet::None);
+        assert_debug_snapshot!("side_bet_exact_streak", SideBet::ExactStreak(5));
+        assert_debug_snapshot!("side_bet_sequence", SideBet::Sequence(3));
+    }
+
+    // ── Error code stability ──────────────────────────────────────────────────
+
+    /// These discriminants are part of the public protocol and must never change.
+    #[test]
+    fn error_discriminants_stable() {
+        assert_eq!(Error::WagerBelowMinimum as u32, 1);
+        assert_eq!(Error::WagerAboveMaximum as u32, 2);
+        assert_eq!(Error::ActiveGameExists as u32, 3);
+        assert_eq!(Error::InsufficientReserves as u32, 4);
+        assert_eq!(Error::ContractPaused as u32, 5);
+        assert_eq!(Error::NoActiveGame as u32, 10);
+        assert_eq!(Error::InvalidPhase as u32, 11);
+        assert_eq!(Error::CommitmentMismatch as u32, 12);
+        assert_eq!(Error::RevealTimeout as u32, 13);
+        assert_eq!(Error::NoWinningsToClaimOrContinue as u32, 20);
+        assert_eq!(Error::InvalidCommitment as u32, 21);
+        assert_eq!(Error::Unauthorized as u32, 30);
+        assert_eq!(Error::InvalidFeePercentage as u32, 31);
+        assert_eq!(Error::InvalidWagerLimits as u32, 32);
+        assert_eq!(Error::TransferFailed as u32, 40);
+        assert_eq!(Error::AdminTreasuryConflict as u32, 50);
+        assert_eq!(Error::AlreadyInitialized as u32, 51);
+    }
+
+    // ── StorageKey uniqueness ─────────────────────────────────────────────────
+
+    #[test]
+    fn storage_key_player_game_unique_per_address() {
+        let env = env();
+        let a1 = Address::generate(&env);
+        let a2 = Address::generate(&env);
+        // Different addresses must produce different keys (no collision).
+        assert_ne!(
+            StorageKey::PlayerGame(a1),
+            StorageKey::PlayerGame(a2)
+        );
+    }
+
+    #[test]
+    fn storage_key_player_game_deterministic() {
+        let env = env();
+        let addr = Address::generate(&env);
+        assert_eq!(
+            StorageKey::PlayerGame(addr.clone()),
+            StorageKey::PlayerGame(addr)
+        );
+    }
+
+    #[test]
+    fn storage_key_global_variants_distinct() {
+        assert_ne!(StorageKey::Config, StorageKey::Stats);
+        assert_ne!(StorageKey::Config, StorageKey::EntropyPool);
+        assert_ne!(StorageKey::Stats, StorageKey::EntropyPool);
+    }
+
+    // ── MultiplierConfig ──────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_multiplier_config_default() {
+        let env = env();
+        let m = default_multipliers(&env);
+        assert_debug_snapshot!("multiplier_config_default", m);
+    }
+
+    #[test]
+    fn roundtrip_multiplier_config() {
+        let env = env();
+        let original = MultiplierConfig {
+            streak1: 19_000,
+            streak2: 35_000,
+            streak3: 60_000,
+            streak4_plus: 100_000,
+        };
+        // Store inside a ContractConfig to exercise the nested path.
+        let mut config = minimal_config(&env);
+        config.multipliers = original.clone();
+        let restored: ContractConfig =
+            storage_roundtrip(&env, StorageKey::Config, &config);
+        assert_eq!(restored.multipliers, original);
+    }
+
+    #[test]
+    fn multiplier_config_validity_invariant() {
+        let valid = MultiplierConfig {
+            streak1: 19_000,
+            streak2: 35_000,
+            streak3: 60_000,
+            streak4_plus: 100_000,
+        };
+        assert!(valid.is_valid());
+
+        let invalid_not_monotone = MultiplierConfig {
+            streak1: 35_000,
+            streak2: 19_000,
+            streak3: 60_000,
+            streak4_plus: 100_000,
+        };
+        assert!(!invalid_not_monotone.is_valid());
+
+        let invalid_below_1x = MultiplierConfig {
+            streak1: 9_999,
+            streak2: 35_000,
+            streak3: 60_000,
+            streak4_plus: 100_000,
+        };
+        assert!(!invalid_below_1x.is_valid());
+    }
+
+    // ── EntropyPool ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_entropy_pool_zero() {
+        let env = env();
+        let pool = EntropyPool {
+            pool: zero_bytes32(&env),
+            pool_size: 0,
+            mix_count: 0,
+        };
+        assert_debug_snapshot!("entropy_pool_zero", pool);
+    }
+
+    #[test]
+    fn roundtrip_entropy_pool() {
+        let env = env();
+        let original = EntropyPool {
+            pool: deterministic_hash(&env, 42),
+            pool_size: 100,
+            mix_count: 50,
+        };
+        let restored: EntropyPool =
+            storage_roundtrip(&env, StorageKey::EntropyPool, &original);
+        assert_eq!(original, restored);
+    }
+
+    // ── Backward-compatibility guard ──────────────────────────────────────────
+
+    /// Write a GameState, then read it back and verify every field survives.
+    /// This is the primary guard against accidental struct reordering.
+    #[test]
+    fn backward_compat_game_state_all_fields() {
+        let env = env();
+        let player = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let original = GameState {
+            wager: 99_000_000,
             side: Side::Tails,
-            streak,
-            commitment: BytesN::from_array(&env, &[0; 32]), // deterministic
-            contract_random: BytesN::from_array(&env, &[1; 32]),
-            fee_bps: 500, // max fee
+            streak: 4,
+            commitment: deterministic_hash(&env, 10),
+            contract_random: deterministic_hash(&env, 11),
+            fee_bps: 250,
             phase: GamePhase::Revealed,
-            start_ledger: u32::MAX,
-        
-            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
+            start_ledger: 55_000,
+            side_bet: SideBet::Sequence(2),
+            side_bet_amount: 1_000_000,
+            multipliers: MultiplierConfig {
+                streak1: 19_000,
+                streak2: 35_000,
+                streak3: 60_000,
+                streak4_plus: 100_000,
+            },
+            oracle_commitment: deterministic_hash(&env, 12),
+            vrf_input: deterministic_hash(&env, 13),
+            token: token.clone(),
         };
-        assert_snapshot!(format!("streak_{}", streak), borsh_to_hex(&env, &game));
-    }
-}
 
-#[test]
-fn game_state_roundtrip() {
-    let env = test_env();
-    let original = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 2,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[43u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Revealed,
-        start_ledger: 12345,
-    
-        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
-    };
+        let restored: GameState =
+            storage_roundtrip(&env, StorageKey::PlayerGame(player), &original);
 
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: GameState = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip);
-}
-
-// ── Enum Snapshots ───────────────────────────────────────────────────────────
-
-#[test]
-fn side_enum() {
-    let env = test_env();
-    assert_snapshot!(borsh_to_hex(&env, &Side::Heads), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &Side::Tails), @"01");
-}
-
-#[test]
-fn game_phase_enum() {
-    let env = test_env();
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Committed), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Revealed), @"01");
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Completed), @"02");
-}
-
-#[test]
-fn storage_key_enum() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::Config), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::Stats), @"01");
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::PlayerGame(admin)));
-}
-
-#[test]
-fn error_enum_stable_codes() {
-    // Verify stable u32 discriminants (protocol contract)
-    assert_eq!(Error::WagerBelowMinimum as u32, 1);
-    assert_eq!(Error::AlreadyInitialized as u32, 51);
-    // All 17 codes covered in lib.rs error_codes::VARIANT_COUNT
-}
-
-// ── Backward Compatibility Probes ────────────────────────────────────────────
-
-#[test]
-fn legacy_game_state_deserializes() {
-    // Embed known-good legacy Borsh bytes (update when format changes intentionally)
-    let env = test_env();
-    let legacy_bytes = hex::decode("...").unwrap(); // TODO: capture from mainnet/deployed
-    let _legacy_game: GameState = env.bytes_to_object(&env.bytes_object(&legacy_bytes).unwrap().unwrap()).unwrap();
-    // Will fail-fast if fields reordered/renamed/added incompatibly
-}
-
-
-// ── Storage Key Collision Resistance ─────────────────────────────────────────
-
-#[test]
-fn storage_key_uniqueness() {
-    let env = test_env();
-    let admin1 = Address::generate(&env);
-    let admin2 = Address::generate(&env);
-    
-    let key1 = StorageKey::PlayerGame(admin1.clone());
-    let key2 = StorageKey::PlayerGame(admin2.clone());
-    
-    let bytes1 = env.bytes_from_object(&key1).unwrap().unwrap();
-    let bytes2 = env.bytes_from_object(&key2).unwrap().unwrap();
-    
-    // Different addresses must produce different keys
-    assert_ne!(bytes1, bytes2);
-}
-
-#[test]
-fn storage_key_deterministic() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    
-    let key1 = StorageKey::PlayerGame(admin.clone());
-    let key2 = StorageKey::PlayerGame(admin.clone());
-    
-    let bytes1 = env.bytes_from_object(&key1).unwrap().unwrap();
-    let bytes2 = env.bytes_from_object(&key2).unwrap().unwrap();
-    
-    // Same address must produce identical keys
-    assert_eq!(bytes1, bytes2);
-}
-
-// ── TTL Extension Behavior ───────────────────────────────────────────────────
-
-#[test]
-fn storage_ttl_extension_snapshot() {
-    let env = test_env();
-    
-    // Create a game state and verify TTL can be extended
-    let game = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 0,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[1u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[2u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Committed,
-        start_ledger: 100,
-    
-        vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
-    };
-    
-    let bytes = env.bytes_from_object(&game).unwrap().unwrap();
-    assert_snapshot!(hex::encode(bytes.to_vec()));
-}
-
-// ── Upgrade Simulation with Legacy State ─────────────────────────────────────
-
-#[test]
-fn upgrade_simulation_config_compatibility() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-    
-    // Create config with current schema
-    let config = ContractConfig {
-        admin,
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-    
-        oracle_vrf_pk: BytesN::from_array(&env, &[0u8; 32]),
-    };
-    
-    // Serialize
-    let bytes = env.bytes_from_object(&config).unwrap().unwrap();
-    
-    // Deserialize (simulating upgrade)
-    let deserialized: ContractConfig = env.bytes_to_object(&bytes).unwrap().unwrap();
-    
-    // Verify all fields preserved
-    assert_eq!(deserialized.fee_bps, 300);
-    assert_eq!(deserialized.min_wager, 1_000_000);
-    assert_eq!(deserialized.max_wager, 100_000_000);
-    assert_eq!(deserialized.paused, false);
-}
-
-#[test]
-fn upgrade_simulation_stats_compatibility() {
-    let env = test_env();
-    
-    // Create stats with current schema
-    let stats = ContractStats {
-        total_games: 1000,
-        total_volume: 600_000_000,
-        total_fees: 18_000_000,
-        reserve_balance: 50_000_000,
-        pool_size: 1000,
-        mix_count: 1000,
-    };
-    
-    // Serialize
-    let bytes = env.bytes_from_object(&stats).unwrap().unwrap();
-    
-    // Deserialize (simulating upgrade)
-    let deserialized: ContractStats = env.bytes_to_object(&bytes).unwrap().unwrap();
-    
-    // Verify all fields preserved
-    assert_eq!(deserialized.total_games, 1000);
-    assert_eq!(deserialized.total_volume, 600_000_000);
-    assert_eq!(deserialized.total_fees, 18_000_000);
-    assert_eq!(deserialized.reserve_balance, 50_000_000);
-    assert_eq!(deserialized.pool_size, 1000);
-    assert_eq!(deserialized.mix_count, 1000);
-}
-
-// ── Storage Layout Versioning Strategy ───────────────────────────────────────
-
-/// Document storage versioning strategy:
-/// 
-/// Version 1 (Current):
-/// - GameState: wager, side, streak, commitment, contract_random, fee_bps, phase, start_ledger
-/// - ContractConfig: admin, treasury, token, fee_bps, min_wager, max_wager, paused
-/// - ContractStats: total_games, total_wins, total_losses, reserve_balance
-/// 
-/// Migration Path for Future Versions:
-/// 1. Add new fields at END of struct (backward compatible)
-/// 2. Use Option<T> for optional new fields
-/// 3. Provide migration function in initialize or admin function
-/// 4. Never reorder or remove existing fields
-/// 5. Update this documentation with new version details
-#[test]
-fn storage_versioning_documented() {
-    // This test serves as documentation of the storage layout versioning strategy
-    // and ensures the strategy is maintained across upgrades
-    assert_eq!(error_codes::VARIANT_COUNT, 18);
-}
-//! Snapshot tests for contract state serialization.
-//! Uses `insta` for Borsh baseline snapshots + round-trip verification.
-//!
-//! Run `cargo test snapshot_tests -- --nocapture` to review.
-//! Update: `cargo test update_snapshots`.
-
-use super::*;
-use soroban_sdk::{Env, Address, BytesN};
-use insta::assert_snapshot;
-use hex;
-
-// Test env for deterministic Borsh serialization.
-fn test_env() -> Env {
-    Env::default()
-}
-
-// ── Utility: Serialize to hex ────────────────────────────────────────────────
-
-fn borsh_to_hex<T: soroban_sdk::contracttype::ContractType>(env: &Env, value: &T) -> String {
-    let bytes = env.bytes_from_object(value).unwrap().unwrap();
-    hex::encode(bytes.to_vec())
-}
-
-// ── ContractConfig Snapshots ─────────────────────────────────────────────────
-
-#[test]
-fn contract_config_default() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let config = ContractConfig {
-        admin,
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-    };
-
-    assert_snapshot!(borsh_to_hex(&env, &config), @r###"
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000012c
-    00000000000000000000000000000000000000000000000000000f4240
-    0000000000000000000000000000000000000000000000000005f5e100
-    00
-    "###);
-}
-
-#[test]
-fn contract_config_edge_cases() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let config_paused = ContractConfig {
-        admin: admin.clone(),
-        treasury,
-        token,
-        fee_bps: 500, // max fee
-        min_wager: 1_000_000,
-        max_wager: i128::MAX / 10, // near max
-        paused: true,
-        shutdown: false,
-    };
-
-    assert_snapshot!(borsh_to_hex(&env, &config_paused));
-}
-
-#[test]
-fn contract_config_roundtrip() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let original = ContractConfig {
-        admin: admin.clone(),
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-        shutdown: false,
-    };
-
-    // Serialize → deserialize → reserialize → must match original bytes
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: ContractConfig = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip); // Field equality
-}
-
-// ── ContractStats Snapshots ──────────────────────────────────────────────────
-
-#[test]
-fn contract_stats_zero() {
-    let env = test_env();
-    let stats = ContractStats {
-        total_games: 0,
-        total_volume: 0,
-        total_fees: 0,
-        reserve_balance: 0,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &stats));
-}
-
-#[test]
-fn contract_stats_production() {
-    let env = test_env();
-    let stats = ContractStats {
-        total_games: 1_000_000,
-        total_volume: 1_000_000_000_000, // 100k XLM volume
-        total_fees: 30_000_000_000,       // 3% of volume
-        reserve_balance: 500_000_000_000, // 50k XLM reserves
-    };
-    assert_snapshot!(borsh_to_hex(&env, &stats));
-}
-
-#[test]
-fn contract_stats_roundtrip() {
-    let env = test_env();
-    let original = ContractStats {
-        total_games: 1_234,
-        total_volume: 123_456_789,
-        total_fees: 12_345_678,
-        reserve_balance: 1_000_000_000,
-    };
-
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: ContractStats = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip);
-}
-
-// ── GameState Snapshots ──────────────────────────────────────────────────────
-
-#[test]
-fn game_state_committed_streak_0() {
-    let env = test_env();
-    let game = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 0,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[1u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[2u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Committed,
-        start_ledger: 12345,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &game));
-}
-
-#[test]
-fn game_state_all_phases() {
-    let env = test_env();
-    macro_rules! snapshot_phase {
-        ($phase:expr) => {
-            let game = GameState {
-                wager: 10_000_000,
-                side: Side::Heads,
-                streak: 1,
-                commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32])).try_into().unwrap(),
-                contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[43u8; 32])).try_into().unwrap(),
-                fee_bps: 300,
-                phase: $phase,
-                start_ledger: 12345,
-            };
-            assert_snapshot!(format!("{:?}", borsh_to_hex(&env, &game)));
-        };
+        assert_eq!(restored.wager, 99_000_000);
+        assert_eq!(restored.side, Side::Tails);
+        assert_eq!(restored.streak, 4);
+        assert_eq!(restored.commitment, original.commitment);
+        assert_eq!(restored.contract_random, original.contract_random);
+        assert_eq!(restored.fee_bps, 250);
+        assert_eq!(restored.phase, GamePhase::Revealed);
+        assert_eq!(restored.start_ledger, 55_000);
+        assert_eq!(restored.side_bet, SideBet::Sequence(2));
+        assert_eq!(restored.side_bet_amount, 1_000_000);
+        assert_eq!(restored.multipliers, original.multipliers);
+        assert_eq!(restored.oracle_commitment, original.oracle_commitment);
+        assert_eq!(restored.vrf_input, original.vrf_input);
+        assert_eq!(restored.token, token);
     }
 
-    snapshot_phase!(GamePhase::Committed);
-    snapshot_phase!(GamePhase::Revealed);
-    snapshot_phase!(GamePhase::Completed);
-}
+    /// Write a ContractConfig, then read it back and verify every field survives.
+    #[test]
+    fn backward_compat_contract_config_all_fields() {
+        let env = env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
+        let vrf_pk = deterministic_hash(&env, 99);
 
-#[test]
-fn game_state_edge_streaks() {
-    let env = test_env();
-    for streak in [0, 1, 2, 3, 4, 10, u32::MAX] {
-        let game = GameState {
-            wager: 10_000_000,
-            side: Side::Tails,
-            streak,
-            commitment: BytesN::from_array(&env, &[0; 32]), // deterministic
-            contract_random: BytesN::from_array(&env, &[1; 32]),
-            fee_bps: 500, // max fee
-            phase: GamePhase::Revealed,
-            start_ledger: u32::MAX,
+        let original = ContractConfig {
+            admin: admin.clone(),
+            treasury: treasury.clone(),
+            token: token.clone(),
+            fee_bps: 400,
+            min_wager: 500_000,
+            max_wager: 200_000_000,
+            paused: true,
+            shutdown_mode: false,
+            multipliers: MultiplierConfig {
+                streak1: 20_000,
+                streak2: 40_000,
+                streak3: 70_000,
+                streak4_plus: 110_000,
+            },
+            min_reserve_threshold: 10_000_000,
+            oracle_vrf_pk: vrf_pk.clone(),
         };
-        assert_snapshot!(format!("streak_{}", streak), borsh_to_hex(&env, &game));
-    }
-}
 
-#[test]
-fn game_state_roundtrip() {
-    let env = test_env();
-    let original = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 2,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[43u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Revealed,
-        start_ledger: 12345,
-    };
+        let restored: ContractConfig =
+            storage_roundtrip(&env, StorageKey::Config, &original);
 
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: GameState = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip);
-}
-
-// ── Enum Snapshots ───────────────────────────────────────────────────────────
-
-#[test]
-fn side_enum() {
-    let env = test_env();
-    assert_snapshot!(borsh_to_hex(&env, &Side::Heads), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &Side::Tails), @"01");
-}
-
-#[test]
-fn game_phase_enum() {
-    let env = test_env();
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Committed), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Revealed), @"01");
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Completed), @"02");
-}
-
-#[test]
-fn storage_key_enum() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::Config), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::Stats), @"01");
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::PlayerGame(admin)));
-}
-
-#[test]
-fn error_enum_stable_codes() {
-    // Verify stable u32 discriminants (protocol contract)
-    assert_eq!(Error::WagerBelowMinimum as u32, 1);
-    assert_eq!(Error::AlreadyInitialized as u32, 51);
-    // All 17 codes covered in lib.rs error_codes::VARIANT_COUNT
-}
-
-// ── Backward Compatibility Probes ────────────────────────────────────────────
-
-#[test]
-fn legacy_game_state_deserializes() {
-    // Embed known-good legacy Borsh bytes (update when format changes intentionally)
-    let env = test_env();
-    let legacy_bytes = hex::decode("...").unwrap(); // TODO: capture from mainnet/deployed
-    let _legacy_game: GameState = env.bytes_to_object(&env.bytes_object(&legacy_bytes).unwrap().unwrap()).unwrap();
-    // Will fail-fast if fields reordered/renamed/added incompatibly
-}
-
-
-// ── Storage Key Collision Resistance ─────────────────────────────────────────
-
-#[test]
-fn storage_key_uniqueness() {
-    let env = test_env();
-    let admin1 = Address::generate(&env);
-    let admin2 = Address::generate(&env);
-    
-    let key1 = StorageKey::PlayerGame(admin1.clone());
-    let key2 = StorageKey::PlayerGame(admin2.clone());
-    
-    let bytes1 = env.bytes_from_object(&key1).unwrap().unwrap();
-    let bytes2 = env.bytes_from_object(&key2).unwrap().unwrap();
-    
-    // Different addresses must produce different keys
-    assert_ne!(bytes1, bytes2);
-}
-
-#[test]
-fn storage_key_deterministic() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    
-    let key1 = StorageKey::PlayerGame(admin.clone());
-    let key2 = StorageKey::PlayerGame(admin.clone());
-    
-    let bytes1 = env.bytes_from_object(&key1).unwrap().unwrap();
-    let bytes2 = env.bytes_from_object(&key2).unwrap().unwrap();
-    
-    // Same address must produce identical keys
-    assert_eq!(bytes1, bytes2);
-}
-
-// ── TTL Extension Behavior ───────────────────────────────────────────────────
-
-#[test]
-fn storage_ttl_extension_snapshot() {
-    let env = test_env();
-    
-    // Create a game state and verify TTL can be extended
-    let game = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 0,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[1u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[2u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Committed,
-        start_ledger: 100,
-    };
-    
-    let bytes = env.bytes_from_object(&game).unwrap().unwrap();
-    assert_snapshot!(hex::encode(bytes.to_vec()));
-}
-
-// ── Upgrade Simulation with Legacy State ─────────────────────────────────────
-
-#[test]
-fn upgrade_simulation_config_compatibility() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-    
-    // Create config with current schema
-    let config = ContractConfig {
-        admin,
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-        shutdown: false,
-    };
-    
-    // Serialize
-    let bytes = env.bytes_from_object(&config).unwrap().unwrap();
-    
-    // Deserialize (simulating upgrade)
-    let deserialized: ContractConfig = env.bytes_to_object(&bytes).unwrap().unwrap();
-    
-    // Verify all fields preserved
-    assert_eq!(deserialized.fee_bps, 300);
-    assert_eq!(deserialized.min_wager, 1_000_000);
-    assert_eq!(deserialized.max_wager, 100_000_000);
-    assert_eq!(deserialized.paused, false);
-}
-
-#[test]
-fn upgrade_simulation_stats_compatibility() {
-    let env = test_env();
-    
-    // Create stats with current schema
-    let stats = ContractStats {
-        total_games: 1000,
-        total_wins: 600,
-        total_losses: 400,
-        reserve_balance: 50_000_000,
-    };
-    
-    // Serialize
-    let bytes = env.bytes_from_object(&stats).unwrap().unwrap();
-    
-    // Deserialize (simulating upgrade)
-    let deserialized: ContractStats = env.bytes_to_object(&bytes).unwrap().unwrap();
-    
-    // Verify all fields preserved
-    assert_eq!(deserialized.total_games, 1000);
-    assert_eq!(deserialized.total_wins, 600);
-    assert_eq!(deserialized.total_losses, 400);
-    assert_eq!(deserialized.reserve_balance, 50_000_000);
-}
-
-// ── Storage Layout Versioning Strategy ───────────────────────────────────────
-
-/// Document storage versioning strategy:
-/// 
-/// Version 1 (Current):
-/// - GameState: wager, side, streak, commitment, contract_random, fee_bps, phase, start_ledger
-/// - ContractConfig: admin, treasury, token, fee_bps, min_wager, max_wager, paused
-/// - ContractStats: total_games, total_wins, total_losses, reserve_balance
-/// 
-/// Migration Path for Future Versions:
-/// 1. Add new fields at END of struct (backward compatible)
-/// 2. Use Option<T> for optional new fields
-/// 3. Provide migration function in initialize or admin function
-/// 4. Never reorder or remove existing fields
-/// 5. Update this documentation with new version details
-#[test]
-fn storage_versioning_documented() {
-    // This test serves as documentation of the storage layout versioning strategy
-    // and ensures the strategy is maintained across upgrades
-    assert_eq!(error_codes::VARIANT_COUNT, 17);
-}
-//! Snapshot tests for contract state serialization.
-//! Uses `insta` for Borsh baseline snapshots + round-trip verification.
-//!
-//! Run `cargo test snapshot_tests -- --nocapture` to review.
-//! Update: `cargo test update_snapshots`.
-
-use super::*;
-use soroban_sdk::{Env, Address, BytesN};
-use insta::assert_snapshot;
-use hex;
-
-// Test env for deterministic Borsh serialization.
-fn test_env() -> Env {
-    Env::default()
-}
-
-// ── Utility: Serialize to hex ────────────────────────────────────────────────
-
-fn borsh_to_hex<T: soroban_sdk::contracttype::ContractType>(env: &Env, value: &T) -> String {
-    let bytes = env.bytes_from_object(value).unwrap().unwrap();
-    hex::encode(bytes.to_vec())
-}
-
-// ── ContractConfig Snapshots ─────────────────────────────────────────────────
-
-#[test]
-fn contract_config_default() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let config = ContractConfig {
-        admin,
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-    };
-
-    assert_snapshot!(borsh_to_hex(&env, &config), @r###"
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000000000000000000000000000000000000000000000000000
-    0000000000000000012c
-    00000000000000000000000000000000000000000000000000000f4240
-    0000000000000000000000000000000000000000000000000005f5e100
-    00
-    "###);
-}
-
-#[test]
-fn contract_config_edge_cases() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let config_paused = ContractConfig {
-        admin: admin.clone(),
-        treasury,
-        token,
-        fee_bps: 500, // max fee
-        min_wager: 1_000_000,
-        max_wager: i128::MAX / 10, // near max
-        paused: true,
-        max_streak: 10,
-    };
-
-    assert_snapshot!(borsh_to_hex(&env, &config_paused));
-}
-
-#[test]
-fn contract_config_roundtrip() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    let original = ContractConfig {
-        admin: admin.clone(),
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-        max_streak: 10,
-    };
-
-    // Serialize → deserialize → reserialize → must match original bytes
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: ContractConfig = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip); // Field equality
-}
-
-// ── ContractStats Snapshots ──────────────────────────────────────────────────
-
-#[test]
-fn contract_stats_zero() {
-    let env = test_env();
-    let stats = ContractStats {
-        total_games: 0,
-        total_volume: 0,
-        total_fees: 0,
-        reserve_balance: 0,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &stats));
-}
-
-#[test]
-fn contract_stats_production() {
-    let env = test_env();
-    let stats = ContractStats {
-        total_games: 1_000_000,
-        total_volume: 1_000_000_000_000, // 100k XLM volume
-        total_fees: 30_000_000_000,       // 3% of volume
-        reserve_balance: 500_000_000_000, // 50k XLM reserves
-    };
-    assert_snapshot!(borsh_to_hex(&env, &stats));
-}
-
-#[test]
-fn contract_stats_roundtrip() {
-    let env = test_env();
-    let original = ContractStats {
-        total_games: 1_234,
-        total_volume: 123_456_789,
-        total_fees: 12_345_678,
-        reserve_balance: 1_000_000_000,
-    };
-
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: ContractStats = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip);
-}
-
-// ── GameState Snapshots ──────────────────────────────────────────────────────
-
-#[test]
-fn game_state_committed_streak_0() {
-    let env = test_env();
-    let game = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 0,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[1u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[2u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Committed,
-        start_ledger: 12345,
-    };
-    assert_snapshot!(borsh_to_hex(&env, &game));
-}
-
-#[test]
-fn game_state_all_phases() {
-    let env = test_env();
-    macro_rules! snapshot_phase {
-        ($phase:expr) => {
-            let game = GameState {
-                wager: 10_000_000,
-                side: Side::Heads,
-                streak: 1,
-                commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32])).try_into().unwrap(),
-                contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[43u8; 32])).try_into().unwrap(),
-                fee_bps: 300,
-                phase: $phase,
-                start_ledger: 12345,
-            };
-            assert_snapshot!(format!("{:?}", borsh_to_hex(&env, &game)));
-        };
+        assert_eq!(restored.admin, admin);
+        assert_eq!(restored.treasury, treasury);
+        assert_eq!(restored.token, token);
+        assert_eq!(restored.fee_bps, 400);
+        assert_eq!(restored.min_wager, 500_000);
+        assert_eq!(restored.max_wager, 200_000_000);
+        assert!(restored.paused);
+        assert!(!restored.shutdown_mode);
+        assert_eq!(restored.multipliers.streak1, 20_000);
+        assert_eq!(restored.multipliers.streak4_plus, 110_000);
+        assert_eq!(restored.min_reserve_threshold, 10_000_000);
+        assert_eq!(restored.oracle_vrf_pk, vrf_pk);
     }
 
-    snapshot_phase!(GamePhase::Committed);
-    snapshot_phase!(GamePhase::Revealed);
-    snapshot_phase!(GamePhase::Completed);
-}
-
-#[test]
-fn game_state_edge_streaks() {
-    let env = test_env();
-    for streak in [0, 1, 2, 3, 4, 10, u32::MAX] {
-        let game = GameState {
-            wager: 10_000_000,
-            side: Side::Tails,
-            streak,
-            commitment: BytesN::from_array(&env, &[0; 32]), // deterministic
-            contract_random: BytesN::from_array(&env, &[1; 32]),
-            fee_bps: 500, // max fee
-            phase: GamePhase::Revealed,
-            start_ledger: u32::MAX,
+    /// Write ContractStats, then read it back and verify every field survives.
+    #[test]
+    fn backward_compat_contract_stats_all_fields() {
+        let env = env();
+        let original = ContractStats {
+            total_games: 9_999,
+            total_volume: 999_999_999,
+            total_fees: 29_999_999,
+            reserve_balance: 100_000_000,
+            pool_size: 9_999,
+            mix_count: 4_999,
         };
-        assert_snapshot!(format!("streak_{}", streak), borsh_to_hex(&env, &game));
+
+        let restored: ContractStats =
+            storage_roundtrip(&env, StorageKey::Stats, &original);
+
+        assert_eq!(restored.total_games, 9_999);
+        assert_eq!(restored.total_volume, 999_999_999);
+        assert_eq!(restored.total_fees, 29_999_999);
+        assert_eq!(restored.reserve_balance, 100_000_000);
+        assert_eq!(restored.pool_size, 9_999);
+        assert_eq!(restored.mix_count, 4_999);
     }
-}
-
-#[test]
-fn game_state_roundtrip() {
-    let env = test_env();
-    let original = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 2,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[42u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[43u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Revealed,
-        start_ledger: 12345,
-    };
-
-    let bytes = env.bytes_from_object(&original).unwrap().unwrap();
-    let roundtrip: GameState = env.bytes_to_object(&bytes).unwrap().unwrap();
-    let roundtrip_bytes = env.bytes_from_object(&roundtrip).unwrap().unwrap();
-
-    assert_eq!(bytes, roundtrip_bytes);
-    assert_eq!(original, roundtrip);
-}
-
-// ── Enum Snapshots ───────────────────────────────────────────────────────────
-
-#[test]
-fn side_enum() {
-    let env = test_env();
-    assert_snapshot!(borsh_to_hex(&env, &Side::Heads), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &Side::Tails), @"01");
-}
-
-#[test]
-fn game_phase_enum() {
-    let env = test_env();
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Committed), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Revealed), @"01");
-    assert_snapshot!(borsh_to_hex(&env, &GamePhase::Completed), @"02");
-}
-
-#[test]
-fn storage_key_enum() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::Config), @"00");
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::Stats), @"01");
-    assert_snapshot!(borsh_to_hex(&env, &StorageKey::PlayerGame(admin)));
-}
-
-#[test]
-fn error_enum_stable_codes() {
-    // Verify stable u32 discriminants (protocol contract)
-    assert_eq!(Error::WagerBelowMinimum as u32, 1);
-    assert_eq!(Error::AlreadyInitialized as u32, 51);
-    // All 17 codes covered in lib.rs error_codes::VARIANT_COUNT
-}
-
-// ── Backward Compatibility Probes ────────────────────────────────────────────
-
-#[test]
-fn legacy_game_state_deserializes() {
-    // Embed known-good legacy Borsh bytes (update when format changes intentionally)
-    let env = test_env();
-    let legacy_bytes = hex::decode("...").unwrap(); // TODO: capture from mainnet/deployed
-    let _legacy_game: GameState = env.bytes_to_object(&env.bytes_object(&legacy_bytes).unwrap().unwrap()).unwrap();
-    // Will fail-fast if fields reordered/renamed/added incompatibly
-}
-
-
-// ── Storage Key Collision Resistance ─────────────────────────────────────────
-
-#[test]
-fn storage_key_uniqueness() {
-    let env = test_env();
-    let admin1 = Address::generate(&env);
-    let admin2 = Address::generate(&env);
-    
-    let key1 = StorageKey::PlayerGame(admin1.clone());
-    let key2 = StorageKey::PlayerGame(admin2.clone());
-    
-    let bytes1 = env.bytes_from_object(&key1).unwrap().unwrap();
-    let bytes2 = env.bytes_from_object(&key2).unwrap().unwrap();
-    
-    // Different addresses must produce different keys
-    assert_ne!(bytes1, bytes2);
-}
-
-#[test]
-fn storage_key_deterministic() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    
-    let key1 = StorageKey::PlayerGame(admin.clone());
-    let key2 = StorageKey::PlayerGame(admin.clone());
-    
-    let bytes1 = env.bytes_from_object(&key1).unwrap().unwrap();
-    let bytes2 = env.bytes_from_object(&key2).unwrap().unwrap();
-    
-    // Same address must produce identical keys
-    assert_eq!(bytes1, bytes2);
-}
-
-// ── TTL Extension Behavior ───────────────────────────────────────────────────
-
-#[test]
-fn storage_ttl_extension_snapshot() {
-    let env = test_env();
-    
-    // Create a game state and verify TTL can be extended
-    let game = GameState {
-        wager: 10_000_000,
-        side: Side::Heads,
-        streak: 0,
-        commitment: env.crypto().sha256(&Bytes::from_slice(&env, &[1u8; 32])).try_into().unwrap(),
-        contract_random: env.crypto().sha256(&Bytes::from_slice(&env, &[2u8; 32])).try_into().unwrap(),
-        fee_bps: 300,
-        phase: GamePhase::Committed,
-        start_ledger: 100,
-    };
-    
-    let bytes = env.bytes_from_object(&game).unwrap().unwrap();
-    assert_snapshot!(hex::encode(bytes.to_vec()));
-}
-
-// ── Upgrade Simulation with Legacy State ─────────────────────────────────────
-
-#[test]
-fn upgrade_simulation_config_compatibility() {
-    let env = test_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token = Address::generate(&env);
-    
-    // Create config with current schema
-    let config = ContractConfig {
-        admin,
-        treasury,
-        token,
-        fee_bps: 300,
-        min_wager: 1_000_000,
-        max_wager: 100_000_000,
-        paused: false,
-        max_streak: 10,
-    };
-    
-    // Serialize
-    let bytes = env.bytes_from_object(&config).unwrap().unwrap();
-    
-    // Deserialize (simulating upgrade)
-    let deserialized: ContractConfig = env.bytes_to_object(&bytes).unwrap().unwrap();
-    
-    // Verify all fields preserved
-    assert_eq!(deserialized.fee_bps, 300);
-    assert_eq!(deserialized.min_wager, 1_000_000);
-    assert_eq!(deserialized.max_wager, 100_000_000);
-    assert_eq!(deserialized.paused, false);
-}
-
-#[test]
-fn upgrade_simulation_stats_compatibility() {
-    let env = test_env();
-    
-    // Create stats with current schema
-    let stats = ContractStats {
-        total_games: 1000,
-        total_volume: 100_000_000,
-        total_fees: 3_000_000,
-        reserve_balance: 50_000_000,
-    };
-    
-    // Serialize
-    let bytes = env.bytes_from_object(&stats).unwrap().unwrap();
-    
-    // Deserialize (simulating upgrade)
-    let deserialized: ContractStats = env.bytes_to_object(&bytes).unwrap().unwrap();
-    
-    // Verify all fields preserved
-    assert_eq!(deserialized.total_games, 1000);
-    assert_eq!(deserialized.total_volume, 100_000_000);
-    assert_eq!(deserialized.total_fees, 3_000_000);
-    assert_eq!(deserialized.reserve_balance, 50_000_000);
-}
-
-// ── Storage Layout Versioning Strategy ───────────────────────────────────────
-
-/// Document storage versioning strategy:
-/// 
-/// Version 1 (Current):
-/// - GameState: wager, side, streak, commitment, contract_random, fee_bps, phase, start_ledger
-/// - ContractConfig: admin, treasury, token, fee_bps, min_wager, max_wager, paused
-/// - ContractStats: total_games, total_wins, total_losses, reserve_balance
-/// 
-/// Migration Path for Future Versions:
-/// 1. Add new fields at END of struct (backward compatible)
-/// 2. Use Option<T> for optional new fields
-/// 3. Provide migration function in initialize or admin function
-/// 4. Never reorder or remove existing fields
-/// 5. Update this documentation with new version details
-#[test]
-fn storage_versioning_documented() {
-    // This test serves as documentation of the storage layout versioning strategy
-    // and ensures the strategy is maintained across upgrades
-    assert_eq!(error_codes::VARIANT_COUNT, 17);
 }

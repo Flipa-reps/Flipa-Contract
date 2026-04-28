@@ -6826,6 +6826,7 @@ impl CoinflipContract {
 
 #[cfg(test)]
 mod arithmetic_tests;
+mod snapshot_tests;
 
 #[cfg(test)]
 mod config_versioning_tests;
