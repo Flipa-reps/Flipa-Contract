@@ -6852,6 +6852,9 @@ mod dynamic_reserve_tests;
 mod phase_transition_tests;
 
 #[cfg(test)]
+mod integration_win_cashout_tests;
+
+#[cfg(test)]
 mod streak_tests;
 
 #[cfg(test)]
