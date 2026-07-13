@@ -54,7 +54,7 @@ async function injectAlbedoStub(page: Page) {
 test.describe("Page load @cross-browser", () => {
   test("landing page loads and renders hero content", async ({ page }) => {
     await page.goto("/");
-    await expect(page).toHaveTitle(/tossd/i);
+    await expect(page).toHaveTitle(/flipa/i);
     // At least one primary CTA or heading must be visible
     const hero = page.getByRole("heading", { level: 1 }).or(
       page.getByRole("button", { name: /play|start|connect/i }).first()

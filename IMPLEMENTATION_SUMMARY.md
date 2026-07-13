@@ -1,7 +1,7 @@
 # Implementation Summary: Issues #400-403
 
 ## Overview
-Successfully implemented comprehensive testing infrastructure for the Tossd Soroban smart contract across four GitHub issues. All changes committed to branch `test/400-401-402-403`.
+Successfully implemented comprehensive testing infrastructure for the Flipa Soroban smart contract across four GitHub issues. All changes committed to branch `test/400-401-402-403`.
 
 ## Issues Implemented
 

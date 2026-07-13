@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This feature adds configuration versioning and atomic rollback to the Tossd
+This feature adds configuration versioning and atomic rollback to the Flipa
 coinflip contract. Every admin-initiated change to `ContractConfig` creates an
 immutable versioned snapshot. The admin can list available versions, compare
 any two versions, and atomically revert the live configuration to any prior
@@ -16,7 +16,7 @@ Closes #508.
 
 ## Glossary
 
-- **Contract**: The Tossd Soroban coinflip smart contract.
+- **Contract**: The Flipa Soroban coinflip smart contract.
 - **Admin**: The privileged address stored in `ContractConfig.admin`; the only
   caller permitted to invoke config-management entry points.
 - **ContractConfig**: The existing struct holding all contract-wide settings

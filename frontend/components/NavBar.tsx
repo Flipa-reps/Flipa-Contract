@@ -6,7 +6,7 @@ const NAV_LINKS = [
   { label: "How It Works", href: "#how-it-works" },
   { label: "Economics", href: "#economics" },
   { label: "Security", href: "#security" },
-  { label: "Audit Contract", href: "https://github.com/Tossd-Org/Tossd" },
+  { label: "Audit Contract", href: "https://github.com/Flipa-Org/Flipa" },
 ];
 
 export interface NavBarProps {
@@ -39,8 +39,8 @@ export function NavBar({ onConnectWallet, walletConnected = false }: NavBarProps
       role="banner"
       data-scrolled={scrolled}
     >
-      <a href="/" className={styles.logo} aria-label="Tossd home">
-        Tossd
+      <a href="/" className={styles.logo} aria-label="Flipa home">
+        Flipa
       </a>
 
       {/* Desktop nav */}

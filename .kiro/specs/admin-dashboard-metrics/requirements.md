@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This feature adds a comprehensive real-time admin dashboard for the Tossd coinflip
+This feature adds a comprehensive real-time admin dashboard for the Flipa coinflip
 contract. It introduces a metrics collection layer that reads on-chain `ContractStats`,
 `ContractConfig`, and per-player data; a backend API that aggregates and exposes those
 metrics; a WebSocket server that streams live updates to connected admin clients; and a
@@ -36,7 +36,7 @@ Closes #511.
   incoming `MetricsSnapshot` data and emits `Alert` records.
 - **Admin**: The privileged address stored in `ContractConfig.admin`; the only user
   permitted to access the Dashboard and manage `Alert_Rule` entries.
-- **Contract**: The Tossd Soroban coinflip smart contract.
+- **Contract**: The Flipa Soroban coinflip smart contract.
 - **ContractStats**: The on-chain aggregate statistics struct (`total_games`,
   `total_volume`, `total_fees`, `reserve_balance`, `pool_size`, `mix_count`).
 - **ContractConfig**: The on-chain contract configuration struct (`paused`,

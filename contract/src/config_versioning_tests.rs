@@ -108,7 +108,7 @@ fn test_rollback_emits_event() {
     // Check event
     let events = env.events().all();
     let last_event = events.last().unwrap();
-    assert_eq!(last_event.0, (symbol_short!("tossd"), Symbol::new(&env, "config_rollback")));
+    assert_eq!(last_event.0, (symbol_short!("flipa"), Symbol::new(&env, "config_rollback")));
     let (target_v, new_v): (u32, u32) = last_event.1.try_into().unwrap();
     assert_eq!(target_v, 1);
     assert_eq!(new_v, 3); // version 3 is the rollback audit snapshot

@@ -188,7 +188,7 @@ export class ImmutableAuditLog {
       maxEntries?: number;
     } = {},
   ) {
-    this.storeName = options.storeName ?? "tossd-security-log";
+    this.storeName = options.storeName ?? "flipa-security-log";
     this.maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
   }
 

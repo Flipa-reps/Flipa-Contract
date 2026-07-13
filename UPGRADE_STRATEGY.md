@@ -1,8 +1,8 @@
-# Tossd Contract Upgrade Strategy
+# Flipa Contract Upgrade Strategy
 
 ## Overview
 
-This document outlines the zero-downtime upgrade procedures and backward compatibility guarantees for the Tossd coinflip contract.
+This document outlines the zero-downtime upgrade procedures and backward compatibility guarantees for the Flipa coinflip contract.
 
 ## Upgrade Principles
 

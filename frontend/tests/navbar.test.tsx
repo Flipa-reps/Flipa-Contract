@@ -18,7 +18,7 @@ describe("NavBar — rendering", () => {
 
   it("renders the logo link", () => {
     render(<NavBar />);
-    expect(screen.getByRole("link", { name: /tossd home/i })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /flipa home/i })).toBeInTheDocument();
   });
 
   it("renders all desktop nav links", () => {

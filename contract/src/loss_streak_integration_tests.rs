@@ -1,6 +1,6 @@
 /// # Integration Tests: Loss at Multiple Streak Levels
 ///
-/// Closes: https://github.com/Tossd-Org/Tossd/issues/153
+/// Closes: https://github.com/Flipa-Org/Flipa/issues/153
 ///
 /// ## Coverage
 ///

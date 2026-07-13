@@ -1,5 +1,5 @@
-# Tossd Design Tokens
-> Source of truth: `frontend/tokens/tossd.tokens.css`
+# Flipa Design Tokens
+> Source of truth: `frontend/tokens/flipa.tokens.css`
 > Style direction: `webapp-02-japaneseswiss_light`
 >
 > **Rule: never use raw hex or px values in components. Always reference a token.**

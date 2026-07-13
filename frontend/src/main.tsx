@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
-import "../tokens/tossd.tokens.css";
+import "../tokens/flipa.tokens.css";
 import "../typography/fonts.css";
 import "../typography/typography.css";
 import "./styles.css";

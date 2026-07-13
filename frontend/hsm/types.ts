@@ -2,7 +2,7 @@
  * HSM (Hardware Security Module) type definitions.
  *
  * Defines the core interfaces for HSM-backed cryptographic operations used
- * throughout the Tossd application. All signing and key management operations
+ * throughout the Flipa application. All signing and key management operations
  * should flow through these abstractions rather than touching raw key material.
  */
 

@@ -193,7 +193,7 @@ export class HsmContractAdapter implements ContractAdapter {
       const result = await this.hsm.sign({
         keyId: this.options.signingKeyId,
         message: payloadBytes,
-        context: `tossd:${operation}`,
+        context: `flipa:${operation}`,
       });
 
       entry.signatureHex = result.signatureHex;

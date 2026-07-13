@@ -52,7 +52,7 @@ describe("crypto utilities", () => {
   });
 
   it("sha256 is deterministic", async () => {
-    const input = new TextEncoder().encode("tossd");
+    const input = new TextEncoder().encode("flipa");
     const a = await sha256(input);
     const b = await sha256(input);
     expect(bytesToHex(a)).toBe(bytesToHex(b));

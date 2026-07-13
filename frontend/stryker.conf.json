@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker/main/packages/core/schema/stryker-schema.json",
-  "_comment": "Mutation testing config for Tossd frontend (#380)",
+  "_comment": "Mutation testing config for Flipa frontend (#380)",
   "testRunner": "vitest",
   "tsconfigFile": "tsconfig.json",
   "packageManager": "npm",

@@ -16,7 +16,7 @@ Closes #509.
 
 ## Glossary
 
-- **Contract**: The Tossd CosmWasm/Soroban coinflip smart contract.
+- **Contract**: The Flipa CosmWasm/Soroban coinflip smart contract.
 - **Admin**: The privileged address stored in `ContractConfig.admin`; the only
   caller permitted to invoke pause-management entry points.
 - **Operation**: A discrete, player-facing contract entry point. The four

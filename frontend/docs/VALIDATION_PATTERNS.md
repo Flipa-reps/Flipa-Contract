@@ -1,6 +1,6 @@
 # Frontend Validation Patterns
 
-This document outlines the validation and sanitization patterns used in the Tossd frontend to ensure data integrity and prevent security vulnerabilities like XSS.
+This document outlines the validation and sanitization patterns used in the Flipa frontend to ensure data integrity and prevent security vulnerabilities like XSS.
 
 ## Core Principles
 

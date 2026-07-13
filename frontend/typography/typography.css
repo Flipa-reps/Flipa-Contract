@@ -1,11 +1,11 @@
 /**
- * Tossd Typography System — frontend/typography/typography.css
+ * Flipa Typography System — frontend/typography/typography.css
  *
  * Utility classes for the full type scale. All values reference tokens from
- * tossd.tokens.css — never use raw values in components.
+ * flipa.tokens.css — never use raw values in components.
  *
  * Import order:
- *   1. @import "../tokens/tossd.tokens.css";
+ *   1. @import "../tokens/flipa.tokens.css";
  *   2. @import "../typography/typography.css";
  *
  * Contrast audit (WCAG AA, 4.5:1 minimum for normal text):
@@ -17,7 +17,7 @@
  *   --color-fg-muted     #757575 on #FFFFFF  →  4.6:1  ✓ AA (large text only for muted)
  */
 
-@import "../tokens/tossd.tokens.css";
+@import "../tokens/flipa.tokens.css";
 
 /* ── Base reset ─────────────────────────────────────────────────────────────── */
 

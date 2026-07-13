@@ -1,5 +1,5 @@
 /**
- * Tossd Font Loading — frontend/typography/fonts.css
+ * Flipa Font Loading — frontend/typography/fonts.css
  *
  * Strategy: system-font fallbacks ship immediately; custom fonts load via
  * Google Fonts CDN with font-display:swap so text is never invisible.

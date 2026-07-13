@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implement the backend API for Tossd game session orchestration (soroban-coinflip-game
+Implement the backend API for Flipa game session orchestration (soroban-coinflip-game
 spec). The work is split across four layers: shared types and project bootstrap,
 transaction builder service, read model service, and session orchestrator. All backend
 code lives in a new `backend/` directory. The frontend integration layer extends the

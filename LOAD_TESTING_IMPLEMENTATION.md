@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implemented a comprehensive distributed load generation framework simulating hundreds to thousands of concurrent actors for the Tossd coinflip game.
+Implemented a comprehensive distributed load generation framework simulating hundreds to thousands of concurrent actors for the Flipa coinflip game.
 
 ## What Was Implemented
 

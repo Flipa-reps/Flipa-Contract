@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/deploy-testnet.sh
 #
-# Builds the Tossd Soroban contract and deploys it to Stellar testnet.
+# Builds the Flipa Soroban contract and deploys it to Stellar testnet.
 # Outputs the deployed CONTRACT_ID for use in integration tests.
 #
 # Prerequisites:
@@ -17,10 +17,10 @@
 
 set -euo pipefail
 
-IDENTITY="${IDENTITY:-tossd-deployer}"
+IDENTITY="${IDENTITY:-flipa-deployer}"
 NETWORK="testnet"
 MANIFEST="contract/Cargo.toml"
-WASM_PATH="contract/target/wasm32-unknown-unknown/release/tossd_contract.wasm"
+WASM_PATH="contract/target/wasm32-unknown-unknown/release/flipa_contract.wasm"
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 echo "==> Building contract (release)…"

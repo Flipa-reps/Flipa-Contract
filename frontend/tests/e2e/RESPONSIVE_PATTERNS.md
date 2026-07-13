@@ -1,6 +1,6 @@
 # Responsive Patterns
 
-`frontend/tests/e2e/responsive.spec.ts` validates the responsive behavior that the current Tossd landing page actually ships today.
+`frontend/tests/e2e/responsive.spec.ts` validates the responsive behavior that the current Flipa landing page actually ships today.
 
 ## Viewport matrix
 

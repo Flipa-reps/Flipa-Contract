@@ -12,7 +12,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe, toHaveNoViolations } from "jest-axe";
 import { vi } from "vitest";
-import tokens from "../tokens/tossd.tokens.json";
+import tokens from "../tokens/flipa.tokens.json";
 import { App } from "../src/App";
 import { Button } from "../components/Button";
 import { CoinFlip } from "../components/CoinFlip";

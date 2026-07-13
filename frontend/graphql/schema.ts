@@ -1,4 +1,4 @@
-// GraphQL schema definition for Tossd
+// GraphQL schema definition for Flipa
 export const typeDefs = `
   type GameState {
     id: ID!

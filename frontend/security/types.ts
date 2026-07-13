@@ -1,7 +1,7 @@
 /**
  * Security event logging types
  *
- * Defines the comprehensive security event taxonomy for the Tossd application.
+ * Defines the comprehensive security event taxonomy for the Flipa application.
  * All security-relevant operations emit typed events that are aggregated into
  * an immutable, tamper-evident audit log.
  *
