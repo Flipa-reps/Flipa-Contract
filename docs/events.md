@@ -1,4 +1,4 @@
-# Tossd Contract Event Schema
+# Flipa Contract Event Schema
 
 All state-changing contract functions emit a Soroban event atomically with the
 state write.  Events are never emitted on guard failures — their presence
@@ -9,11 +9,11 @@ implies the corresponding state change succeeded.
 Every event uses a two-element topic tuple:
 
 ```
-(Symbol("tossd"), Symbol("<action>"))
+(Symbol("flipa"), Symbol("<action>"))
 ```
 
-Off-chain indexers can subscribe to all Tossd events by filtering on the first
-topic (`"tossd"`) and further narrow by action using the second topic.
+Off-chain indexers can subscribe to all Flipa events by filtering on the first
+topic (`"flipa"`) and further narrow by action using the second topic.
 
 ---
 
@@ -32,7 +32,7 @@ Emitted once by `initialize`.
 | `min_wager` | `i128`    | Inclusive minimum wager in stroops   |
 | `max_wager` | `i128`    | Inclusive maximum wager in stroops   |
 
-Topics: `("tossd", "init")`
+Topics: `("flipa", "init")`
 
 ---
 
@@ -48,7 +48,7 @@ Emitted by `start_game` on success.
 | `commitment` | `BytesN<32>` | SHA-256 hash of the player's secret      |
 | `ledger`     | `u32`        | Ledger sequence at game creation         |
 
-Topics: `("tossd", "started")`
+Topics: `("flipa", "started")`
 
 ---
 
@@ -63,7 +63,7 @@ Emitted by `reveal` on both win and loss paths.
 | `streak`  | `u32`     | Post-reveal streak (1+ on win, 0 on loss)        |
 | `outcome` | `Side`    | Derived outcome (`Heads` or `Tails`)             |
 
-Topics: `("tossd", "revealed")`
+Topics: `("flipa", "revealed")`
 
 Notes:
 - On a win, `streak` is the incremented value (≥ 1).
@@ -83,7 +83,7 @@ Emitted by `cash_out` and `claim_winnings` on success.
 | `streak` | `u32`     | Streak level at settlement                                   |
 | `method` | `Symbol`  | `"cash_out"` or `"claim_winnings"`                           |
 
-Topics: `("tossd", "settled")`
+Topics: `("flipa", "settled")`
 
 Notes:
 - `payout + fee == gross_payout` where `gross = wager × multiplier / 10_000`.
@@ -101,7 +101,7 @@ Emitted by `continue_streak` on success.
 | `streak`         | `u32`        | Current streak (preserved, not reset)    |
 | `new_commitment` | `BytesN<32>` | New commitment for the next round        |
 
-Topics: `("tossd", "continued")`
+Topics: `("flipa", "continued")`
 
 ---
 
@@ -115,7 +115,7 @@ Emitted by `reclaim_wager` on success.
 | `wager`  | `i128`    | Reclaimed wager amount in stroops                |
 | `ledger` | `u32`     | Ledger sequence at original game creation        |
 
-Topics: `("tossd", "reclaimed")`
+Topics: `("flipa", "reclaimed")`
 
 ---
 
@@ -128,7 +128,7 @@ Emitted by `set_paused`, `set_treasury`, `set_wager_limits`, and `set_fee`.
 | `action` | `Symbol`  | One of `"set_paused"`, `"set_treasury"`, `"set_wager_limits"`, `"set_fee"` |
 | `admin`  | `Address` | Admin address that performed the action                            |
 
-Topics: `("tossd", "admin")`
+Topics: `("flipa", "admin")`
 
 Notes:
 - The new configuration values are not included in the event payload; read

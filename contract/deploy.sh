@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy.sh — Tossd coinflip contract deployment script
+# deploy.sh — Flipa coinflip contract deployment script
 # Usage: ./deploy.sh [testnet|mainnet]
 #
 # Prerequisites:

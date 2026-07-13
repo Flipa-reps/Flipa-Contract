@@ -3,7 +3,7 @@
 ## Overview
 
 This feature adds per-player statistics tracking and a multi-category leaderboard to
-the Tossd Soroban coinflip contract. It consists of four integrated layers:
+the Flipa Soroban coinflip contract. It consists of four integrated layers:
 
 1. **Contract layer (Rust / Soroban)** — new `PlayerStats` struct, three sorted
    `LeaderboardIndex` entries in persistent storage, atomic stats updates on every

@@ -2,8 +2,8 @@
 
 ## Introduction
 
-This feature defines the backend API contract for the Tossd coinflip game session
-orchestration layer. The API sits between the React/TypeScript frontend and the Tossd
+This feature defines the backend API contract for the Flipa coinflip game session
+orchestration layer. The API sits between the React/TypeScript frontend and the Flipa
 Soroban smart contract on Stellar. It provides unsigned transaction preparation,
 read-model endpoints for game state and contract configuration, and session lifecycle
 tracking. The backend is a stateless, serverless relay: it never holds private keys,
@@ -29,7 +29,7 @@ Closes the backend API spec work tracked in the soroban-coinflip-game spec.
 - **Commitment**: SHA-256 hash of the player's secret random value, submitted at game
   start so the player cannot change their random input after seeing the contract's
   contribution.
-- **Contract**: The Tossd Soroban coinflip smart contract; the source of truth for all
+- **Contract**: The Flipa Soroban coinflip smart contract; the source of truth for all
   game rules and financial state.
 - **Wallet**: The player's Stellar wallet extension (Freighter / xBull); the sole
   private key custodian.

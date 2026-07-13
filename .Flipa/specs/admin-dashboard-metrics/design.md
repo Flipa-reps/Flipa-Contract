@@ -2,7 +2,7 @@
 
 ## Overview
 
-This feature adds a real-time admin analytics dashboard for the Tossd Soroban coinflip
+This feature adds a real-time admin analytics dashboard for the Flipa Soroban coinflip
 contract (issue #511). It consists of five integrated layers:
 
 1. **Metrics Collector** — a Node.js/TypeScript backend service that polls the Soroban

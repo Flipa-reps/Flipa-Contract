@@ -1,5 +1,5 @@
-# Tossd Component Specs & Redlines
-> All measurements reference tokens from `frontend/tokens/tossd.tokens.css`.
+# Flipa Component Specs & Redlines
+> All measurements reference tokens from `frontend/tokens/flipa.tokens.css`.
 > Every component lives in `frontend/components/<Name>.tsx` + `<Name>.module.css`.
 
 ---

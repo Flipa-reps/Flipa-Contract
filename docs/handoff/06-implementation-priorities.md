@@ -1,4 +1,4 @@
-# Tossd Implementation Priorities
+# Flipa Implementation Priorities
 
 ---
 
@@ -8,7 +8,7 @@ These are required for any playable state. Nothing else ships until these are do
 
 | # | Component | File | Notes |
 |---|---|---|---|
-| 1 | Design tokens | `tokens/tossd.tokens.css` | Must be imported before any component renders |
+| 1 | Design tokens | `tokens/flipa.tokens.css` | Must be imported before any component renders |
 | 2 | Button | `Button.tsx` | All 3 variants + loading state + icon slots |
 | 3 | LoadingSpinner | `LoadingSpinner.tsx` | Used inside Button and standalone |
 | 4 | Modal | `Modal.tsx` | Base for WalletModal and CashOutModal |

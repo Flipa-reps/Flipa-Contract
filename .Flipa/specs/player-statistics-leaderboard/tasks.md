@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implement per-player statistics tracking and a multi-category leaderboard for the Tossd
+Implement per-player statistics tracking and a multi-category leaderboard for the Flipa
 Soroban coinflip contract (player-statistics-leaderboard spec). The work is split across
 four layers: Soroban contract (Rust), backend read-model API (TypeScript), React frontend
 UI, and property/unit tests for each layer.

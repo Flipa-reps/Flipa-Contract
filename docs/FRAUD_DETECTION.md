@@ -40,7 +40,7 @@ review. This avoids false positives disrupting legitimate players.
 `set_fraud_flag` persists a `FraudFlag` and emits an on-chain event:
 
 ```
-event topic:  (Symbol("tossd"), Symbol("fraud_flag"))
+event topic:  (Symbol("flipa"), Symbol("fraud_flag"))
 event data:   (player: Address, reason: Symbol)
 ```
 

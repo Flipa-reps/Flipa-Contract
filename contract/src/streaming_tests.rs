@@ -51,11 +51,11 @@ fn inject_revealed(env: &Env, contract_id: &Address, player: &Address, streak: u
     });
 }
 
-/// Find the last `("tossd", "stats")` event in the recorded event log.
+/// Find the last `("flipa", "stats")` event in the recorded event log.
 fn last_stats_event(env: &Env) -> Option<EventStatsUpdated> {
     let expected_topics = vec![
         env,
-        symbol_short!("tossd").into_val(env),
+        symbol_short!("flipa").into_val(env),
         symbol_short!("stats").into_val(env),
     ];
     for (_, topics, data) in env.events().all().iter().rev() {
@@ -236,7 +236,7 @@ fn test_reclaim_wager_emits_stats_updated_with_trigger_reclaim() {
 // ── event topic filtering ─────────────────────────────────────────────────────
 
 #[test]
-fn test_stats_events_use_tossd_stats_topics() {
+fn test_stats_events_use_flipa_stats_topics() {
     let env = Env::default();
     let (contract_id, client) = setup(&env);
     fund_reserves(&env, &contract_id, 1_000_000_000);
@@ -246,7 +246,7 @@ fn test_stats_events_use_tossd_stats_topics() {
 
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("stats").into_val(&env),
     ];
 

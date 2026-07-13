@@ -107,7 +107,7 @@ Add immutable config snapshots and atomic rollback to `lib.rs`. Every admin conf
     - **Validates: Requirements 1.4, 1.5**
 
 - [ ] 7. Add unit tests in `config_versioning_tests.rs`
-  - Create `Tossd/contract/src/config_versioning_tests.rs`
+  - Create `Flipa/contract/src/config_versioning_tests.rs`
   - Add module declaration in `lib.rs`: `#[cfg(test)] mod config_versioning_tests;`
   - Implement the following unit tests:
     - `test_initialize_creates_version_1` — history has one entry with `version_number = 1` after `initialize` (Req 1.7)

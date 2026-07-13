@@ -3,7 +3,7 @@
 ## Introduction
 
 This feature adds per-player statistics tracking and a multi-category leaderboard to
-the Tossd Soroban coinflip contract. Every game settlement atomically updates a
+the Flipa Soroban coinflip contract. Every game settlement atomically updates a
 `PlayerStats` record stored in persistent contract storage. Three leaderboard indexes
 (by total wagered, by games won, and by best streak) are maintained as sorted vectors
 and exposed through new read-only contract entry points. A privacy control lets players
@@ -18,7 +18,7 @@ Closes the player statistics and leaderboard work tracked in issue
 
 ## Glossary
 
-- **Contract**: The Tossd Soroban coinflip smart contract written in Rust using the
+- **Contract**: The Flipa Soroban coinflip smart contract written in Rust using the
   Soroban SDK (`no_std`).
 - **PlayerStats**: The on-chain per-player statistics record stored under
   `StorageKey::PlayerStats(Address)` in persistent storage. Fields: `games_played`

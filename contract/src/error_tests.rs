@@ -1,4 +1,4 @@
-/// Comprehensive error code stability validation tests for the Tossd contract.
+/// Comprehensive error code stability validation tests for the Flipa contract.
 ///
 /// # Coverage
 /// - Test all 18 error variants are reachable

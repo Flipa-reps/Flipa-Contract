@@ -2,7 +2,7 @@
 
 ## Overview
 
-This feature defines the backend (serverless) API contract for the Tossd coinflip game
+This feature defines the backend (serverless) API contract for the Flipa coinflip game
 session orchestration layer. It sits between the browser wallet and the Soroban smart
 contract, providing three responsibilities:
 
@@ -40,7 +40,7 @@ graph TD
 
     subgraph Stellar Network
         RPC[Soroban RPC]
-        SC[Tossd Contract]
+        SC[Flipa Contract]
     end
 
     subgraph Persistence

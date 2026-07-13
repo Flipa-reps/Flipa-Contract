@@ -2,7 +2,7 @@
 
 ## Overview
 
-This feature adds immutable configuration snapshots and atomic rollback to the Tossd
+This feature adds immutable configuration snapshots and atomic rollback to the Flipa
 Soroban coinflip contract (issue #508). Every admin-initiated `ContractConfig` mutation
 automatically appends a `ConfigVersion` to a persistent history store. The admin can
 list versions, retrieve a specific version, diff two versions, and atomically revert the
@@ -423,7 +423,7 @@ Each property test must include a comment referencing the design property:
 
 Each correctness property (1–11) must be implemented by a single `proptest!` block.
 
-**Test file:** `Tossd/contract/src/config_versioning_tests.rs`
+**Test file:** `Flipa/contract/src/config_versioning_tests.rs`
 
 ```rust
 use proptest::prelude::*;

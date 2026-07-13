@@ -1,15 +1,15 @@
-# Tossd Asset & Export Notes
+# Flipa Asset & Export Notes
 
 ---
 
 ## Design Tokens
 
-**Canonical file:** `frontend/tokens/tossd.tokens.css`
-**JSON mirror:** `frontend/tokens/tossd.tokens.json` (source of truth for tooling/Figma sync)
+**Canonical file:** `frontend/tokens/flipa.tokens.css`
+**JSON mirror:** `frontend/tokens/flipa.tokens.json` (source of truth for tooling/Figma sync)
 
 Import in every component CSS module:
 ```css
-@import "../tokens/tossd.tokens.css";
+@import "../tokens/flipa.tokens.css";
 ```
 
 Never import tokens from a relative path that skips the `tokens/` directory. Always use the canonical path.
@@ -88,7 +88,7 @@ Every component has a co-located `.module.css` file. No global class names excep
 
 ## Brand Usage Rules
 
-1. **Logo text:** "Tossd" — `--font-display` · weight `700` · `--color-fg-primary`
+1. **Logo text:** "Flipa" — `--font-display` · weight `700` · `--color-fg-primary`
 2. **Tagline:** "Trustless coinflips on Soroban." — `--font-body` · `--color-fg-secondary`
 3. **Accent color** (`#0F766E`) is used for: active states, focus rings, eyebrows, step indicators, spinner accent, brand-accent-soft backgrounds
 4. **Ink color** (`#111111`) is used for: primary buttons, logo, CTA links
@@ -98,6 +98,6 @@ Every component has a co-located `.module.css` file. No global class names excep
 
 ## Figma / Design Tool Handoff
 
-- Token values are in `frontend/tokens/tossd.tokens.json` — import into Figma via Tokens Studio or equivalent
+- Token values are in `frontend/tokens/flipa.tokens.json` — import into Figma via Tokens Studio or equivalent
 - Component structure mirrors the file tree: one component per file, co-located CSS
 - All spacing, color, and type decisions map 1:1 to tokens — no custom values in Figma
