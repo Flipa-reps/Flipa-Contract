@@ -1,4 +1,4 @@
-//! # Tossd Coinflip Contract
+//! # Flipa Coinflip Contract
 //!
 //! Provably fair coinflip game on the Stellar/Soroban smart contract platform.
 //!
@@ -30,6 +30,7 @@
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Bytes, BytesN, Env, Symbol};
+use soroban_sdk::xdr::ToXdr;
 
 /// Stable error code constants for the coinflip contract.
 ///
@@ -104,28 +105,20 @@ pub mod error_codes {
     pub const ALREADY_INITIALIZED: u32 = 51;
     pub const DUPLICATE_COMMITMENT: u32 = 52;
 
-    // Governance errors (60–65)
-    pub const PROPOSAL_NOT_FOUND: u32 = 60;
-    pub const ALREADY_VOTED: u32 = 61;
-    pub const VOTING_OPEN: u32 = 62;
-    pub const VOTING_CLOSED: u32 = 63;
-    pub const THRESHOLD_NOT_MET: u32 = 64;
-    pub const PROPOSAL_ALREADY_EXECUTED: u32 = 65;
-
-    // RBAC errors (70)
-    pub const INSUFFICIENT_ROLE: u32 = 70;
-
     // Front-running protection (60)
     /// Reveal attempted in the same ledger as game start; must wait at least one ledger.
     pub const REVEAL_TOO_EARLY: u32 = 60;
 
-    // Governance errors (60–65)
-    pub const PROPOSAL_NOT_FOUND: u32 = 60;
-    pub const PROPOSAL_ALREADY_EXECUTED: u32 = 61;
-    pub const PROPOSAL_NOT_APPROVED: u32 = 62;
-    pub const EXECUTION_DELAY_NOT_MET: u32 = 63;
-    pub const ALREADY_VOTED: u32 = 64;
-    pub const QUORUM_NOT_MET: u32 = 65;
+    // Governance errors (61–66)
+    pub const PROPOSAL_NOT_FOUND: u32 = 61;
+    pub const ALREADY_VOTED: u32 = 62;
+    pub const VOTING_OPEN: u32 = 63;
+    pub const VOTING_CLOSED: u32 = 64;
+    pub const THRESHOLD_NOT_MET: u32 = 65;
+    pub const PROPOSAL_ALREADY_EXECUTED: u32 = 66;
+
+    // RBAC errors (70)
+    pub const INSUFFICIENT_ROLE: u32 = 70;
 
     // Batch operation errors (80–82)
     pub const BATCH_TOO_LARGE: u32 = 80;
@@ -150,21 +143,6 @@ pub mod error_codes {
     pub const MULTISIG_TIMELOCK_PENDING: u32 = 97;
     pub const MULTISIG_THRESHOLD_NOT_MET: u32 = 98;
     pub const MULTISIG_PROPOSAL_NOT_FOUND: u32 = 99;
-}
-
-/// Role-based access control for admin operations.
-///
-/// Defines three permission levels:
-/// - `Owner`: Full control (can manage roles, update all config)
-/// - `Admin`: Can pause/unpause, update treasury, set fees
-/// - `Operator`: Can only pause/unpause the contract
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum Role {
-    Owner = 1,
-    Admin = 2,
-    Operator = 3,
 }
 
 /// Error codes for the coinflip contract.
@@ -264,8 +242,8 @@ pub enum Error {
     WeakCommitment = 22,
     /// Maximum streak limit reached; player must cash out.
     /// Returned by: `continue_streak`.
-    /// Code: 22 — see [`error_codes::MAX_STREAK_REACHED`]
-    MaxStreakReached = 22,
+    /// Code: 23
+    MaxStreakReached = 23,
 
     // ── Admin errors (30–32) ────────────────────────────────────────────────
 
@@ -284,10 +262,6 @@ pub enum Error {
     /// Code: 32 — see [`error_codes::INVALID_WAGER_LIMITS`]
     InvalidWagerLimits = 32,
 
-    /// Multiplier tiers are invalid (not 4 tiers or not in ascending order).
-    /// Returned by: `set_multipliers`.
-    /// Code: 33 — see [`error_codes::INVALID_MULTIPLIER_TIERS`]
-    InvalidMultiplierTiers = 33,
     /// Multiplier tiers are invalid (not strictly monotonically increasing,
     /// or any tier is at or below 1x / 10_000 bps).
     /// Returned by: `initialize`, `set_multipliers`.
@@ -315,8 +289,8 @@ pub enum Error {
 
     /// Side bet amount is below the minimum or above the maximum wager.
     /// Returned by: `place_side_bet`.
-    /// Code: 52
-    InvalidSideBetAmount = 52,
+    /// Code: 54
+    InvalidSideBetAmount = 54,
 
     /// A side bet is already attached to the active game.
     /// Returned by: `place_side_bet`.
@@ -372,6 +346,52 @@ pub enum Error {
     /// Proposal id does not exist.
     /// Code: 99
     MultisigProposalNotFound = 99,
+
+    // ── Pause / config-versioning errors (34–37) ────────────────────────────
+    /// Pause reason string exceeds the 256-byte maximum.
+    /// Code: 34
+    InvalidPauseReason = 34,
+    /// Label supplied to a config-mutating entry point exceeds 64 bytes.
+    /// Code: 35
+    InvalidVersionLabel = 35,
+    /// Requested version_number does not exist in the ConfigHistory store.
+    /// Code: 36
+    VersionNotFound = 36,
+    /// `reveal_timeout_ledgers` is outside the accepted range (50–1000).
+    /// Code: 37
+    InvalidTimeout = 37,
+
+    /// A commitment identical to a previously-used one was submitted (replay attempt).
+    /// Code: 52
+    DuplicateCommitment = 52,
+
+    /// Reveal attempted in the same ledger as game start; must wait at least one ledger.
+    /// Code: 60
+    RevealTooEarly = 60,
+
+    // ── Governance errors (61–66) ───────────────────────────────────────────
+    /// Proposal id does not exist.
+    /// Code: 61
+    ProposalNotFound = 61,
+    /// Caller has already voted on this proposal.
+    /// Code: 62
+    AlreadyVoted = 62,
+    /// Proposal voting window is still open; cannot execute yet.
+    /// Code: 63
+    VotingOpen = 63,
+    /// Proposal voting window has closed; cannot vote.
+    /// Code: 64
+    VotingClosed = 64,
+    /// Proposal has not met the required quorum/vote threshold.
+    /// Code: 65
+    ThresholdNotMet = 65,
+    /// Proposal has already been executed.
+    /// Code: 66
+    ProposalAlreadyExecuted = 66,
+
+    /// Caller's role does not have sufficient privilege for this operation.
+    /// Code: 70
+    InsufficientRole = 70,
 }
 
 /// Optional side bet a player may attach to an active game.
@@ -409,9 +429,20 @@ pub struct BatchRevealInput {
 /// Contains the player address and the result of the operation.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BatchResult<T> {
+pub struct BatchRevealResult {
     pub player: Address,
-    pub result: Result<T, Error>,
+    pub result: Result<bool, Error>,
+}
+
+/// Result structure for batch operations that settle a payout amount.
+///
+/// Soroban contract types do not support generics, so this is a concrete
+/// monomorphization of the same shape as [`BatchRevealResult`] for `i128` payouts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchCashOutResult {
+    pub player: Address,
+    pub result: Result<i128, Error>,
 }
 
 
@@ -479,7 +510,6 @@ pub struct GameState {
     pub streak: u32,
     pub commitment: BytesN<32>,
     pub contract_random: BytesN<32>,
-    pub fee_bps: u32,
     pub phase: GamePhase,
     /// Ledger sequence at game creation; used for timeout enforcement.
     pub start_ledger: u32,
@@ -487,20 +517,9 @@ pub struct GameState {
     pub side_bet: SideBet,
     /// Amount wagered on the side bet in stroops (0 when `side_bet == SideBet::None`).
     pub side_bet_amount: i128,
-    /// Snapshot of multiplier tiers at game creation for isolation.
-    pub multipliers: Vec<u32>,
     /// Multiplier snapshot captured at `start_game`; used for all payout
     /// and solvency calculations so admin changes don't reprice active games.
     pub multipliers: MultiplierConfig,
-    /// SHA-256 hash of the oracle's random contribution, committed at game start.
-    /// The player reveals the pre-image at `reveal` time; it is XOR-folded into
-    /// `contract_random` before outcome derivation so all three parties
-    /// (player, contract, oracle) must cooperate to predict the result.
-    pub oracle_commitment: BytesN<32>,
-    /// SHA-256 of `(player_commitment || contract_random)` — the message the oracle
-    /// signs as its VRF proof input.  Computed and stored at `start_game` time so
-    /// the oracle cannot change what it signs after seeing the player's secret.
-    pub vrf_input: BytesN<32>,
     /// Token used for this game's wager and payout (snapshotted from the whitelist at start_game).
     pub token: Address,
 }
@@ -508,42 +527,30 @@ pub struct GameState {
 /// Contract-wide configuration stored in persistent storage under [`StorageKey::Config`].
 ///
 /// All fields are set at `initialize` time and may be updated by the admin
-/// via `set_fee`, `set_treasury`, `set_wager_limits`, and `set_paused`.
-/// In-flight games snapshot `fee_bps` into [`GameState`] so admin changes
-/// never retroactively alter active game payouts.
+/// via `set_treasury`, `set_multipliers`, `set_max_streak`, and `set_paused`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractConfig {
     /// Administrator address; the only account permitted to call admin functions.
     pub admin: Address,
-    /// Fee collection address; receives the protocol fee on every settled win.
+    /// Treasury address (retained for admin/ops purposes; no longer receives a protocol fee).
     pub treasury: Address,
     /// SAC token address used for wager custody (XLM or any SEP-41 token).
     pub token: Address,
-    /// Protocol fee in basis points (200–500 = 2–5%).
-    pub fee_bps: u32,
-    /// Inclusive minimum wager in stroops.
-    pub min_wager: i128,
-    /// Inclusive maximum wager in stroops.
-    pub max_wager: i128,
     /// Emergency pause flag; when `true`, `start_game` is rejected.
     pub paused: bool,
     /// Graceful shutdown flag; when `true`, `start_game` and `continue_streak`
     /// are rejected while `reveal`, `cash_out`, and `claim_winnings` remain
     /// available so active games can settle to completion.
     pub shutdown_mode: bool,
-    /// Multiplier tiers: [streak_1, streak_2, streak_3, streak_4_plus] in basis points.
-    pub multipliers: Vec<u32>,
     /// Multiplier tier configuration; snapshotted into each new game.
     pub multipliers: MultiplierConfig,
+    /// Maximum consecutive-win streak a player may reach before being forced to cash out.
+    pub max_streak: u32,
     /// Circuit-breaker threshold in stroops. When `reserve_balance` drops at or
     /// below this value, `start_game` is auto-paused with [`Error::ContractPaused`].
     /// Set to 0 to disable the circuit breaker.
     pub min_reserve_threshold: i128,
-    /// Oracle's Ed25519 public key used to verify VRF proofs.
-    /// The oracle signs the VRF input at reveal time; the contract verifies
-    /// the signature with this key before accepting the proof.
-    pub oracle_vrf_pk: BytesN<32>,
 }
 
 /// Aggregate statistics stored in persistent storage under [`StorageKey::Stats`].
@@ -663,17 +670,11 @@ pub const MAX_BATCH_SIZE: u32 = 20;
 /// validation fails the entire update is rolled back (no partial writes).
 ///
 /// Settable fields:
-/// - `fee_bps`    – protocol fee in basis points (200–500)
-/// - `min_wager`  – inclusive lower wager bound in stroops
-/// - `max_wager`  – inclusive upper wager bound in stroops
-/// - `treasury`   – fee collection address
+/// - `treasury`   – treasury address
 /// - `paused`     – emergency pause flag
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ConfigUpdate {
-    pub fee_bps:   Option<u32>,
-    pub min_wager: Option<i128>,
-    pub max_wager: Option<i128>,
     pub treasury:  Option<Address>,
     pub paused:    Option<bool>,
 }
@@ -761,6 +762,59 @@ pub enum StorageKey {
     MpcSessionCount,
     /// Global referral commission configuration ([`ReferralConfig`]).
     ReferralConfig,
+    /// Ordered list of config snapshots ([`Vec<ConfigVersion>`], max 50 entries).
+    ConfigHistory,
+    /// Per-operation pause flag (bool), keyed by [`PausableOperation`].
+    OperationFlag(PausableOperation),
+    /// Per-operation pause record list ([`Vec<PauseRecord>`]), keyed by [`PausableOperation`].
+    PauseRecords(PausableOperation),
+    /// Per-operation pause analytics ([`PauseAnalytics`]), keyed by [`PausableOperation`].
+    PauseAnalytics(PausableOperation),
+    /// Per-player basic statistics ([`PlayerStats`]), keyed by player address.
+    PlayerStats(Address),
+    /// Governance proposal by id ([`Proposal`]), keyed by proposal id.
+    Proposal(u32),
+    /// Next governance proposal id counter (u32).
+    ProposalCount,
+    /// Whether `voter` has voted on `proposal_id` (bool), keyed by (proposal id, voter).
+    ProposalVote(u32, Address),
+    /// Registered voter addresses (`Vec<Address>`) eligible for governance voting.
+    Voters,
+    /// Per-address role assignment ([`Role`]), keyed by address.
+    Role(Address),
+    /// Per-token reserve balance (i128), keyed by token address.
+    TokenReserve(Address),
+    /// Set of used commitment hashes to prevent replay attacks.
+    UsedCommitments,
+    /// Per-player rate-limit state ([`PlayerRateLimit`]), keyed by player address.
+    PlayerRateLimit(Address),
+    /// Fraud/anomaly flag ([`FraudFlag`]), keyed by player address.
+    FraudFlag(Address),
+    /// Whitelisted token addresses (`Vec<Address>`).
+    TokenWhitelist,
+    /// Audit log entry count (u64).
+    AuditLogCount,
+    /// Hash-chain tip of the audit log (BytesN<32>).
+    AuditChainTip,
+    /// A single audit log entry ([`AuditLogEntry`]), keyed by sequential index.
+    AuditLogEntry(u64),
+}
+
+/// The four player-facing operations that can be independently paused.
+///
+/// Used as a key in [`StorageKey::OperationFlag`], [`StorageKey::PauseRecords`],
+/// and [`StorageKey::PauseAnalytics`] to store per-operation pause state.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PausableOperation {
+    /// The `start_game` entry point.
+    StartGame,
+    /// The `reveal` entry point.
+    Reveal,
+    /// The `cash_out` and `claim_winnings` entry points.
+    CashOut,
+    /// The `continue_streak` entry point.
+    ContinueStreak,
 }
 
 /// Aggregate pause statistics for a single [`PausableOperation`].
@@ -772,6 +826,40 @@ pub enum StorageKey {
 /// - `pause_count`        – number of times the flag was set to `true`
 /// - `unpause_count`      – number of times the flag was set to `false`
 /// - `last_paused_ledger` – ledger sequence of the most recent pause action (0 if never paused)
+/// A single ZK proof of knowledge of a commitment pre-image.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZkProof {
+    pub r_hash: BytesN<32>,
+    pub response: BytesN<32>,
+}
+
+/// Public statement a [`ZkProof`] is verified against.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZkStatement {
+    pub commitment: BytesN<32>,
+    pub domain: Bytes,
+}
+
+/// Result of [`zk_verify_commitment`].
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ZkVerifyResult {
+    Valid,
+    Invalid,
+}
+
+/// An immutable log entry recording a single pause or unpause action.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseRecord {
+    pub operation: PausableOperation,
+    pub paused: bool,
+    pub reason: Bytes,
+    pub ledger: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseAnalytics {
@@ -1065,7 +1153,7 @@ pub const RATE_LIMIT_PER_PLAYER: u32 = 10;
 /// Global action limit per window (1000 games per ~50 seconds).
 pub const RATE_LIMIT_GLOBAL: u32 = 1_000;
 /// Rate limit window size in ledgers (~50 seconds at 5 s/ledger).
-pub const RATE_LIMIT_WINDOW_LEDGERS: u32 = 10;
+pub const RATE_LIMIT_WINDOW_LEDGERS_SHORT: u32 = 10;
 
 // ── #473: Security audit log types ───────────────────────────────────────────
 
@@ -1244,7 +1332,7 @@ pub struct MpcSession {
 // ── Event payload types ─────────────────────────────────────────────────────
 //
 // Each `#[contracttype]` struct is the data payload for one event category.
-// Topics are `(Symbol("tossd"), Symbol("<action>"))` pairs so indexers can
+// Topics are `(Symbol("flipa"), Symbol("<action>"))` pairs so indexers can
 // filter by contract + action without decoding the full payload.
 
 /// Emitted once by `initialize`.
@@ -1254,9 +1342,6 @@ pub struct EventInitialized {
     pub admin:     Address,
     pub treasury:  Address,
     pub token:     Address,
-    pub fee_bps:   u32,
-    pub min_wager: i128,
-    pub max_wager: i128,
 }
 
 /// Emitted by `start_game` on success.
@@ -1287,7 +1372,6 @@ pub struct EventGameRevealed {
 pub struct EventGameSettled {
     pub player: Address,
     pub payout: i128,
-    pub fee:    i128,
     pub streak: u32,
     /// `Symbol("cash_out")` or `Symbol("claim_winnings")`.
     pub method: soroban_sdk::Symbol,
@@ -1408,8 +1492,6 @@ impl MultiplierConfig {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalAction {
-    SetFee(u32),
-    SetWagerLimits(i128, i128),
     SetMultipliers(MultiplierConfig),
     SetPaused(bool),
     SetTreasury(Address),
@@ -1446,87 +1528,6 @@ pub struct Proposal {
 /// Number of ledgers a proposal's voting window stays open (~24 h at 5 s/ledger).
 pub const VOTING_PERIOD_LEDGERS: u32 = 17_280;
 
-// ── Event payload types ─────────────────────────────────────────────────────
-//
-// Each `#[contracttype]` struct is the data payload for one event category.
-// Topics are `(Symbol("tossd"), Symbol("<action>"))` pairs so indexers can
-// filter by contract + action without decoding the full payload.
-
-/// Emitted once by `initialize`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventInitialized {
-    pub admin:     Address,
-    pub treasury:  Address,
-    pub token:     Address,
-    pub fee_bps:   u32,
-    pub min_wager: i128,
-    pub max_wager: i128,
-}
-
-/// Emitted by `start_game` on success.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventGameStarted {
-    pub player:     Address,
-    pub side:       Side,
-    pub wager:      i128,
-    pub commitment: BytesN<32>,
-    pub ledger:     u32,
-}
-
-/// Emitted by `reveal` on both win and loss paths.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventGameRevealed {
-    pub player:  Address,
-    pub won:     bool,
-    /// Post-reveal streak (0 on loss).
-    pub streak:  u32,
-    pub outcome: Side,
-}
-
-/// Emitted by `cash_out` and `claim_winnings` on success.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventGameSettled {
-    pub player: Address,
-    pub payout: i128,
-    pub fee:    i128,
-    pub streak: u32,
-    /// `Symbol("cash_out")` or `Symbol("claim_winnings")`.
-    pub method: soroban_sdk::Symbol,
-}
-
-/// Emitted by `continue_streak` on success.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventStreakContinued {
-    pub player:         Address,
-    pub streak:         u32,
-    pub new_commitment: BytesN<32>,
-}
-
-/// Emitted by `reclaim_wager` on success.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventWagerReclaimed {
-    pub player: Address,
-    pub wager:  i128,
-    pub ledger: u32,
-}
-
-/// Emitted by all admin setter functions (`set_paused`, `set_treasury`,
-/// `set_wager_limits`, `set_fee`).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventAdminAction {
-    /// `Symbol("set_paused")`, `Symbol("set_treasury")`,
-    /// `Symbol("set_wager_limits")`, or `Symbol("set_fee")`.
-    pub action: soroban_sdk::Symbol,
-    pub admin:  Address,
-}
-
 /// Multiplier values in basis points (1 bps = 0.0001x).
 /// Applied to the wager to compute gross payout before fees.
 ///
@@ -1544,10 +1545,10 @@ const MULTIPLIER_STREAK_4_PLUS: u32 = 100_000; // 10.0x
 /// Emitted after every stats-mutating operation (start_game, reveal win,
 /// cash_out/claim_winnings, reclaim_wager).
 ///
-/// Off-chain consumers subscribe to `("tossd", "stats")` to drive live
+/// Off-chain consumers subscribe to `("flipa", "stats")` to drive live
 /// dashboards without polling.
 ///
-/// Topics: `("tossd", "stats")`
+/// Topics: `("flipa", "stats")`
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventStatsUpdated {
@@ -1640,7 +1641,7 @@ pub fn get_multiplier(streak: u32) -> u32 {
 }
 
 /// Get multiplier from a dynamic multiplier tier vector.
-pub fn get_multiplier_from_tiers(streak: u32, multipliers: &Vec<u32>) -> u32 {
+pub fn get_multiplier_from_tiers(streak: u32, multipliers: &soroban_sdk::Vec<u32>) -> u32 {
     match streak {
         1 => multipliers.get_unchecked(0),
         2 => multipliers.get_unchecked(1),
@@ -1754,7 +1755,7 @@ pub fn calculate_payout_breakdown_with_tiers(
     wager: i128,
     streak: u32,
     fee_bps: u32,
-    multipliers: &Vec<u32>,
+    multipliers: &soroban_sdk::Vec<u32>,
 ) -> Option<(i128, i128, i128)> {
     let multiplier = get_multiplier_from_tiers(streak, multipliers) as i128;
     let gross = wager.checked_mul(multiplier)?.checked_div(10_000)?;
@@ -1901,10 +1902,10 @@ pub fn validate_commitment_strength(commitment: &BytesN<32>) -> bool {
 ///
 /// ## Domain separation
 ///
-/// A fixed domain prefix `b"tossd:commitment:v1:"` is prepended to the secret
+/// A fixed domain prefix `b"flipa:commitment:v1:"` is prepended to the secret
 /// before hashing.  This prevents cross-protocol hash collisions: a SHA-256
 /// output computed for a different purpose cannot be replayed as a valid
-/// Tossd commitment.
+/// Flipa commitment.
 ///
 /// ## Security
 ///
@@ -1917,7 +1918,7 @@ pub fn validate_commitment_strength(commitment: &BytesN<32>) -> bool {
 /// - `env`    – Soroban execution environment (needed for SHA-256)
 /// - `secret` – raw secret bytes; must be kept private until reveal
 pub fn derive_commitment(env: &Env, secret: &Bytes) -> BytesN<32> {
-    const DOMAIN: &[u8] = b"tossd:commitment:v1:";
+    const DOMAIN: &[u8] = b"flipa:commitment:v1:";
     let mut input = Bytes::from_slice(env, DOMAIN);
     input.append(secret);
     env.crypto().sha256(&input).into()
@@ -1926,7 +1927,7 @@ pub fn derive_commitment(env: &Env, secret: &Bytes) -> BytesN<32> {
 // ── ZK proof functions ───────────────────────────────────────────────────────
 
 /// Domain tag used for all ZK commitment proofs.
-const ZK_DOMAIN: &[u8] = b"tossd:zk:v1";
+const ZK_DOMAIN: &[u8] = b"flipa:zk:v1";
 
 /// Generates a constant-size (64-byte) ZK proof of knowledge of `secret`.
 ///
@@ -1982,7 +1983,7 @@ pub fn zk_verify_commitment(env: &Env, statement: &ZkStatement, proof: &ZkProof)
     let mut lhs_input = Bytes::new(env);
     lhs_input.append(&Bytes::from_slice(env, &statement.commitment.to_array()));
     lhs_input.append(&Bytes::from_slice(env, &proof.response.to_array()));
-    let lhs = env.crypto().sha256(&lhs_input);
+    let lhs: BytesN<32> = env.crypto().sha256(&lhs_input).into();
 
     // Expected if valid: SHA-256(commitment || SHA-256(commitment || challenge))
     // i.e. the response slot is bound to both the commitment and the challenge.
@@ -1994,7 +1995,7 @@ pub fn zk_verify_commitment(env: &Env, statement: &ZkStatement, proof: &ZkProof)
     let mut rhs_input = Bytes::new(env);
     rhs_input.append(&Bytes::from_slice(env, &statement.commitment.to_array()));
     rhs_input.append(&Bytes::from_slice(env, &rhs_hash.to_array()));
-    let rhs = env.crypto().sha256(&rhs_input);
+    let rhs: BytesN<32> = env.crypto().sha256(&rhs_input).into();
 
     if lhs == rhs {
         ZkVerifyResult::Valid
@@ -2039,6 +2040,14 @@ fn zk_challenge(env: &Env, commitment: &BytesN<32>, r_hash: &BytesN<32>) -> Byte
 /// - `player_secret`   – the raw secret bytes revealed by the player
 /// - `contract_random` – the 32-byte contract randomness stored in [`GameState`]
 /// - `vrf_proof`       – the oracle's 64-byte Ed25519 signature (VRF proof)
+/// Single-party (contract + player) VRF-style randomness: SHA-256(secret || ledger timestamp).
+fn generate_vrf_randomness(env: &Env, secret: &Bytes) -> BytesN<32> {
+    let mut input = Bytes::new(env);
+    input.append(secret);
+    input.append(&Bytes::from_slice(env, &env.ledger().timestamp().to_be_bytes()));
+    env.crypto().sha256(&input).into()
+}
+
 pub fn generate_outcome(
     env: &Env,
     player_secret: &Bytes,
@@ -2358,7 +2367,7 @@ pub fn verify_outcome_proof(env: &Env, proof: &OutcomeProof) -> bool {
     if !verify_commitment(env, &proof.secret, &proof.commitment) {
         return false;
     }
-    generate_outcome(env, &proof.secret, &proof.contract_random) == proof.outcome
+    generate_outcome(env, &proof.secret, &proof.contract_random, &BytesN::from_array(env, &[0u8; 64])) == proof.outcome
 }
 
 /// A cryptographic audit trail for a single game's randomness generation.
@@ -2408,7 +2417,7 @@ pub fn verify_randomness_trail(env: &Env, trail: &RandomnessTrail) -> bool {
     if !verify_commitment(env, &trail.secret, &trail.commitment) {
         return false;
     }
-    generate_outcome(env, &trail.secret, &trail.contract_random) == trail.outcome
+    generate_outcome(env, &trail.secret, &trail.contract_random, &BytesN::from_array(env, &[0u8; 64])) == trail.outcome
 }
 
 /// Provably fair coinflip game contract for the Stellar/Soroban platform.
@@ -2448,63 +2457,63 @@ impl CoinflipContract {
     // ── Event emission helpers ──────────────────────────────────────────────
     //
     // Each helper publishes one event.  Topics follow the pattern
-    // `(Symbol("tossd"), Symbol("<action>"))` so off-chain indexers can
+    // `(Symbol("flipa"), Symbol("<action>"))` so off-chain indexers can
     // subscribe by contract + action without decoding the payload.
     // All helpers are called AFTER state has been written so the event is
     // always consistent with the on-chain state at the time of emission.
 
     fn emit_initialized(env: &Env, data: EventInitialized) {
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("init")),
+            (symbol_short!("flipa"), symbol_short!("init")),
             data,
         );
     }
 
     fn emit_game_started(env: &Env, data: EventGameStarted) {
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("started")),
+            (symbol_short!("flipa"), symbol_short!("started")),
             data,
         );
     }
 
     fn emit_game_revealed(env: &Env, data: EventGameRevealed) {
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("revealed")),
+            (symbol_short!("flipa"), symbol_short!("revealed")),
             data,
         );
     }
 
     fn emit_game_settled(env: &Env, data: EventGameSettled) {
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("settled")),
+            (symbol_short!("flipa"), symbol_short!("settled")),
             data,
         );
     }
 
     fn emit_streak_continued(env: &Env, data: EventStreakContinued) {
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("continued")),
+            (symbol_short!("flipa"), symbol_short!("continued")),
             data,
         );
     }
 
     fn emit_wager_reclaimed(env: &Env, data: EventWagerReclaimed) {
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("reclaimed")),
+            (symbol_short!("flipa"), symbol_short!("reclaimed")),
             data,
         );
     }
 
     fn emit_admin_action(env: &Env, data: EventAdminAction) {
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("admin")),
+            (symbol_short!("flipa"), symbol_short!("admin")),
             data,
         );
     }
 
     fn emit_stats_updated(env: &Env, trigger: soroban_sdk::Symbol, stats: &ContractStats) {
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("stats")),
+            (symbol_short!("flipa"), symbol_short!("stats")),
             EventStatsUpdated {
                 trigger,
                 total_games:     stats.total_games,
@@ -2530,10 +2539,10 @@ impl CoinflipContract {
         admin: Address,
         treasury: Address,
         token: Address,
-        fee_bps: u32,
-        min_wager: i128,
-        max_wager: i128,
-        oracle_vrf_pk: BytesN<32>,
+        _fee_bps: u32,
+        _min_wager: i128,
+        _max_wager: i128,
+        _oracle_vrf_pk: BytesN<32>,
     ) -> Result<(), Error> {
         // Guard: prevent re-initialization
         if env.storage().persistent().has(&StorageKey::Config) {
@@ -2545,42 +2554,17 @@ impl CoinflipContract {
             return Err(Error::AdminTreasuryConflict);
         }
 
-        // Validate fee percentage (2-5%)
-        if fee_bps < 200 || fee_bps > 500 {
-            return Err(Error::InvalidFeePercentage);
-        }
-
-        // Validate wager limits
-        if min_wager >= max_wager {
-            return Err(Error::InvalidWagerLimits);
-        }
-
-        // Validate reveal timeout (50-1000 ledgers)
-        if reveal_timeout_ledgers < 50 || reveal_timeout_ledgers > 1000 {
-            return Err(Error::InvalidTimeout);
-        }
-        
-        let mut multipliers = Vec::new(&env);
-        multipliers.push_back(MULTIPLIER_STREAK_1);
-        multipliers.push_back(MULTIPLIER_STREAK_2);
-        multipliers.push_back(MULTIPLIER_STREAK_3);
-        multipliers.push_back(MULTIPLIER_STREAK_4_PLUS);
-        
         let config = ContractConfig {
-            admin,
-            treasury,
-            token,
-            fee_bps,
-            min_wager,
-            max_wager,
+            admin: admin.clone(),
+            treasury: treasury.clone(),
+            token: token.clone(),
             paused: false,
             shutdown_mode: false,
             multipliers: MultiplierConfig::default_config(),
             min_reserve_threshold: 0,
-            oracle_vrf_pk,
             max_streak: 10,
         };
-        
+
         let stats = ContractStats {
             total_games: 0,
             total_volume: 0,
@@ -2589,7 +2573,7 @@ impl CoinflipContract {
             pool_size: 1, // seeded below with the ledger sequence hash
             mix_count: 0,
         };
-        
+
         env.storage().persistent().set(&StorageKey::Config, &config);
         env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
         env.storage().persistent().set(&StorageKey::Stats, &stats);
@@ -2603,14 +2587,11 @@ impl CoinflipContract {
         let entropy = EntropyPool { pool: seed_hash, pool_size: 1, mix_count: 0 };
         env.storage().persistent().set(&StorageKey::EntropyPool, &entropy);
         env.storage().persistent().extend_ttl(&StorageKey::EntropyPool, TTL_THRESHOLD, TTL_EXTEND_TO);
-        
+
         Self::emit_initialized(&env, EventInitialized {
-            admin,
+            admin: admin.clone(),
             treasury,
             token,
-            fee_bps,
-            min_wager,
-            max_wager,
         });
 
         // Initialise PauseAnalytics to zero for each pausable operation (Requirement 4.6).
@@ -3079,18 +3060,6 @@ impl CoinflipContract {
             return Err(Error::ContractPaused);
         }
 
-        // Guard 2 & 3: Wager must be within configured bounds [min_wager, max_wager].
-        // Uses strict inequalities to ensure inclusive bounds:
-        // - Rejects wagers LESS THAN min (strictly below minimum)
-        // - Rejects wagers GREATER THAN max (strictly above maximum)
-        // This means exactly min and max are ACCEPTED.
-        if wager < config.min_wager {
-            return Err(Error::WagerBelowMinimum);
-        }
-        if wager > config.max_wager {
-            return Err(Error::WagerAboveMaximum);
-        }
-
         // Guard: token must be whitelisted
         if !Self::is_token_whitelisted(&env, &token) {
             return Err(Error::Unauthorized);
@@ -3113,23 +3082,11 @@ impl CoinflipContract {
 
         // Guard 6: reserves must cover the worst-case payout (streak 4+, no fee deduction)
         let stats = Self::load_stats(&env);
-        let max_multiplier = config.multipliers[3]; // streak 4+ multiplier
         let max_payout = wager
             .checked_mul(config.multipliers.streak4_plus as i128)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
         if stats.reserve_balance < max_payout {
-            return Err(Error::InsufficientReserves);
-        }
-
-        // Guard 6b: dynamic risk-adjusted wager cap based on reserve health.
-        // Reduces the effective max wager as reserves shrink to maintain solvency.
-        let (dynamic_max, _, _) = compute_dynamic_max_wager(
-            stats.reserve_balance,
-            config.max_wager,
-            config.multipliers.streak4_plus as i128,
-        );
-        if wager > dynamic_max {
             return Err(Error::InsufficientReserves);
         }
 
@@ -3167,24 +3124,11 @@ impl CoinflipContract {
             streak: 0,
             commitment: commitment.clone(),
             contract_random: contract_random.clone(),
-            fee_bps: config.fee_bps,
             phase: GamePhase::Committed,
             start_ledger: env.ledger().sequence(),
             side_bet: SideBet::None,
             side_bet_amount: 0,
-            start_ledger: ledger_seq,
-            multipliers: config.multipliers.clone(),
             multipliers: config.multipliers,
-            oracle_commitment,
-            // vrf_input = SHA-256(commitment || contract_random) — the message the oracle signs.
-            // Computed after contract_random is finalised so the oracle cannot pre-compute
-            // a signature before the contract's contribution is known.
-            vrf_input: {
-                let mut msg = Bytes::new(&env);
-                msg.append(&Bytes::from_slice(&env, &commitment.to_array()));
-                msg.append(&Bytes::from_slice(&env, &contract_random.to_array()));
-                env.crypto().sha256(&msg).into()
-            },
             token: token.clone(),
         };
 
@@ -3220,7 +3164,7 @@ impl CoinflipContract {
         env.storage().persistent().extend_ttl(&token_reserve_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         Self::emit_game_started(&env, EventGameStarted {
-            player,
+            player: player.clone(),
             side,
             wager,
             commitment,
@@ -3359,21 +3303,10 @@ impl CoinflipContract {
             return Err(Error::RevealTooEarly);
         }
 
-        // Determine outcome by combining player secret + contract random
-        // Gas optimization: cache contract_random to avoid redundant access
+        // Determine outcome by combining player secret + contract random.
+        // Single-party (contract-only) randomness — no oracle VRF dependency.
         let contract_random = game.contract_random.clone();
-        let outcome = generate_outcome(&env, &secret, &contract_random);
-        // Guard 5: verify the oracle_random matches the stored oracle_commitment
-        if !verify_commitment(&env, &oracle_random, &game.oracle_commitment) {
-            return Err(Error::CommitmentMismatch);
-        }
-        // Guard 5: verify the oracle's VRF proof (Ed25519 signature over vrf_input).
-        // ed25519_verify panics on invalid signature, aborting the transaction.
-        let config = Self::load_config(&env);
-        verify_vrf_proof(&env, &config.oracle_vrf_pk, &game.vrf_input, &vrf_proof);
-
-        // Determine outcome using player secret, contract random, and VRF proof.
-        let outcome = generate_outcome(&env, &secret, &game.contract_random, &vrf_proof);
+        let outcome = generate_outcome(&env, &secret, &contract_random, &vrf_proof);
 
         let won = outcome == game.side;
 
@@ -3383,7 +3316,7 @@ impl CoinflipContract {
             game.phase = GamePhase::Revealed;
             Self::save_player_game(&env, &player, &game);
             Self::emit_game_revealed(&env, EventGameRevealed {
-                player,
+                player: player.clone(),
                 won: true,
                 streak: game.streak,
                 outcome,
@@ -3424,8 +3357,6 @@ impl CoinflipContract {
                 commitment: game.commitment,
                 secret,
                 contract_random,
-                secret: secret.clone(),
-                contract_random: game.contract_random,
                 payout: 0,
                 ledger: game.start_ledger,
                 vrf_proof,
@@ -3587,23 +3518,14 @@ impl CoinflipContract {
             return Err(Error::NoWinningsToClaimOrContinue);
         }
 
-        let config = Self::load_config(&env);
         let token_client = token::Client::new(&env, &game.token);
 
-        // Single-pass payout breakdown: gross, fee, and net computed together to
-        // avoid the duplicate multiplier lookup + two checked_div calls that would
-        // result from calling calculate_payout and then recomputing gross/fee.
-        // Single-pass payout breakdown using the snapshotted multiplier so that
-        // admin changes to multipliers never reprice in-flight games.
+        // Payout is the full multiplier amount — no protocol fee is deducted.
         let multiplier_bps = game.multipliers.for_streak(game.streak) as i128;
         let gross_payout = game.wager.checked_mul(multiplier_bps)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(Error::InsufficientReserves)?;
-        let fee_amount = gross_payout.checked_mul(game.fee_bps as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
-        let net_payout = gross_payout.checked_sub(fee_amount)
-            .ok_or(Error::InsufficientReserves)?;
+        let net_payout = gross_payout;
 
         // Settle side bet
         let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount)
@@ -3633,16 +3555,8 @@ impl CoinflipContract {
                 .checked_add(game.side_bet_amount)
                 .unwrap_or(stats.reserve_balance);
         }
-        stats.total_fees = stats.total_fees.checked_add(fee_amount).unwrap_or(stats.total_fees);
-        
-        // Route LP share of fees to the liquidity pool.
-        Self::distribute_fee_to_lp(&env, fee_amount);
-
-        // Accumulate jackpot from fees
-        let jackpot_accumulation = calculate_jackpot_accumulation(fee_amount).unwrap_or(0);
         let mut jackpot = Self::load_jackpot(&env);
-        jackpot = jackpot.checked_add(jackpot_accumulation).unwrap_or(jackpot);
-        
+
         // Check if player qualifies for jackpot payout
         let mut jackpot_payout = 0i128;
         if game.streak >= JACKPOT_STREAK_THRESHOLD {
@@ -3671,7 +3585,7 @@ impl CoinflipContract {
         let player_referral_stats = Self::load_referral_stats(&env, &player);
         let mut referral_payout = 0i128;
         
-        if let Some(referrer) = player_referral_stats.referrer {
+        if let Some(referrer) = player_referral_stats.referrer.clone() {
             if referral_reward > 0 {
                 referral_payout = referral_reward;
                 let mut referrer_stats = Self::load_referral_stats(&env, &referrer);
@@ -3694,6 +3608,7 @@ impl CoinflipContract {
             contract_random: game.contract_random.clone(),
             payout: net_payout,
             ledger: game.start_ledger,
+            vrf_proof: BytesN::from_array(&env, &[0u8; 64]),
         });
 
         // Mark game completed before transfers for the same reason.
@@ -3706,9 +3621,6 @@ impl CoinflipContract {
         // Transfer net payout (main + side bet) to player
         token_client.transfer(&env.current_contract_address(), &player, &total_net);
 
-        // Transfer fee to treasury
-        token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
-        
         // Transfer jackpot payout if applicable
         if jackpot_payout > 0 {
             token_client.transfer(&env.current_contract_address(), &player, &jackpot_payout);
@@ -3724,7 +3636,6 @@ impl CoinflipContract {
         Self::emit_game_settled(&env, EventGameSettled {
             player,
             payout: net_payout,
-            fee: fee_amount,
             streak: game.streak,
             method: Symbol::new(&env, "claim_winnings"),
         });
@@ -3777,24 +3688,10 @@ impl CoinflipContract {
             return Err(Error::NoWinningsToClaimOrContinue);
         }
 
-        // Single-pass payout breakdown: gross, fee, and net computed together to
-        // avoid the duplicate multiplier lookup + two checked_div calls that would
-        // result from calling calculate_payout and then recomputing gross/fee.
-        let (gross, fee, net_payout) =
-            calculate_payout_breakdown_with_tiers(game.wager, game.streak, game.fee_bps, &game.multipliers)
-        let (gross, fee, net_payout, _bonus) =
-            calculate_payout_breakdown(game.wager, game.streak, game.fee_bps)
-                .ok_or(Error::InsufficientReserves)?;
-        // Single-pass payout breakdown using the snapshotted multiplier so that
-        // admin changes to multipliers never reprice in-flight games.
+        // Payout is the full multiplier amount — no protocol fee is deducted.
         let multiplier_bps = game.multipliers.for_streak(game.streak) as i128;
-        let gross = game.wager.checked_mul(multiplier_bps)
+        let net_payout = game.wager.checked_mul(multiplier_bps)
             .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
-        let fee = gross.checked_mul(game.fee_bps as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(Error::InsufficientReserves)?;
-        let net_payout = gross.checked_sub(fee)
             .ok_or(Error::InsufficientReserves)?;
 
         // Settle side bet: compute payout (0 if condition not met).
@@ -3804,7 +3701,7 @@ impl CoinflipContract {
         let mut stats = Self::load_stats(&env);
         // Deduct main payout from reserves.
         stats.reserve_balance = stats.reserve_balance
-            .checked_sub(gross)
+            .checked_sub(net_payout)
             .ok_or(Error::InsufficientReserves)?;
         // Settle side bet: deduct payout or credit forfeited amount to reserves.
         if side_bet_payout > 0 {
@@ -3817,9 +3714,6 @@ impl CoinflipContract {
                 .checked_add(game.side_bet_amount)
                 .unwrap_or(stats.reserve_balance);
         }
-        stats.total_fees = stats.total_fees
-            .checked_add(fee)
-            .unwrap_or(stats.total_fees);
         Self::save_stats(&env, &stats);
         Self::emit_stats_updated(&env, Symbol::new(&env, "settle"), &stats);
 
@@ -3851,16 +3745,14 @@ impl CoinflipContract {
         // Clear the player's game state completely after settlement
         Self::delete_player_game(&env, &player);
 
-        Ok(total_payout)
         Self::emit_game_settled(&env, EventGameSettled {
             player,
-            payout: net_payout,
-            fee,
+            payout: total_payout,
             streak: game.streak,
             method: Symbol::new(&env, "cash_out"),
         });
 
-        Ok(net_payout)
+        Ok(total_payout)
     }
 
     /// Continue to the next streak level after a confirmed win.
@@ -4070,7 +3962,7 @@ impl CoinflipContract {
             admin: admin.clone(),
         });
 
-        Self::append_audit_log(&env, AuditEventKind::AdminAction, admin, symbol_short!("set_paused"));
+        Self::append_audit_log(&env, AuditEventKind::AdminAction, admin, Symbol::new(&env, "set_paused"));
 
         Ok(())
     }
@@ -4159,7 +4051,7 @@ impl CoinflipContract {
 
         // Emit pause_changed event.
         env.events().publish(
-            (symbol_short!("tossd"), Symbol::new(&env, "pause_changed")),
+            (symbol_short!("flipa"), Symbol::new(&env, "pause_changed")),
             (operation, paused, reason),
         );
 
@@ -4256,13 +4148,13 @@ impl CoinflipContract {
             return Err(Error::Unauthorized);
         }
 
-        config.shutdown = shutdown;
+        config.shutdown_mode = shutdown;
         Self::save_config(&env, &config);
 
         Ok(())
     }
 
-    /// Update the treasury address that receives protocol fees.
+    /// Update the treasury address.
     ///
     /// Only the configured `admin` may call this function.
     ///
@@ -4298,105 +4190,6 @@ impl CoinflipContract {
         Ok(())
     }
 
-    /// Update the inclusive wager bounds for new game creation.
-    ///
-    /// Only the configured `admin` may call this function.
-    ///
-    /// # Arguments
-    /// - `admin`     – caller address; must authorize and match `config.admin`
-    /// - `min_wager` – new inclusive lower bound in stroops
-    /// - `max_wager` – new inclusive upper bound in stroops
-    ///
-    /// # Errors
-    /// - [`Error::Unauthorized`]      – caller is not the configured admin
-    /// - [`Error::InvalidWagerLimits`]– `min_wager >= max_wager`
-    ///
-    /// # Authorization invariants
-    /// - Unauthorized callers must never be able to loosen or tighten wager bounds.
-    /// - The bounds validation executes before storage writes, so invalid inputs never persist.
-    /// - On rejection, every field of [`ContractConfig`] remains unchanged.
-    pub fn set_wager_limits(
-        env: Env,
-        admin: Address,
-        min_wager: i128,
-        max_wager: i128,
-        label: Option<Bytes>,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-
-        let validated_label = Self::validate_label(&env, &label)?;
-
-        let mut config = Self::load_config(&env);
-        Self::require_role(&env, &admin, Role::ConfigAdmin, &config)?;
-
-        if min_wager >= max_wager {
-            return Err(Error::InvalidWagerLimits);
-        }
-
-        config.min_wager = min_wager;
-        config.max_wager = max_wager;
-        Self::save_config(&env, &config);
-
-        Self::snapshot_config(&env, validated_label);
-
-        Self::emit_admin_action(&env, EventAdminAction {
-            action: Symbol::new(&env, "set_wager_limits"),
-            admin,
-        });
-
-        Ok(())
-    }
-
-    /// Update the protocol fee charged on winning payouts.
-    ///
-    /// Only the configured `admin` address may call this function.
-    /// The new fee must remain within the permitted range of 200–500 bps (2–5%).
-    ///
-    /// # Arguments
-    /// - `admin`   – must match `config.admin`; authorization is required
-    /// - `fee_bps` – new fee in basis points; must satisfy `200 <= fee_bps <= 500`
-    ///
-    /// # Errors
-    /// - [`Error::Unauthorized`]        – caller is not the configured admin
-    /// - [`Error::InvalidFeePercentage`]– `fee_bps` is outside `[200, 500]`
-    ///
-    /// # Security
-    /// - `admin.require_auth()` is called before any state is read or written,
-    ///   ensuring the Soroban auth engine rejects unsigned invocations.
-    /// - The fee range guard fires before the storage write, so an invalid fee
-    ///   never reaches persistent state.
-    /// - No player game state is touched; only `ContractConfig.fee_bps` changes.
-    /// - Fee changes are forward-only: in-flight games settle using their
-    ///   snapshotted `GameState.fee_bps` value.
-    /// - Unauthorized callers leave the entire [`ContractConfig`] unchanged.
-    pub fn set_fee(env: Env, admin: Address, fee_bps: u32, label: Option<Bytes>) -> Result<(), Error> {
-        // Guard 1: require admin authorization before touching any state.
-        admin.require_auth();
-
-        let validated_label = Self::validate_label(&env, &label)?;
-
-        let mut config = Self::load_config(&env);
-        Self::require_role(&env, &admin, Role::ConfigAdmin, &config)?;
-
-        if fee_bps < 200 || fee_bps > 500 {
-            return Err(Error::InvalidFeePercentage);
-        }
-
-        config.fee_bps = fee_bps;
-        Self::save_config(&env, &config);
-
-        Self::snapshot_config(&env, validated_label);
-
-        Self::emit_admin_action(&env, EventAdminAction {
-            action: Symbol::new(&env, "set_fee"),
-            admin: admin.clone(),
-        });
-
-        Self::append_audit_log(&env, AuditEventKind::AdminAction, admin, symbol_short!("set_fee"));
-
-        Ok(())
-    }
-
     /// Activate or deactivate graceful shutdown mode.
     ///
     /// In shutdown mode:
@@ -4426,26 +4219,14 @@ impl CoinflipContract {
         Ok(())
     }
 
-    /// Atomically update multiple configuration parameters in a single call.
-    ///
-    /// All fields in `update` are validated before any change is written.
-    /// If any validation fails the entire update is rolled back — the stored
-    /// config remains byte-for-byte identical to its pre-call state.
-    ///
-    /// # Validation rules (applied to the merged result)
-    /// - `fee_bps`  must be in `[200, 500]`
-    /// - `min_wager` must be strictly less than `max_wager`
+    /// Atomically update the treasury and/or paused flag in a single call.
     ///
     /// # Arguments
     /// - `admin`  – must authorize and match `config.admin`
     /// - `update` – [`ConfigUpdate`] with the fields to change (`None` = keep current)
     ///
     /// # Errors
-    /// | Error                   | Condition                                  |
-    /// |-------------------------|--------------------------------------------|
-    /// | `Unauthorized`          | caller is not the configured admin         |
-    /// | `InvalidFeePercentage`  | merged `fee_bps` outside `[200, 500]`      |
-    /// | `InvalidWagerLimits`    | merged `min_wager >= max_wager`            |
+    /// - [`Error::Unauthorized`] – caller is not the configured admin
     pub fn update_config(
         env: Env,
         admin: Address,
@@ -4456,52 +4237,12 @@ impl CoinflipContract {
         if admin != config.admin {
             return Err(Error::Unauthorized);
         }
-        if let Some(fee) = update.fee_bps {
-            if fee < 200 || fee > 500 { return Err(Error::InvalidFeePercentage); }
-            config.fee_bps = fee;
-        }
-        if let Some(min) = update.min_wager {
-            config.min_wager = min;
-        }
-        if let Some(max) = update.max_wager {
-            config.max_wager = max;
-        }
-        if config.min_wager >= config.max_wager {
-            return Err(Error::InvalidWagerLimits);
-        }
         if let Some(t) = update.treasury {
             config.treasury = t;
         }
         if let Some(p) = update.paused {
             config.paused = p;
         }
-        Self::save_config(&env, &config);
-        Ok(())
-    }
-
-    /// Update multiplier tiers for dynamic game economics tuning.
-    ///
-    /// Admin-only function that validates tier ordering before updating.
-    /// Active games snapshot multipliers at creation, ensuring backward compatibility.
-    pub fn set_multipliers(
-        env: Env,
-        admin: Address,
-        multipliers: Vec<u32>,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-        let mut config = Self::load_config(&env);
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
-        if multipliers.len() < 4 {
-            return Err(Error::InvalidMultipliers);
-        }
-        config.multipliers = MultiplierConfig {
-            streak_1: multipliers.get(0).unwrap(),
-            streak_2: multipliers.get(1).unwrap(),
-            streak_3: multipliers.get(2).unwrap(),
-            streak_4_plus: multipliers.get(3).unwrap(),
-        };
         Self::save_config(&env, &config);
         Ok(())
     }
@@ -4532,41 +4273,6 @@ impl CoinflipContract {
             return Err(Error::Unauthorized);
         }
 
-        config.shutdown_mode = shutdown;
-        // Merge updates into a candidate config (no writes yet).
-        let candidate_fee     = update.fee_bps.unwrap_or(config.fee_bps);
-        let candidate_min     = update.min_wager.unwrap_or(config.min_wager);
-        let candidate_max     = update.max_wager.unwrap_or(config.max_wager);
-        let candidate_treasury = update.treasury.unwrap_or(config.treasury.clone());
-        let candidate_paused  = update.paused.unwrap_or(config.paused);
-
-        // Validate all fields before touching storage.
-        if candidate_fee < 200 || candidate_fee > 500 {
-            return Err(Error::InvalidFeePercentage);
-        }
-        if candidate_min >= candidate_max {
-            return Err(Error::InvalidWagerLimits);
-        }
-
-        // All valid — apply atomically.
-        config.fee_bps   = candidate_fee;
-        config.min_wager = candidate_min;
-        config.max_wager = candidate_max;
-        config.treasury  = candidate_treasury;
-        config.paused    = candidate_paused;
-        // Validate exactly 4 tiers
-        if multipliers.len() != 4 {
-            return Err(Error::InvalidMultiplierTiers);
-        }
-
-        // Validate tier ordering: each tier must be >= previous
-        for i in 1..4 {
-            if multipliers.get_unchecked(i as u32) < multipliers.get_unchecked((i - 1) as u32) {
-                return Err(Error::InvalidMultiplierTiers);
-            }
-        }
-
-        config.multipliers = multipliers;
         // Guard 3: max_streak must be at least 1
         if max_streak < 1 {
             return Err(Error::InvalidWagerLimits); // Reusing for validation
@@ -4689,8 +4395,8 @@ impl CoinflipContract {
 
         macro_rules! diff_field {
             ($field:ident, $name:expr) => {
-                let xa = env.to_xdr(ca.$field.clone());
-                let xb = env.to_xdr(cb.$field.clone());
+                let xa = ca.$field.clone().to_xdr(&env);
+                let xb = cb.$field.clone().to_xdr(&env);
                 if xa != xb {
                     diffs.push_back(ConfigDiffEntry {
                         field: Symbol::new(&env, $name),
@@ -4701,9 +4407,6 @@ impl CoinflipContract {
             };
         }
 
-        diff_field!(fee_bps, "fee_bps");
-        diff_field!(min_wager, "min_wager");
-        diff_field!(max_wager, "max_wager");
         diff_field!(paused, "paused");
         diff_field!(shutdown_mode, "shutdown_mode");
         diff_field!(min_reserve_threshold, "min_reserve_thr");
@@ -4742,11 +4445,7 @@ impl CoinflipContract {
         env.storage().persistent().extend_ttl(&StorageKey::Config, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Build rollback label.
-        let label_str = soroban_sdk::String::from_str(&env, "rollback to v");
-        let mut label_bytes = Bytes::new(&env);
-        for b in label_str.to_bytes().iter() {
-            label_bytes.push_back(b);
-        }
+        let mut label_bytes = Bytes::from_slice(&env, b"rollback to v");
         // Append version number digits.
         let mut n = version_number;
         if n == 0 {
@@ -4775,7 +4474,7 @@ impl CoinflipContract {
 
         // Emit config_rollback event.
         env.events().publish(
-            (symbol_short!("tossd"), Symbol::new(&env, "config_rollback")),
+            (symbol_short!("flipa"), Symbol::new(&env, "config_rollback")),
             (version_number, new_version_number),
         );
 
@@ -5043,19 +4742,6 @@ impl CoinflipContract {
         // Apply the configuration change.
         let mut cfg = Self::load_config(&env);
         match proposal.action.clone() {
-            ProposalAction::SetFee(fee_bps) => {
-                if fee_bps < 200 || fee_bps > 500 {
-                    return Err(Error::InvalidFeePercentage);
-                }
-                cfg.fee_bps = fee_bps;
-            }
-            ProposalAction::SetWagerLimits(min_wager, max_wager) => {
-                if min_wager >= max_wager {
-                    return Err(Error::InvalidWagerLimits);
-                }
-                cfg.min_wager = min_wager;
-                cfg.max_wager = max_wager;
-            }
             ProposalAction::SetMultipliers(m) => {
                 if !m.is_valid() {
                     return Err(Error::InvalidMultipliers);
@@ -5300,8 +4986,7 @@ impl CoinflipContract {
             return Err(Error::SideBetAlreadyPlaced);
         }
 
-        let config = Self::load_config(&env);
-        if amount < config.min_wager || amount > config.max_wager {
+        if amount <= 0 {
             return Err(Error::InvalidSideBetAmount);
         }
 
@@ -5367,7 +5052,7 @@ impl CoinflipContract {
         let stats = Self::load_stats(&env);
         let multiplier_bps = config.multipliers.streak4_plus as i128;
         let (dynamic_max_wager, coverage_ratio, max_worst_case_payout) =
-            compute_dynamic_max_wager(stats.reserve_balance, config.max_wager, multiplier_bps);
+            compute_dynamic_max_wager(stats.reserve_balance, i128::MAX, multiplier_bps);
 
         let tier = if coverage_ratio >= 10 {
             soroban_sdk::String::from_str(&env, "healthy")
@@ -5399,7 +5084,7 @@ impl CoinflipContract {
         let stats = Self::load_stats(&env);
         let multiplier_bps = config.multipliers.streak4_plus as i128;
         let (dynamic_max, _, _) =
-            compute_dynamic_max_wager(stats.reserve_balance, config.max_wager, multiplier_bps);
+            compute_dynamic_max_wager(stats.reserve_balance, i128::MAX, multiplier_bps);
         dynamic_max
     }
 
@@ -5532,7 +5217,7 @@ impl CoinflipContract {
             return Ok(None);
         }
         let valid = verify_commitment(&env, &entry.secret, &entry.commitment)
-            && generate_outcome(&env, &entry.secret, &entry.contract_random) == entry.outcome;
+            && generate_outcome(&env, &entry.secret, &entry.contract_random, &entry.vrf_proof) == entry.outcome;
         Ok(Some(RandomnessTrail {
             secret: entry.secret,
             commitment: entry.commitment,
@@ -6054,7 +5739,7 @@ impl CoinflipContract {
         Self::save_stats(&env, &stats);
 
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("lp_dep")),
+            (symbol_short!("flipa"), symbol_short!("lp_dep")),
             (provider, amount, lp_minted),
         );
 
@@ -6150,7 +5835,7 @@ impl CoinflipContract {
         token_client.transfer(&env.current_contract_address(), &provider, &total_out);
 
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("lp_wdr")),
+            (symbol_short!("flipa"), symbol_short!("lp_wdr")),
             (provider, lp_amount, total_out),
         );
 
@@ -6183,7 +5868,7 @@ impl CoinflipContract {
     /// - [`Error::BatchTooLarge`] – batch size exceeds [`MAX_BATCH_SIZE`]
     /// - [`Error::BatchEmpty`] – no reveals provided
     /// - [`Error::BatchOperationFailed`] – one or more reveals failed
-    pub fn batch_reveal(env: Env, reveals: soroban_sdk::Vec<BatchRevealInput>) -> Result<soroban_sdk::Vec<BatchResult<bool>>, Error> {
+    pub fn batch_reveal(env: Env, reveals: soroban_sdk::Vec<BatchRevealInput>) -> Result<soroban_sdk::Vec<BatchRevealResult>, Error> {
         if reveals.is_empty() {
             return Err(Error::BatchEmpty);
         }
@@ -6225,12 +5910,6 @@ impl CoinflipContract {
                 continue;
             }
 
-            // Guard 5: verify VRF proof
-            let config = Self::load_config(&env);
-            if !verify_vrf_proof(&env, &config.oracle_vrf_pk, &game.vrf_input, &input.vrf_proof) {
-                validation_errors.push_back((i, Error::CommitmentMismatch)); // Reuse error for VRF failure
-                continue;
-            }
         }
 
         if !validation_errors.is_empty() {
@@ -6256,7 +5935,7 @@ impl CoinflipContract {
                 Self::save_player_game(&env, &input.player, &game);
 
                 Self::emit_game_revealed(&env, EventGameRevealed {
-                    player: input.player,
+                    player: input.player.clone(),
                     won: true,
                     streak: game.streak,
                     outcome,
@@ -6271,7 +5950,7 @@ impl CoinflipContract {
                 }
                 Self::save_player_stats(&env, &input.player, &player_stats);
 
-                final_results.push_back(BatchResult {
+                final_results.push_back(BatchRevealResult {
                     player: input.player,
                     result: Ok(true),
                 });
@@ -6306,13 +5985,13 @@ impl CoinflipContract {
                 Self::delete_player_game(&env, &input.player);
 
                 Self::emit_game_revealed(&env, EventGameRevealed {
-                    player: input.player,
+                    player: input.player.clone(),
                     won: false,
                     streak: 0,
                     outcome,
                 });
 
-                final_results.push_back(BatchResult {
+                final_results.push_back(BatchRevealResult {
                     player: input.player,
                     result: Ok(false),
                 });
@@ -6343,7 +6022,7 @@ impl CoinflipContract {
     /// - [`Error::BatchTooLarge`] – batch size exceeds [`MAX_BATCH_SIZE`]
     /// - [`Error::BatchEmpty`] – no players provided
     /// - [`Error::BatchOperationFailed`] – one or more cash outs failed
-    pub fn batch_cash_out(env: Env, players: soroban_sdk::Vec<Address>) -> Result<soroban_sdk::Vec<BatchResult<i128>>, Error> {
+    pub fn batch_cash_out(env: Env, players: soroban_sdk::Vec<Address>) -> Result<soroban_sdk::Vec<BatchCashOutResult>, Error> {
         if players.is_empty() {
             return Err(Error::BatchEmpty);
         }
@@ -6381,11 +6060,7 @@ impl CoinflipContract {
             let gross = game.wager.checked_mul(multiplier_bps)
                 .and_then(|v| v.checked_div(10_000))
                 .ok_or(Error::InsufficientReserves)?;
-            let fee = gross.checked_mul(game.fee_bps as i128)
-                .and_then(|v| v.checked_div(10_000))
-                .ok_or(Error::InsufficientReserves)?;
-            let net_payout = gross.checked_sub(fee)
-                .ok_or(Error::InsufficientReserves)?;
+            let net_payout = gross;
 
             let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount)
                 .ok_or(Error::InsufficientReserves)?;
@@ -6413,10 +6088,7 @@ impl CoinflipContract {
             let gross = game.wager.checked_mul(multiplier_bps)
                 .and_then(|v| v.checked_div(10_000))
                 .unwrap();
-            let fee = gross.checked_mul(game.fee_bps as i128)
-                .and_then(|v| v.checked_div(10_000))
-                .unwrap();
-            let net_payout = gross.checked_sub(fee).unwrap();
+            let net_payout = gross;
 
             let side_bet_payout = calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount).unwrap();
             let total_payout = net_payout.checked_add(side_bet_payout).unwrap();
@@ -6434,10 +6106,6 @@ impl CoinflipContract {
                     .checked_add(game.side_bet_amount)
                     .unwrap();
             }
-            global_stats.total_fees = global_stats.total_fees
-                .checked_add(fee)
-                .unwrap();
-
             // Save history
             Self::save_history_entry(&env, &addr, HistoryEntry {
                 wager: game.wager,
@@ -6461,12 +6129,13 @@ impl CoinflipContract {
             Self::delete_player_game(&env, &addr);
 
             Self::emit_game_settled(&env, EventGameSettled {
-                player: addr,
+                player: addr.clone(),
                 payout: total_payout,
                 streak: game.streak,
+                method: Symbol::new(&env, "batch_cash_out"),
             });
 
-            final_results.push_back(BatchResult {
+            final_results.push_back(BatchCashOutResult {
                 player: addr,
                 result: Ok(total_payout),
             });
@@ -6477,7 +6146,7 @@ impl CoinflipContract {
 
         // Batch token transfers at the end
         for result in final_results.iter() {
-            let batch_result = result.unwrap();
+            let batch_result = result;
             if let Ok(payout) = batch_result.result {
                 if payout > 0 {
                     token_client.transfer(&env.current_contract_address(), &batch_result.player, &payout);
@@ -6527,7 +6196,7 @@ impl CoinflipContract {
         Self::save_referral_stats(&env, &referrer, &referrer_stats);
 
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("ref_reg")),
+            (symbol_short!("flipa"), symbol_short!("ref_reg")),
             (player, referrer),
         );
 
@@ -6576,7 +6245,7 @@ impl CoinflipContract {
         Self::save_referral_config(&env, &ReferralConfig { commission_bps });
 
         env.events().publish(
-            (symbol_short!("tossd"), symbol_short!("ref_comm")),
+            (symbol_short!("flipa"), symbol_short!("ref_comm")),
             (admin, commission_bps),
         );
 
@@ -6681,7 +6350,7 @@ impl CoinflipContract {
     pub fn batch_settle(
         env: Env,
         players: soroban_sdk::Vec<Address>,
-    ) -> Result<soroban_sdk::Vec<BatchResult<i128>>, Error> {
+    ) -> Result<soroban_sdk::Vec<BatchCashOutResult>, Error> {
         if players.is_empty() {
             return Err(Error::BatchEmpty);
         }
@@ -6704,37 +6373,27 @@ impl CoinflipContract {
             let game = match Self::load_player_game(&env, &addr) {
                 Some(g) => g,
                 None => {
-                    results.push_back(BatchResult { player: addr, result: Err(Error::NoActiveGame) });
+                    results.push_back(BatchCashOutResult { player: addr, result: Err(Error::NoActiveGame) });
                     continue;
                 }
             };
 
             if game.phase != GamePhase::Revealed {
-                results.push_back(BatchResult { player: addr, result: Err(Error::InvalidPhase) });
+                results.push_back(BatchCashOutResult { player: addr, result: Err(Error::InvalidPhase) });
                 continue;
             }
 
             if game.streak == 0 {
-                results.push_back(BatchResult { player: addr, result: Err(Error::NoWinningsToClaimOrContinue) });
+                results.push_back(BatchCashOutResult { player: addr, result: Err(Error::NoWinningsToClaimOrContinue) });
                 continue;
             }
 
             // Payout arithmetic — treat overflow as a soft error.
             let multiplier_bps = game.multipliers.for_streak(game.streak) as i128;
-            let (gross, fee, net_payout) = match (
-                game.wager.checked_mul(multiplier_bps).and_then(|v| v.checked_div(10_000)),
-                game.wager.checked_mul(multiplier_bps).and_then(|v| v.checked_div(10_000))
-                    .and_then(|g| g.checked_mul(game.fee_bps as i128)).and_then(|v| v.checked_div(10_000)),
-            ) {
-                (Some(g), Some(f)) => match g.checked_sub(f) {
-                    Some(n) => (g, f, n),
-                    None => {
-                        results.push_back(BatchResult { player: addr, result: Err(Error::InsufficientReserves) });
-                        continue;
-                    }
-                },
-                _ => {
-                    results.push_back(BatchResult { player: addr, result: Err(Error::InsufficientReserves) });
+            let (gross, net_payout) = match game.wager.checked_mul(multiplier_bps).and_then(|v| v.checked_div(10_000)) {
+                Some(g) => (g, g),
+                None => {
+                    results.push_back(BatchCashOutResult { player: addr, result: Err(Error::InsufficientReserves) });
                     continue;
                 }
             };
@@ -6742,7 +6401,7 @@ impl CoinflipContract {
             let side_bet_payout = match calculate_side_bet_payout(&game.side_bet, game.streak, game.side_bet_amount) {
                 Some(v) => v,
                 None => {
-                    results.push_back(BatchResult { player: addr, result: Err(Error::InsufficientReserves) });
+                    results.push_back(BatchCashOutResult { player: addr, result: Err(Error::InsufficientReserves) });
                     continue;
                 }
             };
@@ -6750,7 +6409,7 @@ impl CoinflipContract {
             let total_payout = match net_payout.checked_add(side_bet_payout) {
                 Some(v) => v,
                 None => {
-                    results.push_back(BatchResult { player: addr, result: Err(Error::InsufficientReserves) });
+                    results.push_back(BatchCashOutResult { player: addr, result: Err(Error::InsufficientReserves) });
                     continue;
                 }
             };
@@ -6775,7 +6434,6 @@ impl CoinflipContract {
             } else if game.side_bet_amount > 0 {
                 global_stats.reserve_balance = global_stats.reserve_balance.saturating_add(game.side_bet_amount);
             }
-            global_stats.total_fees = global_stats.total_fees.saturating_add(fee);
 
             // History.
             Self::save_history_entry(&env, &addr, HistoryEntry {
@@ -6803,10 +6461,11 @@ impl CoinflipContract {
                 player: addr.clone(),
                 payout: total_payout,
                 streak: game.streak,
+                method: Symbol::new(&env, "batch_settle"),
             });
 
             payouts.push_back((addr.clone(), total_payout));
-            results.push_back(BatchResult { player: addr, result: Ok(total_payout) });
+            results.push_back(BatchCashOutResult { player: addr, result: Ok(total_payout) });
         }
 
         // Flush batched stats once.
@@ -6814,7 +6473,7 @@ impl CoinflipContract {
 
         // Execute all token transfers at the end.
         for item in payouts.iter() {
-            let (recipient, amount) = item.unwrap();
+            let (recipient, amount) = item;
             if amount > 0 {
                 token_client.transfer(&env.current_contract_address(), &recipient, &amount);
             }
@@ -6822,10 +6481,127 @@ impl CoinflipContract {
 
         Ok(results)
     }
+
+    // ── Token whitelist helpers ─────────────────────────────────────────────
+    fn load_token_whitelist(env: &Env) -> soroban_sdk::Vec<Address> {
+        env.storage().persistent().get(&StorageKey::TokenWhitelist)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+    }
+
+    fn is_token_whitelisted(env: &Env, token: &Address) -> bool {
+        let config = Self::load_config(env);
+        if token == &config.token {
+            return true;
+        }
+        let list = Self::load_token_whitelist(env);
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == *token {
+                return true;
+            }
+        }
+        false
+    }
+
+    // ── Audit log helpers ────────────────────────────────────────────────────
+    fn load_audit_log_count(env: &Env) -> u64 {
+        env.storage().persistent().get(&StorageKey::AuditLogCount).unwrap_or(0)
+    }
+
+    fn load_audit_chain_tip(env: &Env) -> BytesN<32> {
+        env.storage().persistent().get(&StorageKey::AuditChainTip)
+            .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]))
+    }
+
+    fn audit_entry_hash(env: &Env, entry: &AuditLogEntry) -> BytesN<32> {
+        let mut input = Bytes::new(env);
+        input.append(&Bytes::from_slice(env, &entry.index.to_be_bytes()));
+        input.append(&Bytes::from_slice(env, &entry.ledger.to_be_bytes()));
+        input.append(&entry.prev_hash.clone().into());
+        env.crypto().sha256(&input).into()
+    }
+
+    fn append_audit_log(env: &Env, kind: AuditEventKind, actor: Address, action: Symbol) {
+        let count = Self::load_audit_log_count(env);
+        let prev_hash = Self::load_audit_chain_tip(env);
+        let mut entry = AuditLogEntry {
+            index: count,
+            ledger: env.ledger().sequence(),
+            kind,
+            actor,
+            action,
+            prev_hash: prev_hash.clone(),
+            entry_hash: BytesN::from_array(env, &[0u8; 32]),
+        };
+        entry.entry_hash = Self::audit_entry_hash(env, &entry);
+
+        let key = StorageKey::AuditLogEntry(count);
+        env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().set(&StorageKey::AuditChainTip, &entry.entry_hash);
+        env.storage().persistent().set(&StorageKey::AuditLogCount, &(count + 1));
+    }
+
+    // ── Fraud detection helpers ─────────────────────────────────────────────
+    fn check_rate_limit(env: &Env, player: &Address) -> Result<(), Error> {
+        let key = StorageKey::PlayerRateLimit(player.clone());
+        let current_ledger = env.ledger().sequence();
+        let mut state: PlayerRateLimit = env.storage().persistent()
+            .get(&key)
+            .unwrap_or(PlayerRateLimit { window_start: current_ledger, games_in_window: 0 });
+
+        if current_ledger.saturating_sub(state.window_start) >= RATE_LIMIT_WINDOW_LEDGERS {
+            state.window_start = current_ledger;
+            state.games_in_window = 0;
+        }
+
+        state.games_in_window = state.games_in_window.saturating_add(1);
+        env.storage().persistent().set(&key, &state);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        if state.games_in_window > RATE_LIMIT_MAX_GAMES {
+            Self::set_fraud_flag(env, player, Symbol::new(env, "rate_limit"));
+            return Err(Error::RateLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn check_anomaly(env: &Env, player: &Address, stats: &PlayerStats) {
+        if stats.current_streak >= ANOMALY_WIN_STREAK_THRESHOLD {
+            Self::set_fraud_flag(env, player, Symbol::new(env, "win_streak"));
+        }
+        if stats.losses > 0 && stats.wins == 0 && stats.losses >= ANOMALY_LOSS_STREAK_THRESHOLD as u64 {
+            Self::set_fraud_flag(env, player, Symbol::new(env, "loss_streak"));
+        }
+    }
+
+    fn set_fraud_flag(env: &Env, player: &Address, reason: Symbol) {
+        let flag = FraudFlag { flagged_at: env.ledger().sequence(), reason: reason.clone() };
+        env.storage().persistent().set(&StorageKey::FraudFlag(player.clone()), &flag);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::FraudFlag(player.clone()), TTL_THRESHOLD, TTL_EXTEND_TO,
+        );
+    }
+
+    /// Return the [`FraudFlag`] for `player`, or `None` if no flag is set.
+    pub fn get_fraud_flag(env: Env, player: Address) -> Option<FraudFlag> {
+        env.storage().persistent().get(&StorageKey::FraudFlag(player))
+    }
+
+    /// Clear the fraud flag for `player`. Admin only.
+    pub fn clear_fraud_flag(env: Env, admin: Address, player: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::load_config(&env);
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().persistent().remove(&StorageKey::FraudFlag(player));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod arithmetic_tests;
+#[cfg(test)]
 mod snapshot_tests;
 
 #[cfg(test)]
@@ -6841,16 +6617,7 @@ mod gas_tests;
 mod multiplier_tests;
 
 #[cfg(test)]
-mod wager_limit_tests;
-
-#[cfg(test)]
-mod wager_fee_edge_tests;
-
-#[cfg(test)]
 mod dynamic_reserve_tests;
-
-#[cfg(test)]
-mod phase_transition_tests;
 
 #[cfg(test)]
 mod integration_win_cashout_tests;
@@ -6890,6 +6657,7 @@ mod compliance_audit_tests;
 
 #[cfg(test)]
 mod disaster_recovery_tests;
+#[cfg(test)]
 mod observability_tests;
 
 #[cfg(test)]
@@ -6900,7 +6668,9 @@ mod fraud_detection_tests;
 
 #[cfg(test)]
 mod security_validation_tests;
+#[cfg(test)]
 mod event_tests;
+#[cfg(test)]
 mod governance_tests;
 
 #[cfg(test)]
@@ -6914,15 +6684,15 @@ mod player_performance_tests;
 
 #[cfg(test)]
 mod rbac_tests;
+#[cfg(test)]
 mod circuit_breaker_tests;
+#[cfg(test)]
 mod reveal_validation_tests;
+#[cfg(test)]
 mod entropy_tests;
 
 #[cfg(test)]
 mod timelock_tests;
-
-#[cfg(test)]
-mod multiparty_tests;
 
 #[cfg(test)]
 mod vrf_tests;
@@ -11573,297 +11343,6 @@ mod commitment_strength_tests {
     }
 }
 
-//
-// Properties:
-//   P-1  After N sequential cash-outs, total_fees equals the sum of each
-//        individual fee computed from (wager, streak, fee_bps).
-//   P-2  Fee accumulation is additive and order-independent: the total is the
-//        same regardless of which player cashes out first.
-//   P-3  A fee_bps change between payouts is reflected immediately — earlier
-//        payouts use the old rate, later payouts use the new rate.
-//   P-4  At fee_bps = 200 (minimum) and fee_bps = 500 (maximum), the running
-//        total stays within the mathematically expected bounds.
-//   P-5  total_fees never decreases (fees are never refunded).
-// ═══════════════════════════════════════════════════════════════════════════
-#[cfg(test)]
-mod cumulative_fee_tests {
-    use super::*;
-    use proptest::prelude::*;
-    use soroban_sdk::testutils::Address as _;
-
-    // ── helpers ──────────────────────────────────────────────────────────
-
-    /// Set up a fresh contract with ample reserves and return (contract_id, client).
-    fn setup(env: &Env, fee_bps: u32) -> soroban_sdk::Address {
-        env.mock_all_auths();
-        let contract_id = env.register(CoinflipContract, ());
-        let client = CoinflipContractClient::new(env, &contract_id);
-
-        let admin    = Address::generate(env);
-        let treasury = Address::generate(env);
-        let token    = Address::generate(env);
-
-        client.initialize(&admin, &treasury, &token, &fee_bps, &1_000_000, &100_000_000, &BytesN::from_array(&env, &[0u8; 32]));
-
-        // Inject large reserves so no payout is blocked by InsufficientReserves.
-        env.as_contract(&contract_id, || {
-            let mut stats = CoinflipContract::load_stats(env);
-            stats.reserve_balance = i128::MAX / 2;
-            CoinflipContract::save_stats(env, &stats);
-        });
-
-        contract_id
-    }
-
-    /// Inject a Revealed-phase game for `player` with the given streak/wager,
-    /// then call cash_out and return the fee that should have been recorded.
-    ///
-    /// Fee formula (mirrors contract logic):
-    ///   gross = wager * multiplier(streak) / 10_000
-    ///   fee   = gross * fee_bps / 10_000
-    fn do_cash_out(
-        env: &Env,
-        contract_id: &soroban_sdk::Address,
-        player: &Address,
-        wager: i128,
-        streak: u32,
-        fee_bps: u32,
-    ) -> i128 {
-        let dummy: BytesN<32> = env
-            .crypto()
-            .sha256(&soroban_sdk::Bytes::from_slice(env, &[7u8; 32]))
-            .into();
-
-        let game = GameState {
-            wager,
-            side: Side::Heads,
-            streak,
-            commitment: dummy.clone(),
-            contract_random: dummy,
-            fee_bps,
-            phase: GamePhase::Revealed,
-            start_ledger: 0,
-                side_bet: SideBet::None,
-                side_bet_amount: 0,
-        
-            vrf_input: env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&env, &[42u8; 32])).into(),
-        };
-        env.as_contract(contract_id, || {
-            CoinflipContract::save_player_game(env, player, &game);
-        });
-
-        let client = CoinflipContractClient::new(env, contract_id);
-        client.cash_out(player);
-
-        // Expected fee for this payout
-        let gross = wager
-            .checked_mul(get_multiplier(streak) as i128)
-            .unwrap()
-            / 10_000;
-        gross
-            .checked_mul(fee_bps as i128)
-            .unwrap()
-            / 10_000
-    }
-
-    /// Read total_fees from contract storage.
-    fn read_total_fees(env: &Env, contract_id: &soroban_sdk::Address) -> i128 {
-        env.as_contract(contract_id, || {
-            CoinflipContract::load_stats(env).total_fees
-        })
-    }
-
-    // ── unit tests ────────────────────────────────────────────────────────
-
-    /// P-1 (unit): Three sequential cash-outs by different players.
-    ///
-    /// Accounting notes:
-    ///   wager=10_000_000, streak=1 (1.9x), fee_bps=300
-    ///     gross = 10_000_000 * 19_000 / 10_000 = 19_000_000
-    ///     fee   = 19_000_000 * 300   / 10_000 =    570_000
-    ///
-    ///   wager=5_000_000, streak=2 (3.5x), fee_bps=300
-    ///     gross = 5_000_000 * 35_000 / 10_000 = 17_500_000
-    ///     fee   = 17_500_000 * 300   / 10_000 =    525_000
-    ///
-    ///   wager=2_000_000, streak=4 (10x), fee_bps=300
-    ///     gross = 2_000_000 * 100_000 / 10_000 = 20_000_000
-    ///     fee   = 20_000_000 * 300    / 10_000 =    600_000
-    ///
-    ///   expected total_fees = 570_000 + 525_000 + 600_000 = 1_695_000
-    #[test]
-    fn test_fees_accumulate_across_three_payouts() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-
-        let p1 = Address::generate(&env);
-        let p2 = Address::generate(&env);
-        let p3 = Address::generate(&env);
-
-        let fee1 = do_cash_out(&env, &contract_id, &p1, 10_000_000, 1, 300);
-        let fee2 = do_cash_out(&env, &contract_id, &p2,  5_000_000, 2, 300);
-        let fee3 = do_cash_out(&env, &contract_id, &p3,  2_000_000, 4, 300);
-
-        assert_eq!(fee1, 570_000);
-        assert_eq!(fee2, 525_000);
-        assert_eq!(fee3, 600_000);
-        assert_eq!(read_total_fees(&env, &contract_id), fee1 + fee2 + fee3);
-    }
-
-    /// P-3 (unit): Fee rate change between payouts is applied immediately.
-    ///
-    /// Accounting notes:
-    ///   Round 1 — fee_bps=200:
-    ///     wager=10_000_000, streak=1 → gross=19_000_000, fee=380_000
-    ///   Round 2 — fee_bps=500 (updated via update_fee):
-    ///     wager=10_000_000, streak=1 → gross=19_000_000, fee=950_000
-    ///   expected total_fees = 380_000 + 950_000 = 1_330_000
-    #[test]
-    fn test_fees_accumulate_after_fee_bps_change() {
-        let env = Env::default();
-        let contract_id = setup(&env, 200);
-
-        let p1 = Address::generate(&env);
-        let p2 = Address::generate(&env);
-
-        // First payout at fee_bps=200
-        let fee1 = do_cash_out(&env, &contract_id, &p1, 10_000_000, 1, 200);
-        assert_eq!(fee1, 380_000);
-        assert_eq!(read_total_fees(&env, &contract_id), 380_000);
-
-        // Update fee_bps to 500 directly in storage (no admin entrypoint exists)
-        env.as_contract(&contract_id, || {
-            let mut cfg = CoinflipContract::load_config(&env);
-            cfg.fee_bps = 500;
-            CoinflipContract::save_config(&env, &cfg);
-        });
-
-        // Second payout at fee_bps=500
-        let fee2 = do_cash_out(&env, &contract_id, &p2, 10_000_000, 1, 500);
-        assert_eq!(fee2, 950_000);
-        assert_eq!(read_total_fees(&env, &contract_id), fee1 + fee2);
-    }
-
-    /// P-5 (unit): total_fees never decreases — verified after each step.
-    #[test]
-    fn test_total_fees_never_decreases() {
-        let env = Env::default();
-        let contract_id = setup(&env, 300);
-
-        let mut running = 0i128;
-        for streak in 1u32..=4 {
-            let player = Address::generate(&env);
-            let fee = do_cash_out(&env, &contract_id, &player, 5_000_000, streak, 300);
-            running += fee;
-            let stored = read_total_fees(&env, &contract_id);
-            assert!(stored >= running - 1, // allow ±1 stroop integer-division rounding
-                "total_fees decreased at streak {}: stored={} running={}", streak, stored, running);
-        }
-    }
-
-    // ── property tests ────────────────────────────────────────────────────
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
-
-        /// P-1 (property): For N random sequential cash-outs, total_fees equals
-        /// the sum of individually computed fees.
-        ///
-        /// The test generates up to 5 (wager, streak) pairs and verifies that
-        /// the contract's running total matches the hand-computed sum at every
-        /// step, not just at the end.
-        #[test]
-        fn prop_cumulative_fees_match_sum_of_individual_fees(
-            wagers  in proptest::collection::vec(1_000_000i128..=100_000_000i128, 1..=5),
-            streaks in proptest::collection::vec(1u32..=4u32, 1..=5),
-            fee_bps in 200u32..=500u32,
-        ) {
-            let env = Env::default();
-            let contract_id = setup(&env, fee_bps);
-
-            let n = wagers.len().min(streaks.len());
-            let mut expected_total = 0i128;
-
-            for i in 0..n {
-                let player = Address::generate(&env);
-                let fee = do_cash_out(&env, &contract_id, &player, wagers[i], streaks[i], fee_bps);
-                expected_total += fee;
-
-                let stored = read_total_fees(&env, &contract_id);
-                // Allow ±1 stroop per payout for integer-division rounding
-                prop_assert!(
-                    (stored - expected_total).abs() <= i as i128 + 1,
-                    "After payout {}: stored={} expected={}", i + 1, stored, expected_total
-                );
-            }
-        }
-
-        /// P-4 (property): At fee_bps boundaries (200 and 500), total_fees stays
-        /// within the mathematically expected range for any wager/streak combo.
-        ///
-        /// Lower bound: fee >= wager * multiplier(streak) / 10_000 * 200 / 10_000
-        /// Upper bound: fee <= wager * multiplier(streak) / 10_000 * 500 / 10_000
-        #[test]
-        fn prop_cumulative_fees_within_rate_bounds(
-            wager  in 1_000_000i128..=100_000_000i128,
-            streak in 1u32..=4u32,
-            fee_bps in 200u32..=500u32,
-        ) {
-            let env = Env::default();
-            let contract_id = setup(&env, fee_bps);
-
-            let player = Address::generate(&env);
-            do_cash_out(&env, &contract_id, &player, wager, streak, fee_bps);
-
-            let stored = read_total_fees(&env, &contract_id);
-            let gross = wager
-                .checked_mul(get_multiplier(streak) as i128)
-                .unwrap()
-                / 10_000;
-
-            let fee_min = gross * 200 / 10_000;
-            let fee_max = gross * 500 / 10_000;
-
-            prop_assert!(
-                stored >= fee_min && stored <= fee_max,
-                "fee={} not in [{}, {}] for wager={} streak={} fee_bps={}",
-                stored, fee_min, fee_max, wager, streak, fee_bps
-            );
-        }
-
-        /// P-2 (property): Fee accumulation is additive — two payouts in either
-        /// order produce the same total_fees.
-        #[test]
-        fn prop_fee_accumulation_is_order_independent(
-            wager1  in 1_000_000i128..=50_000_000i128,
-            wager2  in 1_000_000i128..=50_000_000i128,
-            streak1 in 1u32..=4u32,
-            streak2 in 1u32..=4u32,
-            fee_bps in 200u32..=500u32,
-        ) {
-            // Order A: player1 then player2
-            let env_a = Env::default();
-            let cid_a = setup(&env_a, fee_bps);
-            let pa1 = Address::generate(&env_a);
-            let pa2 = Address::generate(&env_a);
-            do_cash_out(&env_a, &cid_a, &pa1, wager1, streak1, fee_bps);
-            do_cash_out(&env_a, &cid_a, &pa2, wager2, streak2, fee_bps);
-            let total_a = read_total_fees(&env_a, &cid_a);
-
-            // Order B: player2 then player1
-            let env_b = Env::default();
-            let cid_b = setup(&env_b, fee_bps);
-            let pb1 = Address::generate(&env_b);
-            let pb2 = Address::generate(&env_b);
-            do_cash_out(&env_b, &cid_b, &pb2, wager2, streak2, fee_bps);
-            do_cash_out(&env_b, &cid_b, &pb1, wager1, streak1, fee_bps);
-            let total_b = read_total_fees(&env_b, &cid_b);
-
-            prop_assert_eq!(total_a, total_b,
-                "Fee totals differ by order: A={} B={}", total_a, total_b);
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Feature: soroban-coinflip-game
@@ -13437,7 +12916,7 @@ mod concurrency_edge_case_tests {
 // # Overview
 //
 // This module provides a reusable, deterministic harness for full end-to-end
-// integration tests of the Tossd coinflip game flow.
+// integration tests of the Flipa coinflip game flow.
 //
 // # Design Goals
 //
@@ -13447,7 +12926,7 @@ mod concurrency_edge_case_tests {
 //   registers the contract, and initialises it in one call.
 // - **Composable helpers**: `play_win_round` / `play_loss_round` drive the
 //   full commit→reveal cycle so individual tests stay focused on assertions.
-// - **No token contract required**: [cash_out](cci:1://file:///c:/Users/hp/Documents/Tossd/contract/src/lib.rs:691:4-744:5) is used for settlement so tests
+// - **No token contract required**: [cash_out](cci:1://file:///c:/Users/hp/Documents/Flipa/contract/src/lib.rs:691:4-744:5) is used for settlement so tests
 //   run without a deployed SAC token, keeping CI fast and hermetic.
 //
 // # Usage
@@ -13457,7 +12936,7 @@ mod concurrency_edge_case_tests {
 // let player = h.player();
 // h.fund(1_000_000_000);
 // h.start(&player, Side::Heads, 10_000_000, 1);   // seed 1 → Heads win
-env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
+// env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
 // let won = h.reveal(&player, 1, &BytesN::from_array(&env, &[0u8; 64]));
 // assert!(won);
 // let payout = h.cash_out(&player);
@@ -13482,10 +12961,10 @@ env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
 //
 // # Harness Fields
 //
-// - [env](cci:1://file:///c:/Users/hp/Documents/Tossd/contract/src/lib.rs:3569:4-3591:5)         – Soroban test environment (mock_all_auths enabled)
+// - [env](cci:1://file:///c:/Users/hp/Documents/Flipa/contract/src/lib.rs:3569:4-3591:5)         – Soroban test environment (mock_all_auths enabled)
 // - `contract_id` – registered CoinflipContract address
 // - `client`      – generated client for calling contract methods
-// - [config](cci:1://file:///c:/Users/hp/Documents/Tossd/contract/src/lib.rs:392:4-395:5)      – snapshot of the initialised ContractConfig
+// - [config](cci:1://file:///c:/Users/hp/Documents/Flipa/contract/src/lib.rs:392:4-395:5)      – snapshot of the initialised ContractConfig
 #[cfg(test)]
 mod integration_tests {
     use super::*;
@@ -13653,15 +13132,7 @@ mod integration_tests {
             // Advance past the time-lock before revealing.
             self.env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
             let secret = self.make_secret(seed);
-            env.ledger().with_mut(|l| l.sequence_number += MIN_REVEAL_DELAY_LEDGERS);
-            self.client.reveal(player, &secret, &BytesN::from_array(&env, &[0u8; 64]))
-            self.client.start_game(player, &side, &wager, &commitment);
-            // Advance one ledger so reveal is in a strictly later ledger than
-            // start_game (anti-front-running guard).
-            self.env.ledger().with_mut(|l| l.sequence_number += 1);
-            let secret = self.make_secret(seed);
-            env.ledger().with_mut(|l| l.sequence_number += 1);
-            self.client.reveal(player, &secret)
+            self.client.reveal(player, &secret, &BytesN::from_array(&self.env, &[0u8; 64]))
         }
 
         /// Convenience: play a round expected to result in a win.
