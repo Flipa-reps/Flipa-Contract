@@ -17,7 +17,7 @@
  *
  * ## Usage
  * ```ts
- * const storage = new SecureKeyStorage("tossd-hsm-keys");
+ * const storage = new SecureKeyStorage("flipa-hsm-keys");
  * await storage.open();
  * await storage.saveKey(encryptedRecord);
  * const record = await storage.loadKey("key-id");
@@ -174,7 +174,7 @@ export class SecureKeyStorage {
   private backend: StorageBackend | null = null;
   private readonly storeName: string;
 
-  constructor(storeName = "tossd-hsm-keys") {
+  constructor(storeName = "flipa-hsm-keys") {
     this.storeName = storeName;
   }
 

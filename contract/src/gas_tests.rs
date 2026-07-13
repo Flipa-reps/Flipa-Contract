@@ -1,4 +1,4 @@
-/// Gas consumption profiling and regression tests for the Tossd contract.
+/// Gas consumption profiling and regression tests for the Flipa contract.
 ///
 /// # Coverage
 /// - Measure gas for all public functions

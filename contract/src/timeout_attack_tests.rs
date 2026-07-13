@@ -1,4 +1,4 @@
-/// Timeout attack simulation tests for the Tossd contract.
+/// Timeout attack simulation tests for the Flipa contract.
 ///
 /// # Coverage
 /// - Test reveal timeout at exact boundary (100 ledgers)

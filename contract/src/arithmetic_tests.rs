@@ -1,4 +1,4 @@
-/// Comprehensive arithmetic overflow safety tests for the Tossd contract.
+/// Comprehensive arithmetic overflow safety tests for the Flipa contract.
 ///
 /// # Coverage
 /// - Boundary value tests for all arithmetic operations

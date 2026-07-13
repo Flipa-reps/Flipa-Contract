@@ -99,7 +99,7 @@ export function App() {
             <p className="eyebrow">How it works</p>
             <h2>Commit, reveal, verify, settle</h2>
             <p>
-              The page is assembled from the existing Tossd UI components and now
+              The page is assembled from the existing Flipa UI components and now
               boots from a regular app entry.
             </p>
           </div>

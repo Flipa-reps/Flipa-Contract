@@ -1,8 +1,8 @@
-# Tossd Observability Strategy
+# Flipa Observability Strategy
 
 ## Overview
 
-This document outlines the monitoring, logging, and observability infrastructure for the Tossd coinflip contract and supporting systems.
+This document outlines the monitoring, logging, and observability infrastructure for the Flipa coinflip contract and supporting systems.
 
 ## Event Emission
 

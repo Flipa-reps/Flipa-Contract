@@ -41,7 +41,7 @@ test.describe("Landing page @e2e", () => {
 
   test("renders hero section and nav @e2e", async ({ page }) => {
     await expect(page.getByRole("banner")).toBeVisible();
-    await expect(page.getByRole("link", { name: /tossd/i })).toBeVisible();
+    await expect(page.getByRole("link", { name: /flipa/i })).toBeVisible();
     await expect(page.getByRole("button", { name: /connect wallet/i })).toBeVisible();
     await expect(page.getByRole("link", { name: /launch app/i })).toBeVisible();
   });

@@ -10,12 +10,12 @@ export function CTABand() {
             Play with Proof, Not Hype.
           </h2>
           <p className={styles.subtext}>
-            Launch Tossd to play, or audit the contract before your first flip.
+            Launch Flipa to play, or audit the contract before your first flip.
           </p>
         </div>
         <div className={styles.ctaGroup}>
           <a href="#launch" className={styles.btnPrimary}>
-            Launch Tossd
+            Launch Flipa
           </a>
           <a
             href="#audit"

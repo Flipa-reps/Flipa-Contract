@@ -43,7 +43,7 @@ export class RoleRegistry {
       emitter?: SecurityEventEmitter | null;
     } = {},
   ) {
-    this.storageKey = options.storageKey ?? "tossd-rbac-assignments";
+    this.storageKey = options.storageKey ?? "flipa-rbac-assignments";
     this.emitter = options.emitter ?? null;
     this.loadFromStorage();
   }

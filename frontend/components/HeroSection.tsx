@@ -19,16 +19,16 @@ export function HeroSection() {
             Verifiable Outcomes.
           </h1>
           <p className={styles.body}>
-            Tossd is an onchain coinflip game built on Soroban. Every outcome is
+            Flipa is an onchain coinflip game built on Soroban. Every outcome is
             auditable, every multiplier is explicit, and players choose when to
             secure profit or risk a streak.
           </p>
           <div className={styles.ctas}>
             <a href="#play" className={styles.ctaPrimary}>
-              Launch Tossd
+              Launch Flipa
             </a>
             <a
-              href="https://github.com/Tossd-Org/Tossd"
+              href="https://github.com/Flipa-Org/Flipa"
               className={styles.ctaSecondary}
               target="_blank"
               rel="noopener noreferrer"

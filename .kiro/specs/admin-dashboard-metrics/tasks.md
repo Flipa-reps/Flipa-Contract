@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implement the admin analytics dashboard for the Tossd Soroban coinflip contract (issue #511).
+Implement the admin analytics dashboard for the Flipa Soroban coinflip contract (issue #511).
 The work is split across five layers: backend metrics collector, dashboard REST API, WebSocket
 server, alerting engine, and React dashboard UI. All backend code lives in a new `backend/`
 directory; frontend additions extend the existing `frontend/` tree.

@@ -58,7 +58,7 @@ export class ProposalEngine {
     } = {},
   ) {
     this.config = { ...DEFAULT_MULTISIG_CONFIG, ...options.config };
-    this.storageKey = options.storageKey ?? "tossd-multisig-proposals";
+    this.storageKey = options.storageKey ?? "flipa-multisig-proposals";
     this.emitter = options.emitter ?? null;
     this.registry = options.registry ?? null;
     this.loadFromStorage();

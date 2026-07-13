@@ -14,11 +14,11 @@ interface TutorialProps {
   steps: TutorialStep[];
   /** Called when the tutorial finishes or is skipped */
   onComplete: () => void;
-  /** Storage key for persisting progress (default: "tossd_tutorial_step") */
+  /** Storage key for persisting progress (default: "flipa_tutorial_step") */
   storageKey?: string;
 }
 
-const STORAGE_KEY = "tossd_tutorial_step";
+const STORAGE_KEY = "flipa_tutorial_step";
 
 function getTargetRect(selector?: string): DOMRect | null {
   if (!selector) return null;
@@ -151,10 +151,10 @@ export function Tutorial({
   );
 }
 
-// Default steps for Tossd first-time users
+// Default steps for Flipa first-time users
 export const DEFAULT_TUTORIAL_STEPS: TutorialStep[] = [
   {
-    title: "Welcome to Tossd",
+    title: "Welcome to Flipa",
     description: "A provably fair coinflip game on Stellar. Let's walk you through your first game.",
   },
   {

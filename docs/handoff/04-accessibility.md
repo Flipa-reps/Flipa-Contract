@@ -1,4 +1,4 @@
-# Tossd Accessibility Baseline
+# Flipa Accessibility Baseline
 
 All components must meet these requirements before shipping. The test suite includes `jest-axe` checks — run `npm run test:a11y` to verify.
 

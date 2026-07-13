@@ -87,7 +87,7 @@ fn test_initialize_emits_initialized_event() {
     let (_, topics, data) = events.last().unwrap();
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("init").into_val(&env),
     ];
     assert_eq!(topics, expected_topics);
@@ -120,7 +120,7 @@ fn test_start_game_emits_game_started_event() {
 
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("started").into_val(&env),
     ];
     assert_eq!(topics, expected_topics);
@@ -166,7 +166,7 @@ fn test_reveal_win_emits_game_revealed_event() {
 
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("revealed").into_val(&env),
     ];
     assert_eq!(topics, expected_topics);
@@ -214,7 +214,7 @@ fn test_reveal_loss_emits_game_revealed_event_with_streak_zero() {
 
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("revealed").into_val(&env),
     ];
     assert_eq!(topics, expected_topics);
@@ -248,7 +248,7 @@ fn test_cash_out_emits_game_settled_event() {
 
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("settled").into_val(&env),
     ];
     assert_eq!(topics, expected_topics);
@@ -286,13 +286,13 @@ fn test_claim_winnings_emits_game_settled_event() {
     client.claim_winnings(&player);
 
     let events = env.events().all();
-    // Find the last tossd/settled event (token transfer events may follow)
+    // Find the last flipa/settled event (token transfer events may follow)
     let settled = events
         .iter()
         .rev()
         .find(|(_, topics, _)| {
             topics.len() >= 2
-                && topics.get(0) == Some(symbol_short!("tossd").into_val(&env))
+                && topics.get(0) == Some(symbol_short!("flipa").into_val(&env))
                 && topics.get(1) == Some(symbol_short!("settled").into_val(&env))
         });
     assert!(settled.is_some(), "claim_winnings must emit a settled event");
@@ -324,7 +324,7 @@ fn test_continue_streak_emits_streak_continued_event() {
 
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("continued").into_val(&env),
     ];
     assert_eq!(topics, expected_topics);
@@ -361,7 +361,7 @@ fn test_reclaim_wager_emits_wager_reclaimed_event() {
 
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("reclaimed").into_val(&env),
     ];
     assert_eq!(topics, expected_topics);
@@ -386,7 +386,7 @@ fn test_set_paused_emits_admin_action_event() {
 
     let expected_topics = vec![
         &env,
-        symbol_short!("tossd").into_val(&env),
+        symbol_short!("flipa").into_val(&env),
         symbol_short!("admin").into_val(&env),
     ];
     assert_eq!(topics, expected_topics);
@@ -488,7 +488,7 @@ fn test_event_emitted_after_state_written() {
     let events = env.events().all();
     let started = events.iter().any(|(_, topics, _)| {
         topics.len() >= 2
-            && topics.get(0) == Some(symbol_short!("tossd").into_val(&env))
+            && topics.get(0) == Some(symbol_short!("flipa").into_val(&env))
             && topics.get(1) == Some(symbol_short!("started").into_val(&env))
     });
     assert!(started, "GameStarted event must be present after start_game");

@@ -1,4 +1,4 @@
-# Tossd Accessibility Patterns
+# Flipa Accessibility Patterns
 
 This note captures the accessibility conventions used across the frontend and
 the checks that protect them.

@@ -1,6 +1,6 @@
 # Testnet Integration Tests
 
-Tests in this directory run against a **real deployed Tossd contract** on Stellar testnet. They are skipped automatically in CI when the required environment variables are absent.
+Tests in this directory run against a **real deployed Flipa contract** on Stellar testnet. They are skipped automatically in CI when the required environment variables are absent.
 
 ## Prerequisites
 

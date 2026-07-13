@@ -1,5 +1,5 @@
 /**
- * Minimal ContractAdapter implementation that calls the deployed Tossd contract
+ * Minimal ContractAdapter implementation that calls the deployed Flipa contract
  * on Stellar testnet via stellar-sdk.
  *
  * Used exclusively by testnet integration tests. Not imported by the app.

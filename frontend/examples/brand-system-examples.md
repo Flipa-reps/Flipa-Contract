@@ -1,11 +1,11 @@
-# Tossd Brand System Examples
+# Flipa Brand System Examples
 
-These snippets show how to apply Tossd visual tokens without hardcoded styles.
+These snippets show how to apply Flipa visual tokens without hardcoded styles.
 
 ## 1) Import tokens
 
 ```css
-@import "../tokens/tossd.tokens.css";
+@import "../tokens/flipa.tokens.css";
 ```
 
 ## 2) Primary and secondary buttons

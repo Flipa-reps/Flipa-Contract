@@ -1,7 +1,7 @@
 /**
  * Testnet integration tests — Issue #432
  *
- * These tests run against a real deployed Tossd contract on Stellar testnet.
+ * These tests run against a real deployed Flipa contract on Stellar testnet.
  * They are SKIPPED automatically when the required environment variables are
  * not set, so CI stays green without testnet credentials.
  *

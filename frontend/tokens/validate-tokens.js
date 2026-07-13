@@ -2,7 +2,7 @@
 /**
  * Token validation script — frontend/tokens/validate-tokens.js
  *
- * Checks that tossd.tokens.css and tossd.tokens.json are consistent:
+ * Checks that flipa.tokens.css and flipa.tokens.json are consistent:
  *   1. Every leaf value in the JSON has a corresponding CSS custom property.
  *   2. Every CSS custom property declared in :root exists in the JSON.
  *   3. Hex color values in JSON match those in CSS (case-insensitive).
@@ -14,8 +14,8 @@
 const fs = require("fs");
 const path = require("path");
 
-const CSS_FILE = path.join(__dirname, "tossd.tokens.css");
-const JSON_FILE = path.join(__dirname, "tossd.tokens.json");
+const CSS_FILE = path.join(__dirname, "flipa.tokens.css");
+const JSON_FILE = path.join(__dirname, "flipa.tokens.json");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
