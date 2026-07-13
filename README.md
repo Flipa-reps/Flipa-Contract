@@ -1,6 +1,6 @@
-# Tossd
+# Flipa
 
-Soroban smart contract and frontend for Tossd, a provably fair coinflip game on Stellar with a streak-based payout system.
+Soroban smart contract and frontend for Flipa, a provably fair coinflip game on Stellar with a streak-based payout system.
 
 ## Current Status
 
@@ -26,14 +26,14 @@ Not implemented yet:
 - Frontend and backend integration
 
 The source of truth for planned work is:
-- [`tasks.md`](../.Tossd/specs/soroban-coinflip-game/tasks.md)
-- [`requirements.md`](../.Tossd/specs/soroban-coinflip-game/requirements.md)
-- [`design.md`](../.Tossd/specs/soroban-coinflip-game/design.md)
+- [`tasks.md`](../.Flipa/specs/soroban-coinflip-game/tasks.md)
+- [`requirements.md`](../.Flipa/specs/soroban-coinflip-game/requirements.md)
+- [`design.md`](../.Flipa/specs/soroban-coinflip-game/design.md)
 
 ## Project Layout
 
 ```text
-Tossd-contract/
+Flipa-contract/
 ├── contract/
 │   ├── Cargo.toml
 │   └── src/
@@ -113,7 +113,7 @@ The next major milestones are:
 ## Contributor Backlog
 
 Issue drafts for contributors are tracked in:
-- [`contributor-issues.md`](../.Tossd/specs/soroban-coinflip-game/contributor-issues.md)
+- [`contributor-issues.md`](../.Flipa/specs/soroban-coinflip-game/contributor-issues.md)
 
 ## Notes
 

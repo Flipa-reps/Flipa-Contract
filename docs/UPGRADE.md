@@ -52,7 +52,7 @@ client.rollback_config(&admin, &1);
 2. Looks up the target version in history (`Error::VersionNotFound` if missing).
 3. Writes the target config atomically to `StorageKey::Config`.
 4. Appends a new audit snapshot labelled `"rollback to vN"`.
-5. Emits a `(tossd, config_rollback)` event with `(target_version, new_version)`.
+5. Emits a `(flipa, config_rollback)` event with `(target_version, new_version)`.
 
 Rollback is **non-destructive** — the history is never deleted, so you can
 roll forward again by rolling back to a later version.

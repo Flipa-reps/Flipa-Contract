@@ -2,7 +2,7 @@
 set -e
 
 echo "==================================="
-echo "Tossd Load Testing Suite"
+echo "Flipa Load Testing Suite"
 echo "==================================="
 echo ""
 

@@ -1,7 +1,7 @@
-# Tossd Frontend — Design Handoff Pack
+# Flipa Frontend — Design Handoff Pack
 > Issue #91 · Branch: `design/handoff-pack` · Closes #91
 
-Assembled for engineers implementing the Tossd frontend. Read these in order before writing any component code.
+Assembled for engineers implementing the Flipa frontend. Read these in order before writing any component code.
 
 ---
 
@@ -20,12 +20,12 @@ Assembled for engineers implementing the Tossd frontend. Read these in order bef
 
 ## Quick Reference
 
-**Token file:** `frontend/tokens/tossd.tokens.css`
+**Token file:** `frontend/tokens/flipa.tokens.css`
 **Component directory:** `frontend/components/`
 **Tech stack:** React 19 · TypeScript · CSS Modules · Vite · Stellar/Soroban
 
 **Three rules before touching any component:**
-1. Import tokens — `@import "../tokens/tossd.tokens.css";`
+1. Import tokens — `@import "../tokens/flipa.tokens.css";`
 2. No raw hex or px values — token references only
 3. Run `npm run test:a11y` before opening a PR
 

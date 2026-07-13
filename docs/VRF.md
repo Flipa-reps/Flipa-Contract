@@ -1,6 +1,6 @@
 # VRF Integration
 
-Tossd uses a Verifiable Random Function (VRF) as a third independent randomness
+Flipa uses a Verifiable Random Function (VRF) as a third independent randomness
 source, layered on top of the existing commit-reveal scheme.  The result is a
 three-party randomness protocol where **player**, **contract**, and **oracle**
 must all cooperate to predict the outcome.

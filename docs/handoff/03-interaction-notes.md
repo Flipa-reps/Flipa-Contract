@@ -1,10 +1,10 @@
-# Tossd Interaction Notes
+# Flipa Interaction Notes
 
 ---
 
 ## Motion System
 
-All transitions use tokens from `frontend/tokens/tossd.tokens.css`. Never hardcode durations.
+All transitions use tokens from `frontend/tokens/flipa.tokens.css`. Never hardcode durations.
 
 | Token | Value | When to use |
 |---|---|---|

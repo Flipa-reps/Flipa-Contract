@@ -1,8 +1,8 @@
-# Tossd Security Measures
+# Flipa Security Measures
 
 ## Overview
 
-This document outlines the security measures implemented in the Tossd coinflip contract to prevent common vulnerabilities and attacks.
+This document outlines the security measures implemented in the Flipa coinflip contract to prevent common vulnerabilities and attacks.
 
 ## Threat Model
 
@@ -172,7 +172,7 @@ if result.is_err() {
 
 ### OWASP Top 10 Mapping
 
-| OWASP | Vulnerability | Tossd Mitigation |
+| OWASP | Vulnerability | Flipa Mitigation |
 |-------|---|---|
 | A01 | Broken Access Control | Admin signature verification |
 | A02 | Cryptographic Failures | SHA-256 commitment-reveal |
